@@ -1,5 +1,7 @@
 use pyo3::prelude::*;
 
+pub mod sim_init;
+
 #[pyfunction]
 fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
