@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+pub mod actions;
 pub mod sim_init;
 
 #[pyfunction]
