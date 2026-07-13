@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.14,<2"]
+build-backend = "maturin"
+
+[project]
+name = "construct"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.26", "torch>=2.12"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "maturin>=1.14"]
+
+[tool.maturin]
+manifest-path = "engine/Cargo.toml"
+module-name = "construct._engine"
+python-source = "python"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
