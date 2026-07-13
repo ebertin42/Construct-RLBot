@@ -1,0 +1,10 @@
+version = 0
+obs_size = 94
+action_table = "rlgym_lookup_90"
+action_count = 90
+tick_skip = 8
+
+[normalization]
+pos_norm = 0.00043478260869565216      # 1/2300
+vel_norm = 0.00043478260869565216      # 1/2300
+ang_vel_norm = 0.18181818181818182     # 1/5.5
