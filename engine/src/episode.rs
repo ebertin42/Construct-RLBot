@@ -21,6 +21,24 @@ pub struct StepFlags {
     pub truncated: bool,
 }
 
+fn vec3_finite(v: &Vec3) -> bool {
+    v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
+}
+
+/// True iff every physics quantity the obs/reward paths consume is finite.
+fn state_is_finite(gs: &GameState) -> bool {
+    if !(vec3_finite(&gs.ball.pos) && vec3_finite(&gs.ball.vel) && vec3_finite(&gs.ball.ang_vel)) {
+        return false;
+    }
+    gs.cars.iter().all(|c| {
+        vec3_finite(&c.state.pos)
+            && vec3_finite(&c.state.vel)
+            && vec3_finite(&c.state.ang_vel)
+            && vec3_finite(&c.state.rot_mat.forward)
+            && vec3_finite(&c.state.rot_mat.up)
+    })
+}
+
 pub struct EpisodeArena {
     arena: UniquePtr<Arena>,
     table: Vec<[f32; 8]>,
@@ -105,6 +123,32 @@ impl EpisodeArena {
         self.arena.pin_mut().step(self.tick_skip);
 
         let cur = self.arena.pin_mut().get_game_state();
+
+        // Physics-blowup containment. RocketSim's contact solver can go nonfinite
+        // in degenerate multi-body squeezes (observed live at 2.2B steps: two
+        // near-static cars pinching the ball -> a car ejected to [nan,-inf,nan]).
+        // A poisoned state must never reach rewards, obs, or the learner: end the
+        // episode with finite zeros and a fresh kickoff. Terminated (not truncated)
+        // so GAE bootstraps 0 instead of a value estimate of garbage.
+        if !state_is_finite(&cur) {
+            eprintln!(
+                "[construct-engine] physics blowup contained (tick {}): episode terminated, arena reset",
+                cur.tick_count
+            );
+            for a in 0..n {
+                rewards[a] = 0.0;
+                flags[a] = StepFlags { terminated: true, truncated: false };
+            }
+            final_obs[..n * OBS_SIZE].fill(0.0);
+            self.seed = self.seed.wrapping_mul(747796405).wrapping_add(2891336453);
+            self.arena.pin_mut().reset_to_random_kickoff(Some(self.seed));
+            let gs = self.arena.pin_mut().get_game_state();
+            self.episode_start_tick = gs.tick_count;
+            self.last_touch_tick = gs.tick_count;
+            self.prev_state = gs;
+            return;
+        }
+
         let scored = if self.arena.is_ball_scored() {
             Some(if cur.ball.pos.y > 0.0 { Team::Blue } else { Team::Orange })
         } else {

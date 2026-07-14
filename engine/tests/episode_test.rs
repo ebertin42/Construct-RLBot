@@ -67,3 +67,27 @@ fn no_touch_truncates_after_30s() {
     let t = truncated_at.expect("must truncate");
     assert!((445..=455).contains(&t), "truncated at {t}");
 }
+
+#[test]
+fn physics_nan_contained_as_termination() {
+    // RocketSim's contact solver can blow up (observed live: two cars squeezing
+    // the ball -> car ejected to [nan, -inf, nan]). The engine must contain it:
+    // finite rewards, terminated flags, and a clean post-reset state.
+    let mut a = mk(1, 1, 5);
+    a.debug_place_ball([f32::NAN, f32::NAN, f32::NAN], [0.0, 0.0, 0.0]);
+    let mut r = vec![0.0; 2];
+    let mut f = vec![StepFlags::default(); 2];
+    let mut fo = vec![0.0; 2 * OBS_SIZE];
+    a.step(&[0, 0], &mut r, &mut f, &mut fo);
+    assert!(r.iter().all(|x| x.is_finite()), "rewards must stay finite, got {r:?}");
+    assert!(f[0].terminated && f[1].terminated, "poisoned arena must terminate episode");
+    assert!(fo.iter().all(|x| x.is_finite()), "final_obs must stay finite");
+    // next episode must be clean
+    let mut obs = vec![0.0; 2 * OBS_SIZE];
+    a.write_obs(&mut obs);
+    assert!(obs.iter().all(|x| x.is_finite()), "post-reset obs must be finite");
+    // and stepping again works normally
+    a.step(&[0, 0], &mut r, &mut f, &mut fo);
+    assert!(r.iter().all(|x| x.is_finite()));
+    assert!(!f[0].terminated || f[0].terminated == f[1].terminated);
+}
