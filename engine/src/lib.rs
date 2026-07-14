@@ -9,6 +9,7 @@ pub mod episode;
 pub mod obs;
 pub mod policy;
 pub mod reward;
+pub mod sampler;
 pub mod schema;
 pub mod sim_init;
 pub mod viser;
