@@ -7,6 +7,7 @@ pub mod actions;
 pub mod engine;
 pub mod episode;
 pub mod obs;
+pub mod policy;
 pub mod reward;
 pub mod schema;
 pub mod sim_init;
