@@ -72,7 +72,9 @@ class ConstructBot(Bot):
         here = os.path.dirname(os.path.abspath(__file__))
         self.table = make_lookup_table()
         self.net = load_policy(os.path.join(here, "checkpoint.pt"), obs_size=94, action_count=90)
-        self.extra_info = SimExtraInfo(self.field_info, tick_skip=TICK_SKIP)
+        # rlgym_compat >= 2.x dropped the tick_skip param (we do our own
+        # tick-skip accounting via frame_num deltas in get_output)
+        self.extra_info = SimExtraInfo(self.field_info)
         self.game_state = GameState.create_compat_game_state(self.field_info)
         self.ticks = TICK_SKIP  # act on first packet
         self.prev_control = ControllerState()
