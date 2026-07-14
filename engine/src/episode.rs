@@ -167,4 +167,39 @@ impl EpisodeArena {
         ball.vel = Vec3::new(vel[0], vel[1], vel[2]);
         self.arena.pin_mut().set_ball(ball);
     }
+
+    /// JSON state dump matching the deploy/obs.py dict contract (Task 12 interfaces).
+    pub fn debug_state_json(&mut self) -> String {
+        let gs = self.arena.pin_mut().get_game_state();
+        let v3 = |v: &Vec3| serde_json::json!([v.x, v.y, v.z]);
+        let cars: Vec<serde_json::Value> = self
+            .car_ids
+            .iter()
+            .map(|&id| {
+                let c = gs.cars.iter().find(|c| c.id == id).expect("car exists");
+                serde_json::json!({
+                    "id": c.id,
+                    "team": c.team as u8,
+                    "pos": v3(&c.state.pos),
+                    "vel": v3(&c.state.vel),
+                    "ang_vel": v3(&c.state.ang_vel),
+                    "forward": v3(&c.state.rot_mat.forward),
+                    "up": v3(&c.state.rot_mat.up),
+                    "boost": c.state.boost,
+                    "is_on_ground": c.state.is_on_ground,
+                    "has_flip": c.state.has_flip_or_jump(),
+                    "is_demoed": c.state.is_demoed,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "ball": {
+                "pos": v3(&gs.ball.pos),
+                "vel": v3(&gs.ball.vel),
+                "ang_vel": v3(&gs.ball.ang_vel),
+            },
+            "cars": cars,
+        })
+        .to_string()
+    }
 }

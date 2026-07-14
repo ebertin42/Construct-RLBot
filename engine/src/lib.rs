@@ -109,6 +109,26 @@ impl Engine {
             numpy::ndarray::Array2::from_shape_vec((n, d), fin).unwrap().into_pyarray(py),
         ))
     }
+
+    /// JSON dump of arena state + the engine-built obs for all agents of that arena.
+    /// Used by tests/python/test_parity.py to check deploy/obs.py against the Rust
+    /// obs builder (see Task 12 interfaces for the JSON schema).
+    fn debug_state_and_obs<'py>(
+        &mut self,
+        py: Python<'py>,
+        arena_idx: usize,
+    ) -> PyResult<(String, Bound<'py, PyArray2<f32>>)> {
+        let (json, obs, agents) = self
+            .inner
+            .debug_arena(arena_idx)
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            json,
+            numpy::ndarray::Array2::from_shape_vec((agents, self.inner.obs_size), obs)
+                .unwrap()
+                .into_pyarray(py),
+        ))
+    }
 }
 
 // `unsendable`: `EpisodeArena` holds a `cxx::UniquePtr<Arena>`, which contains raw

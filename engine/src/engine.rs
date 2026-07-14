@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 enum Cmd {
     Reset,
     Step(Vec<i64>),
+    Debug { local_idx: usize },
     Shutdown,
 }
 
@@ -19,6 +20,7 @@ struct WorkerOut {
     terminated: Vec<bool>,
     truncated: Vec<bool>,
     final_obs: Vec<f32>,
+    debug_json: Option<String>,
 }
 
 struct Worker {
@@ -26,6 +28,7 @@ struct Worker {
     rx: Receiver<WorkerOut>,
     handle: Option<JoinHandle<()>>,
     num_agents: usize,
+    num_arenas: usize,
 }
 
 pub struct MultiEngine {
@@ -83,6 +86,7 @@ impl MultiEngine {
                                 terminated: vec![false; agents],
                                 truncated: vec![false; agents],
                                 final_obs: vec![0.0; agents * OBS_SIZE],
+                                debug_json: None,
                             };
                             let mut off = 0;
                             for ar in arenas.iter_mut() {
@@ -99,6 +103,7 @@ impl MultiEngine {
                                 terminated: vec![false; agents],
                                 truncated: vec![false; agents],
                                 final_obs: vec![0.0; agents * OBS_SIZE],
+                                debug_json: None,
                             };
                             let mut a_off = 0;
                             let mut flags = vec![StepFlags::default(); per_agent];
@@ -119,10 +124,31 @@ impl MultiEngine {
                             }
                             let _ = otx.send(out);
                         }
+                        Cmd::Debug { local_idx } => {
+                            let ar = &mut arenas[local_idx];
+                            let n = ar.num_agents();
+                            let mut out = WorkerOut {
+                                obs: vec![0.0; n * OBS_SIZE],
+                                rewards: vec![],
+                                terminated: vec![],
+                                truncated: vec![],
+                                final_obs: vec![],
+                                debug_json: None,
+                            };
+                            ar.write_obs(&mut out.obs);
+                            out.debug_json = Some(ar.debug_state_json());
+                            let _ = otx.send(out);
+                        }
                     }
                 }
             });
-            workers.push(Worker { tx: ctx, rx: orx, handle: Some(handle), num_agents: count * per_agent });
+            workers.push(Worker {
+                tx: ctx,
+                rx: orx,
+                handle: Some(handle),
+                num_agents: count * per_agent,
+                num_arenas: count,
+            });
         }
 
         MultiEngine {
@@ -177,6 +203,25 @@ impl MultiEngine {
             off += w.num_agents;
         }
         Ok(())
+    }
+
+    /// Maps the global `arena_idx` to (worker, local_idx) using the same contiguous
+    /// even-split assignment as construction, sends `Cmd::Debug`, and returns the
+    /// worker's JSON state dump + that arena's obs (all agents) + agent count.
+    pub fn debug_arena(&mut self, arena_idx: usize) -> Result<(String, Vec<f32>, usize), String> {
+        let mut base = 0usize;
+        for w in &self.workers {
+            if arena_idx < base + w.num_arenas {
+                let local_idx = arena_idx - base;
+                w.tx.send(Cmd::Debug { local_idx }).map_err(|e| e.to_string())?;
+                let out = w.rx.recv().map_err(|e| e.to_string())?;
+                let agents = out.obs.len() / OBS_SIZE;
+                let json = out.debug_json.ok_or_else(|| "worker returned no debug json".to_string())?;
+                return Ok((json, out.obs, agents));
+            }
+            base += w.num_arenas;
+        }
+        Err(format!("arena_idx {arena_idx} out of range [0, {base})"))
     }
 }
 
