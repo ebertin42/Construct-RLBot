@@ -15,19 +15,32 @@ def ppo_update(
     n = batch["obs"].shape[0]
     adv = batch["advantages"]
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-    stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0, "updates": 0}
+    stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0,
+             "updates": 0, "skipped": 0}
     for _ in range(epochs):
         perm = torch.randperm(n, device=batch["obs"].device)
         for s in range(0, n, minibatch_size):
             idx = perm[s : s + minibatch_size]
             logprobs, entropy, values = net.evaluate(batch["obs"][idx], batch["actions"][idx])
-            ratio = torch.exp(logprobs - batch["logprobs"][idx])
+            # clamp the logratio: with very sharp policies (|logits| ~ 100 after
+            # billions of steps) or stale old_logprobs (reward-regime swap),
+            # exp() overflows to inf and one bad minibatch NaNs every weight
+            # via clip_grad_norm. Beyond the clip range PPO's gradient is zero
+            # anyway, so the clamp changes nothing in the trust region.
+            logratio = torch.clamp(logprobs - batch["logprobs"][idx], -20.0, 20.0)
+            ratio = torch.exp(logratio)
             a = adv[idx]
             unclipped = ratio * a
             clipped = torch.clamp(ratio, 1 - clip, 1 + clip) * a
             policy_loss = -torch.min(unclipped, clipped).mean()
             value_loss = torch.nn.functional.mse_loss(values, batch["returns"][idx])
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
+            if not torch.isfinite(loss):
+                # never let a nonfinite loss reach backward(): one NaN gradient
+                # poisons the whole net through the shared grad-norm clip
+                optimizer.zero_grad()
+                stats["skipped"] += 1
+                continue
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm)

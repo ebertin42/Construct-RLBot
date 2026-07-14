@@ -21,6 +21,9 @@ p.add_argument("--checkpoint-dir", default=None)
 p.add_argument("--device", default=None)
 p.add_argument("--config", default="configs/train_v0.toml")
 p.add_argument("--reward-config", default=None)
+p.add_argument("--reset-optimizer", action="store_true",
+               help="drop Adam state (use when swapping reward regimes — stale "
+                    "moments belong to the old loss landscape)")
 args = p.parse_args()
 
 state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -38,6 +41,8 @@ if args.device:
     cfg.run["device"] = args.device
 if args.reward_config:
     cfg.reward_config_path = args.reward_config
+if args.reset_optimizer:
+    state["optimizer"] = None
 
 t = Trainer(cfg, _state=state)
 print(f"resumed at {t.total_steps:,} steps | arenas={cfg.env['num_arenas']} "

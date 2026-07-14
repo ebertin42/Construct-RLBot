@@ -29,7 +29,8 @@ class Trainer:
         self.total_steps = 0
         if _state:
             self.net.load_state_dict(_state["model"])
-            self.opt.load_state_dict(_state["optimizer"])
+            if _state["optimizer"] is not None:  # None = deliberate reset (regime swap)
+                self.opt.load_state_dict(_state["optimizer"])
             self.total_steps = _state["total_steps"]
 
     def collect(self, T: int) -> dict:
