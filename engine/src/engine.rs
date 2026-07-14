@@ -1,5 +1,6 @@
 use crate::{
     actions,
+    curriculum::CurriculumConfig,
     episode::{EpisodeArena, StepFlags},
     obs::OBS_SIZE,
     policy::{LayerWeights, MlpPolicy, PolicyWeights},
@@ -244,6 +245,7 @@ impl MultiEngine {
         reward_cfg: RewardConfig,
         seed: u32,
         num_threads: usize,
+        curriculum: Option<CurriculumConfig>,
     ) -> Self {
         let num_arenas = sizes.len();
         let threads = if num_threads == 0 {
@@ -261,7 +263,7 @@ impl MultiEngine {
             assigned += count;
             let (ctx, crx) = channel::<Cmd>();
             let (otx, orx) = channel::<WorkerOut>();
-            let (sch, cfg) = (schema.clone(), reward_cfg.clone());
+            let (sch, cfg, curr) = (schema.clone(), reward_cfg.clone(), curriculum.clone());
             // Seed by GLOBAL arena index: this makes each arena's own sim state
             // (kickoff RNG, per-arena action-sample RNG below) invariant to how
             // arenas are sharded across worker threads. That is NOT the same as
@@ -277,8 +279,9 @@ impl MultiEngine {
                     .iter()
                     .enumerate()
                     .map(|(i, &(b, o))| {
-                        EpisodeArena::new(b, o, sch.tick_skip, cfg.clone(),
-                                          sch.normalization.clone(), seed.wrapping_add((global_base + i) as u32))
+                        EpisodeArena::new_with_curriculum(b, o, sch.tick_skip, cfg.clone(),
+                                          sch.normalization.clone(), seed.wrapping_add((global_base + i) as u32),
+                                          curr.clone())
                     })
                     .collect();
                 // Per-arena agent counts (blue+orange, may vary across arenas now)

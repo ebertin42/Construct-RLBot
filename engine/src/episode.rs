@@ -1,7 +1,9 @@
 use crate::{
     actions,
+    curriculum::CurriculumConfig,
     obs::{self, OBS_SIZE},
     reward::{self, RewardConfig},
+    sampler::Pcg32,
     schema::Normalization,
 };
 use cxx::UniquePtr;
@@ -64,6 +66,8 @@ pub struct EpisodeArena {
     episode_start_tick: u64,
     last_touch_tick: u64,
     prev_state: GameState,
+    curriculum: Option<CurriculumConfig>,
+    rng: Pcg32,
 }
 
 impl EpisodeArena {
@@ -75,6 +79,18 @@ impl EpisodeArena {
         norm: Normalization,
         seed: u32,
     ) -> Self {
+        Self::new_with_curriculum(blue, orange, tick_skip, reward_cfg, norm, seed, None)
+    }
+
+    pub fn new_with_curriculum(
+        blue: usize,
+        orange: usize,
+        tick_skip: u32,
+        reward_cfg: RewardConfig,
+        norm: Normalization,
+        seed: u32,
+        curriculum: Option<CurriculumConfig>,
+    ) -> Self {
         let mut arena = Arena::default_standard();
         let mut car_ids = Vec::with_capacity(blue + orange);
         for _ in 0..blue {
@@ -83,10 +99,11 @@ impl EpisodeArena {
         for _ in 0..orange {
             car_ids.push(arena.pin_mut().add_car(Team::Orange, CarConfig::octane()));
         }
-        arena.pin_mut().reset_to_random_kickoff(Some(seed));
+        // Placeholder state — immediately overwritten by reset_episode() below,
+        // which performs the actual (possibly curriculum-driven) reset.
         let prev_state = arena.pin_mut().get_game_state();
         let start = prev_state.tick_count;
-        Self {
+        let mut this = Self {
             arena,
             table: actions::make_lookup_table(),
             car_ids,
@@ -98,7 +115,43 @@ impl EpisodeArena {
             episode_start_tick: start,
             last_touch_tick: start,
             prev_state,
+            curriculum,
+            rng: Pcg32::new((seed as u64) * 7919 + 13),
+        };
+        this.reset_episode();
+        this
+    }
+
+    /// Kickoff when curriculum is absent, or when the weighted coin says kickoff;
+    /// otherwise a bounded random scenario. Replaces every raw
+    /// `reset_to_random_kickoff` call site: always kicks off first for a clean
+    /// baseline (boost pads, `ball_hit_info` reset), then overwrites with a random
+    /// scenario when the curriculum draw says so — this keeps pad/hit-info hygiene
+    /// identical across both reset flavors.
+    fn reset_episode(&mut self) {
+        self.seed = self.seed.wrapping_mul(747796405).wrapping_add(2891336453);
+        let use_random = match &self.curriculum {
+            Some(c) => {
+                let p = c.random_weight / (c.random_weight + c.kickoff_weight);
+                self.rng.next_f32() < p
+            }
+            None => false,
+        };
+        self.arena.pin_mut().reset_to_random_kickoff(Some(self.seed));
+        if use_random {
+            let bounds = self.curriculum.as_ref().unwrap().random.clone();
+            crate::curriculum::random_reset(self.arena.pin_mut(), &mut self.rng, &bounds);
         }
+        let gs = self.arena.pin_mut().get_game_state();
+        self.episode_start_tick = gs.tick_count;
+        self.last_touch_tick = gs.tick_count;
+        self.prev_state = gs;
+    }
+
+    /// Test/debug helper: force an episode reset (through the same curriculum-aware
+    /// path `step` uses on termination/truncation).
+    pub fn debug_force_reset(&mut self) {
+        self.reset_episode();
     }
 
     pub fn num_agents(&self) -> usize {
@@ -155,12 +208,7 @@ impl EpisodeArena {
                 flags[a] = StepFlags { terminated: true, truncated: false };
             }
             final_obs[..n * OBS_SIZE].fill(0.0);
-            self.seed = self.seed.wrapping_mul(747796405).wrapping_add(2891336453);
-            self.arena.pin_mut().reset_to_random_kickoff(Some(self.seed));
-            let gs = self.arena.pin_mut().get_game_state();
-            self.episode_start_tick = gs.tick_count;
-            self.last_touch_tick = gs.tick_count;
-            self.prev_state = gs;
+            self.reset_episode();
             return;
         }
 
@@ -213,12 +261,7 @@ impl EpisodeArena {
                 let ci = self.agent_car_index(&cur, a);
                 obs::build_obs(&cur, ci, &self.norm, &mut final_obs[a * OBS_SIZE..(a + 1) * OBS_SIZE]);
             }
-            self.seed = self.seed.wrapping_mul(747796405).wrapping_add(2891336453);
-            self.arena.pin_mut().reset_to_random_kickoff(Some(self.seed));
-            let gs = self.arena.pin_mut().get_game_state();
-            self.episode_start_tick = gs.tick_count;
-            self.last_touch_tick = gs.tick_count;
-            self.prev_state = gs;
+            self.reset_episode();
         } else {
             self.prev_state = cur;
         }

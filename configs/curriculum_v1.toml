@@ -1,0 +1,9 @@
+# Episode-reset mixture. Weights are relative (normalized internally).
+kickoff_weight = 0.4
+random_weight = 0.6
+
+[random]
+car_speed_max = 1800.0
+ball_speed_max = 2500.0
+z_max = 1700.0
+min_separation = 300.0

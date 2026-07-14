@@ -8,6 +8,7 @@ use pyo3::types::PyDict;
 use std::collections::HashMap;
 
 pub mod actions;
+pub mod curriculum;
 pub mod engine;
 pub mod episode;
 pub mod obs;
@@ -63,7 +64,7 @@ impl Engine {
     #[new]
     #[pyo3(signature = (num_arenas=32, blue=1, orange=1, schema_path="schema/v0.toml",
                         reward_config_path="configs/reward_v0.toml", meshes_path=None,
-                        seed=0, num_threads=0, team_size_weights=None))]
+                        seed=0, num_threads=0, team_size_weights=None, curriculum_config_path=None))]
     fn new(
         num_arenas: usize,
         blue: usize,
@@ -74,6 +75,7 @@ impl Engine {
         seed: u32,
         num_threads: usize,
         team_size_weights: Option<Vec<f64>>,
+        curriculum_config_path: Option<&str>,
     ) -> PyResult<Self> {
         sim_init::ensure_init(meshes_path);
         let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
@@ -103,7 +105,11 @@ impl Engine {
             }
             None => vec![(blue, orange); num_arenas],
         };
-        Ok(Engine { inner: engine::MultiEngine::new(sizes, sch, cfg, seed, num_threads) })
+        let curriculum = match curriculum_config_path {
+            Some(p) => Some(crate::curriculum::CurriculumConfig::load(p).map_err(PyValueError::new_err)?),
+            None => None,
+        };
+        Ok(Engine { inner: engine::MultiEngine::new(sizes, sch, cfg, seed, num_threads, curriculum) })
     }
 
     #[getter]
