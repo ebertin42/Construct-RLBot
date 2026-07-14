@@ -14,9 +14,11 @@ def test_engine_accepts_v1_config():
     eng.set_weights(sd)
     out = eng.collect(32)
     assert np.isfinite(out["rewards"]).all()
-    # goal weight is 20: nothing on a random-ish rollout should exceed the
-    # theoretical per-step bound |goal| + sum of shaping weights
-    assert np.abs(out["rewards"]).max() <= 20.0 + 2.0 + 0.5 + 0.3 + 0.02 + 1e-4
+    # Post-blend per-step bound (1v1, reward_v1.toml): raw max ≈ 22.82
+    # (goal 20 + shaping ≈ 2.82); blend adds -opp_spirit*r_opp where the
+    # conceder can be ≈ -16.5 (concede -16 + worst shaping) →
+    # 22.82 + 0.3*16.5 ≈ 27.8. Assert with headroom:
+    assert np.abs(out["rewards"]).max() <= 28.5
 
 
 def test_v0_config_still_loads():
