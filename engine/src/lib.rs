@@ -1,7 +1,11 @@
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    PyUntypedArrayMethods,
+};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use std::collections::HashMap;
 
 pub mod actions;
 pub mod engine;
@@ -122,6 +126,47 @@ impl Engine {
             term.into_pyarray(py),
             trunc.into_pyarray(py),
             numpy::ndarray::Array2::from_shape_vec((n, d), fin).unwrap().into_pyarray(py),
+        ))
+    }
+
+    /// Loads a PyTorch `state_dict` (as `dict[str, np.float32 ndarray]`) into every
+    /// worker's `MlpPolicy` plus the debug-forward copy held on `MultiEngine`. Keys
+    /// follow `construct.learn.model.PolicyValueNet`'s naming: `trunk.{0,2,...}.weight`
+    /// / `.bias` (nn.Sequential Linear/ReLU pairs), `policy_head.{weight,bias}`,
+    /// `value_head.{weight,bias}`.
+    fn set_weights(&mut self, weights: HashMap<String, PyReadonlyArrayDyn<'_, f32>>) -> PyResult<()> {
+        let arrays: HashMap<String, (Vec<f32>, Vec<usize>)> = weights.into_iter()
+            .map(|(k, v)| {
+                let shape = v.shape().to_vec();
+                (k, (v.as_array().iter().copied().collect(), shape))
+            })
+            .collect();
+        let pw = engine::parse_state_dict(arrays).map_err(PyValueError::new_err)?;
+        self.inner.set_weights(pw).map_err(PyValueError::new_err)
+    }
+
+    /// Runs `obs` (np f32, shape (B, obs_size)) through the policy loaded by the most
+    /// recent `set_weights` call. Returns `(logits (B, action_count), values (B,))`.
+    /// Used for parity testing against the PyTorch reference net — not part of the
+    /// training rollout path (see Task 4's Cmd::Collect for that).
+    fn debug_policy_forward<'py>(
+        &self,
+        py: Python<'py>,
+        obs: PyReadonlyArray2<'py, f32>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray1<f32>>)> {
+        let shape = obs.shape();
+        let (batch, obs_dim) = (shape[0], shape[1]);
+        let flat: Vec<f32> = obs.as_array().iter().copied().collect();
+        let (logits, values) = self
+            .inner
+            .debug_policy_forward(&flat, batch, obs_dim)
+            .map_err(PyValueError::new_err)?;
+        let action_count = logits.len() / batch.max(1);
+        Ok((
+            numpy::ndarray::Array2::from_shape_vec((batch, action_count), logits)
+                .unwrap()
+                .into_pyarray(py),
+            values.into_pyarray(py),
         ))
     }
 

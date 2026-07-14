@@ -1,19 +1,29 @@
 use crate::{
     episode::{EpisodeArena, StepFlags},
     obs::OBS_SIZE,
+    policy::{LayerWeights, MlpPolicy, PolicyWeights},
     reward::RewardConfig,
     schema::Schema,
 };
+use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 enum Cmd {
     Reset,
     Step(Vec<i64>),
     Debug { local_idx: usize },
+    SetWeights(Arc<PolicyWeights>),
     Shutdown,
 }
 
+/// Worker -> main-thread reply. `Step`/`Reset`/`Debug` populate the step-shaped
+/// buffers and leave `error` as `None`; `SetWeights` leaves the buffers empty and
+/// uses `error` to signal ack (`None`) vs failure (`Some(msg)`). One struct (rather
+/// than a response enum per Cmd) keeps the worker's single `Sender<WorkerOut>`
+/// channel type unchanged and gives Task 4's `Cmd::Collect` the same ack/err slot
+/// to reuse alongside whatever payload fields it adds.
 struct WorkerOut {
     obs: Vec<f32>,
     rewards: Vec<f32>,
@@ -21,6 +31,84 @@ struct WorkerOut {
     truncated: Vec<bool>,
     final_obs: Vec<f32>,
     debug_json: Option<String>,
+    error: Option<String>,
+}
+
+impl WorkerOut {
+    fn empty() -> Self {
+        WorkerOut {
+            obs: vec![],
+            rewards: vec![],
+            terminated: vec![],
+            truncated: vec![],
+            final_obs: vec![],
+            debug_json: None,
+            error: None,
+        }
+    }
+
+    fn ack() -> Self {
+        WorkerOut::empty()
+    }
+
+    fn err(msg: String) -> Self {
+        WorkerOut { error: Some(msg), ..WorkerOut::empty() }
+    }
+}
+
+/// Parses a Python state_dict's raw arrays (`name -> (flat row-major data, shape)`)
+/// into `PolicyWeights`. Expects PyTorch `nn.Sequential` trunk layout: `trunk.{i}.weight`
+/// / `trunk.{i}.bias` for the Linear sublayers (ReLU occupies the odd indices, so `i`
+/// is even: 0, 2, 4, ...), plus `policy_head.{weight,bias}` and `value_head.{weight,bias}`.
+pub fn parse_state_dict(
+    arrays: HashMap<String, (Vec<f32>, Vec<usize>)>,
+) -> Result<PolicyWeights, String> {
+    fn take_layer(
+        arrays: &HashMap<String, (Vec<f32>, Vec<usize>)>,
+        prefix: &str,
+    ) -> Result<LayerWeights, String> {
+        let (w, wshape) = arrays.get(&format!("{prefix}.weight"))
+            .ok_or_else(|| format!("missing {prefix}.weight"))?;
+        let (b, bshape) = arrays.get(&format!("{prefix}.bias"))
+            .ok_or_else(|| format!("missing {prefix}.bias"))?;
+        if wshape.len() != 2 || bshape.len() != 1 || bshape[0] != wshape[0] {
+            return Err(format!("bad shapes for {prefix}: {wshape:?} / {bshape:?}"));
+        }
+        Ok(LayerWeights {
+            w: w.clone(), b: b.clone(), out_dim: wshape[0], in_dim: wshape[1],
+        })
+    }
+
+    // trunk.N.weight for even N (nn.Sequential interleaves ReLU at odd indices)
+    let mut trunk_ids: Vec<usize> = arrays.keys()
+        .filter_map(|k| k.strip_prefix("trunk.")?.strip_suffix(".weight")?.parse().ok())
+        .collect();
+    trunk_ids.sort_unstable();
+    if trunk_ids.is_empty() {
+        return Err("no trunk layers found".into());
+    }
+    let trunk = trunk_ids.iter()
+        .map(|i| take_layer(&arrays, &format!("trunk.{i}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let policy = take_layer(&arrays, "policy_head")?;
+    let value = take_layer(&arrays, "value_head")?;
+
+    // chain consistency: each trunk layer's in_dim must match the previous layer's out_dim
+    for i in 1..trunk.len() {
+        if trunk[i].in_dim != trunk[i - 1].out_dim {
+            return Err(format!(
+                "trunk layer {i} in_dim {} does not match layer {} out_dim {}",
+                trunk[i].in_dim, i - 1, trunk[i - 1].out_dim
+            ));
+        }
+    }
+    if policy.in_dim != trunk.last().unwrap().out_dim
+        || value.in_dim != trunk.last().unwrap().out_dim
+        || value.out_dim != 1
+    {
+        return Err("head shapes do not match trunk output".into());
+    }
+    Ok(PolicyWeights { trunk, policy, value })
 }
 
 struct Worker {
@@ -36,6 +124,9 @@ pub struct MultiEngine {
     pub num_agents: usize,
     pub obs_size: usize,
     pub action_count: usize,
+    // Debug-forward policy copy — see `set_weights`/`debug_policy_forward` doc comments
+    // for why this lives here instead of routing through a worker.
+    debug_policy: Option<MlpPolicy>,
 }
 
 impl MultiEngine {
@@ -76,6 +167,12 @@ impl MultiEngine {
                     })
                     .collect();
                 let agents = count * per_agent;
+                // Holds the worker's own MlpPolicy, set via Cmd::SetWeights. Unused by
+                // Reset/Step/Debug today; Task 4's Cmd::Collect (on-worker rollout with
+                // policy-driven actions) will read it. `debug_policy_forward` (Task 3)
+                // does not route through here — see MultiEngine::debug_policy_forward.
+                #[allow(unused_assignments, unused_variables)]
+                let mut policy: Option<MlpPolicy> = None;
                 while let Ok(cmd) = crx.recv() {
                     match cmd {
                         Cmd::Shutdown => break,
@@ -87,6 +184,7 @@ impl MultiEngine {
                                 truncated: vec![false; agents],
                                 final_obs: vec![0.0; agents * OBS_SIZE],
                                 debug_json: None,
+                                error: None,
                             };
                             let mut off = 0;
                             for ar in arenas.iter_mut() {
@@ -104,6 +202,7 @@ impl MultiEngine {
                                 truncated: vec![false; agents],
                                 final_obs: vec![0.0; agents * OBS_SIZE],
                                 debug_json: None,
+                                error: None,
                             };
                             let mut a_off = 0;
                             let mut flags = vec![StepFlags::default(); per_agent];
@@ -134,10 +233,25 @@ impl MultiEngine {
                                 truncated: vec![],
                                 final_obs: vec![],
                                 debug_json: None,
+                                error: None,
                             };
                             ar.write_obs(&mut out.obs);
                             out.debug_json = Some(ar.debug_state_json());
                             let _ = otx.send(out);
+                        }
+                        Cmd::SetWeights(w) => {
+                            match MlpPolicy::new(&w) {
+                                Ok(p) => {
+                                    #[allow(unused_assignments)]
+                                    {
+                                        policy = Some(p);
+                                    }
+                                    let _ = otx.send(WorkerOut::ack());
+                                }
+                                Err(e) => {
+                                    let _ = otx.send(WorkerOut::err(e));
+                                }
+                            }
                         }
                     }
                 }
@@ -156,6 +270,7 @@ impl MultiEngine {
             obs_size: OBS_SIZE,
             action_count: crate::actions::TABLE_SIZE,
             workers,
+            debug_policy: None,
         }
     }
 
@@ -203,6 +318,55 @@ impl MultiEngine {
             off += w.num_agents;
         }
         Ok(())
+    }
+
+    /// Broadcasts `Cmd::SetWeights` to every worker (each builds its own `MlpPolicy`
+    /// for Task 4's on-worker rollout) and, on success, also builds a policy copy held
+    /// directly on `MultiEngine` for `debug_policy_forward`.
+    ///
+    /// Design choice: `debug_policy_forward` needs a synchronous request/response call
+    /// from Python for parity testing. The brief offered either a worker-0 round-trip
+    /// (new `Cmd::DebugForward` + channel plumbing) or a `MultiEngine`-held policy copy
+    /// evaluated on the calling thread. We chose the held copy: it needs no new Cmd
+    /// variant or channel wiring, keeps the debug path off the worker channels
+    /// entirely (so it can never race with in-flight Step/Reset), and candle's CPU
+    /// forward pass is cheap enough that duplicating the weights once per set_weights
+    /// call is a non-issue. The tradeoff is it technically evaluates "the trainer's
+    /// weights" rather than literally "worker 0's net", but since every worker gets
+    /// the identical broadcast weights, the two are equivalent in practice.
+    pub fn set_weights(&mut self, weights: PolicyWeights) -> Result<(), String> {
+        let arc = Arc::new(weights);
+        let debug_policy = MlpPolicy::new(&arc)?;
+        for w in &self.workers {
+            w.tx.send(Cmd::SetWeights(arc.clone())).map_err(|e| e.to_string())?;
+        }
+        let mut first_err: Option<String> = None;
+        for w in &self.workers {
+            let out = w.rx.recv().map_err(|e| e.to_string())?;
+            if let Some(e) = out.error {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        self.debug_policy = Some(debug_policy);
+        Ok(())
+    }
+
+    /// Runs `obs` (row-major batch*obs_size) through the `MultiEngine`-held policy
+    /// copy built by the most recent `set_weights` call. Evaluated on the calling
+    /// (Python) thread — no worker round-trip. See `set_weights` for why.
+    pub fn debug_policy_forward(
+        &self,
+        obs: &[f32],
+        batch: usize,
+        obs_dim: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let policy = self.debug_policy.as_ref().ok_or("set_weights has not been called yet")?;
+        policy.forward(obs, batch, obs_dim)
     }
 
     /// Maps the global `arena_idx` to (worker, local_idx) using the same contiguous
