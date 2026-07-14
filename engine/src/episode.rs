@@ -21,6 +21,19 @@ pub struct StepFlags {
     pub truncated: bool,
 }
 
+/// r_i' = (1-tau)*r_i + tau*mean(own team) - opp*mean(opponent team).
+/// `blue_count` splits `rewards` (blue-then-orange agent order). An empty
+/// team's mean is 0.0 (1v0 test arenas).
+pub fn blend_team_spirit(rewards: &mut [f32], blue_count: usize, tau: f32, opp: f32) {
+    let mean = |s: &[f32]| if s.is_empty() { 0.0 } else { s.iter().sum::<f32>() / s.len() as f32 };
+    let bm = mean(&rewards[..blue_count]);
+    let om = mean(&rewards[blue_count..]);
+    for (i, r) in rewards.iter_mut().enumerate() {
+        let (own, other) = if i < blue_count { (bm, om) } else { (om, bm) };
+        *r = (1.0 - tau) * *r + tau * own - opp * other;
+    }
+}
+
 fn vec3_finite(v: &Vec3) -> bool {
     v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
 }
@@ -43,6 +56,7 @@ pub struct EpisodeArena {
     arena: UniquePtr<Arena>,
     table: Vec<[f32; 8]>,
     car_ids: Vec<u32>, // blue asc, then orange asc — agent index order
+    blue_count: usize,
     tick_skip: u32,
     reward_cfg: RewardConfig,
     norm: Normalization,
@@ -76,6 +90,7 @@ impl EpisodeArena {
             arena,
             table: actions::make_lookup_table(),
             car_ids,
+            blue_count: blue,
             tick_skip,
             reward_cfg,
             norm,
@@ -183,6 +198,15 @@ impl EpisodeArena {
             flags[a] = StepFlags { terminated, truncated };
         }
 
+        if self.reward_cfg.team_spirit != 0.0 || self.reward_cfg.opp_spirit != 0.0 {
+            blend_team_spirit(
+                &mut rewards[..n],
+                self.blue_count,
+                self.reward_cfg.team_spirit,
+                self.reward_cfg.opp_spirit,
+            );
+        }
+
         if terminated || truncated {
             // capture final obs, then reset
             for a in 0..n {
@@ -245,5 +269,30 @@ impl EpisodeArena {
             "cars": cars,
         })
         .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blend_math_exact() {
+        // raw: blue [1.0, 3.0], orange [-2.0, 0.0]; tau=0.5, opp=0.25
+        // bm=2.0, om=-1.0
+        // blue0' = 0.5*1.0 + 0.5*2.0 - 0.25*(-1.0) = 1.75
+        // blue1' = 0.5*3.0 + 0.5*2.0 - 0.25*(-1.0) = 2.75
+        // org0'  = 0.5*(-2.0) + 0.5*(-1.0) - 0.25*2.0 = -2.0
+        // org1'  = 0.5*0.0 + 0.5*(-1.0) - 0.25*2.0 = -1.0
+        let mut r = vec![1.0f32, 3.0, -2.0, 0.0];
+        blend_team_spirit(&mut r, 2, 0.5, 0.25);
+        assert_eq!(r, vec![1.75, 2.75, -2.0, -1.0]);
+    }
+
+    #[test]
+    fn blend_handles_empty_orange() {
+        let mut r = vec![2.0f32];
+        blend_team_spirit(&mut r, 1, 0.5, 0.25); // opp mean = 0.0
+        assert_eq!(r, vec![2.0]); // (1-.5)*2 + .5*2 - .25*0 = 2.0
     }
 }

@@ -9,3 +9,7 @@ touch_accel = 2.0           # pay for IMPACT: hard hits, clears, shots
 vel_ball_to_goal = 0.5      # ball moving at their net = income
 offensive_potential = 0.3   # positioned-to-shoot shaping (KRC)
 # note: touch and touch_accel STACK if both nonzero — set at most one.
+
+# Team play (identity at 1v1: own == team mean). Lucy-SKG used tau=0.3.
+team_spirit = 0.3
+opp_spirit = 0.3

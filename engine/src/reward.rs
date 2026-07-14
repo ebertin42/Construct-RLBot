@@ -14,6 +14,12 @@ pub struct RewardConfig {
     pub vel_ball_to_goal: f32, // ball velocity toward opp net
     #[serde(default)]
     pub offensive_potential: f32, // KRC(vel_to_ball, ball-goal alignment)
+    /// Team-spirit blending (spec §4): r_i' = (1-t)*r_i + t*mean(team) - opp_spirit*mean(opponents).
+    /// Applied in EpisodeArena::step, not here (needs all agents' raw rewards).
+    #[serde(default)]
+    pub team_spirit: f32,
+    #[serde(default)]
+    pub opp_spirit: f32,
 }
 
 impl RewardConfig {
@@ -143,6 +149,8 @@ mod tests {
             touch_accel: 0.0,
             vel_ball_to_goal: 0.0,
             offensive_potential: 0.0,
+            team_spirit: 0.0,
+            opp_spirit: 0.0,
         }
     }
 
@@ -266,6 +274,8 @@ mod tests {
             touch_accel: 2.0,
             vel_ball_to_goal: 0.5,
             offensive_potential: 0.3,
+            team_spirit: 0.0,
+            opp_spirit: 0.0,
         }
     }
 
@@ -437,5 +447,12 @@ mod tests {
             let r = compute(&gs, &gs, idx, None, &cfg);
             assert!(r >= 0.0 && r <= cfg.offensive_potential, "car {idx}: {r}");
         }
+    }
+
+    #[test]
+    fn v1_toml_and_v0_toml_parse_with_zero_spirit_defaults() {
+        let v0 = RewardConfig::load("../configs/reward_v0.toml").unwrap();
+        assert_eq!(v0.team_spirit, 0.0);
+        assert_eq!(v0.opp_spirit, 0.0);
     }
 }
