@@ -30,6 +30,7 @@ impl Pcg32 {
 /// Softmax-CDF sample; numerically stable (max-subtracted).
 /// Returns (index, ln softmax(logits)[index]).
 pub fn sample_categorical(logits: &[f32], rng: &mut Pcg32) -> (usize, f32) {
+    assert!(!logits.is_empty(), "sample_categorical: empty logits");
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut z = 0f32;
     // two passes: normalizer, then CDF walk
@@ -97,5 +98,12 @@ mod tests {
         let (a, lp) = sample_categorical(&logits, &mut rng);
         assert_eq!(a, 0);
         assert!(lp.is_finite() && lp <= 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "empty logits")]
+    fn empty_logits_panics_with_clear_message() {
+        let mut rng = Pcg32::new(1);
+        sample_categorical(&[], &mut rng);
     }
 }
