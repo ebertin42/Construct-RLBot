@@ -28,6 +28,20 @@ def test_deterministic_with_seed():
         np.testing.assert_array_equal(oa, ob)
         np.testing.assert_array_equal(ra, rb)
 
+def test_deterministic_across_thread_counts():
+    a = Engine(num_arenas=4, blue=1, orange=1, schema_path="schema/v0.toml",
+               reward_config_path="configs/reward_v0.toml", seed=7, num_threads=1)
+    b = Engine(num_arenas=4, blue=1, orange=1, schema_path="schema/v0.toml",
+               reward_config_path="configs/reward_v0.toml", seed=7, num_threads=4)
+    a.reset(); b.reset()
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        acts = rng.integers(0, 90, size=8).astype(np.int64)
+        oa, ra, *_ = a.step(acts)
+        ob, rb, *_ = b.step(acts)
+        np.testing.assert_array_equal(oa, ob)
+        np.testing.assert_array_equal(ra, rb)
+
 def test_rejects_bad_actions():
     eng = mk()
     eng.reset()

@@ -62,13 +62,14 @@ impl MultiEngine {
             let (ctx, crx) = channel::<Cmd>();
             let (otx, orx) = channel::<WorkerOut>();
             let (sch, cfg) = (schema.clone(), reward_cfg.clone());
-            let wseed = seed.wrapping_add((t as u32) << 16);
+            // seed by GLOBAL arena index so rollouts are invariant to num_threads
+            let global_base = assigned - count;
             let handle = std::thread::spawn(move || {
                 // arenas created inside the worker thread
                 let mut arenas: Vec<EpisodeArena> = (0..count)
                     .map(|i| {
                         EpisodeArena::new(blue, orange, sch.tick_skip, cfg.clone(),
-                                          sch.normalization.clone(), wseed.wrapping_add(i as u32))
+                                          sch.normalization.clone(), seed.wrapping_add((global_base + i) as u32))
                     })
                     .collect();
                 let agents = count * per_agent;
