@@ -1,0 +1,28 @@
+schema_path = "schema/v0.toml"
+reward_config_path = "configs/reward_v0.toml"
+
+[env]
+num_arenas = 64
+blue = 1
+orange = 1
+seed = 0
+
+[net]
+hidden = [512, 512]
+
+[ppo]
+rollout_steps = 256        # T per iteration -> batch = T * num_agents = 32768
+gamma = 0.9954             # ~10s half-life at 15 Hz
+lam = 0.95
+lr = 2e-4
+clip = 0.2
+entropy_coef = 0.01
+value_coef = 1.0
+epochs = 3
+minibatch_size = 8192
+
+[run]
+device = "cuda"            # falls back to cpu if unavailable
+checkpoint_dir = "checkpoints"
+save_every_iters = 20
+log_every_iters = 1
