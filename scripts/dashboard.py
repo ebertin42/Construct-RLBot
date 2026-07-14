@@ -18,6 +18,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 LOG = REPO / "checkpoints" / "train_v0.log"
+REMOTE_LOG = REPO / "checkpoints" / "train_remote.log"  # synced from the remote box
 EVAL_HISTORY = REPO / "checkpoints" / "eval_history.jsonl"
 LINE = re.compile(
     r"iter (\d+) steps ([\d,]+) sps ([\d,]+) ep_rew ([-\d.]+) "
@@ -29,9 +30,13 @@ MAX_POINTS = 500
 
 def parse_log():
     rows, restarts = [], []
-    try:
-        text = LOG.read_text(errors="replace")
-    except FileNotFoundError:
+    text = ""
+    for src in (LOG, REMOTE_LOG):
+        try:
+            text += src.read_text(errors="replace") + "\n"
+        except FileNotFoundError:
+            pass
+    if not text.strip():
         return rows, restarts
     for m in RESUME.finditer(text):
         restarts.append(int(m.group(1).replace(",", "")))

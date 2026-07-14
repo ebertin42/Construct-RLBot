@@ -11,3 +11,4 @@ checkpoints/
 wandb/
 *.pt
 /rlviser
+checkpoints_b/
