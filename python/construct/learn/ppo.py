@@ -25,8 +25,12 @@ def ppo_update(
             # clamp the logratio: with very sharp policies (|logits| ~ 100 after
             # billions of steps) or stale old_logprobs (reward-regime swap),
             # exp() overflows to inf and one bad minibatch NaNs every weight
-            # via clip_grad_norm. Beyond the clip range PPO's gradient is zero
-            # anyway, so the clamp changes nothing in the trust region.
+            # via clip_grad_norm. NOTE: PPO's gradient is NOT always zero
+            # outside the clip range (it is nonzero when the unclipped branch
+            # wins the min, e.g. A<0 with ratio >> 1+eps), so this clamp CAN
+            # bias truly pathological minibatches — but at |logratio|=20 the
+            # ratio is ~5e8, astronomically past the trust region; in normal
+            # operation the clamp never fires. Do not widen it.
             logratio = torch.clamp(logprobs - batch["logprobs"][idx], -20.0, 20.0)
             ratio = torch.exp(logratio)
             a = adv[idx]

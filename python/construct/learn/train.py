@@ -98,6 +98,9 @@ class Trainer:
                 "total_steps": self.total_steps,
                 "schema_version": self.schema["version"],
                 "config": {"net": self.cfg.net, "ppo": self.cfg.ppo, "env": self.cfg.env},
+                # provenance only (resume takes the path from CLI/config, not from here):
+                # records which reward regime produced this checkpoint
+                "reward_config_path": self.cfg.reward_config_path,
             },
             path,
         )
