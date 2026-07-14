@@ -28,3 +28,15 @@ def test_checkpoint_roundtrip_resumes(tmp_path):
     t2.run(max_iterations=1)
     assert t2.total_steps == 256
     assert any(not torch.equal(a, b) for a, b in zip(before, t2.net.parameters()))
+
+def test_collect_uses_rust_path(tmp_path):
+    t = Trainer(small_cfg(tmp_path))
+    batch = t.collect(8)
+    n = t.engine.num_agents
+    assert batch["obs"].shape == (8 * n, t.engine.obs_size)
+    assert batch["logprobs"].shape == (8 * n,)
+    # rust-collected logprobs must be consistent with the current net
+    import torch
+    with torch.no_grad():
+        lp, _, _ = t.net.evaluate(batch["obs"], batch["actions"])
+    assert (lp - batch["logprobs"]).abs().max().item() < 1e-4

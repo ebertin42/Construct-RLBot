@@ -31,44 +31,34 @@ class Trainer:
             self.net.load_state_dict(_state["model"])
             self.opt.load_state_dict(_state["optimizer"])
             self.total_steps = _state["total_steps"]
-        self.obs = torch.as_tensor(self.engine.reset(), device=self.device)
 
     def collect(self, T: int) -> dict:
         N, D = self.engine.num_agents, self.engine.obs_size
-        obs_b = torch.zeros((T, N, D), device=self.device)
-        act_b = torch.zeros((T, N), dtype=torch.long, device=self.device)
-        logp_b = torch.zeros((T, N), device=self.device)
-        val_b = torch.zeros((T + 1, N), device=self.device)
-        rew_b = np.zeros((T, N), dtype=np.float32)
-        term_b = np.zeros((T, N), dtype=bool)
-        trunc_b = np.zeros((T, N), dtype=bool)
-        finv_b = torch.zeros((T, N), device=self.device)
+        self.engine.set_weights(
+            {k: v.detach().cpu().numpy().astype(np.float32)
+             for k, v in self.net.state_dict().items()}
+        )
+        out = self.engine.collect(T)
 
-        for t in range(T):
-            action, logp, value = self.net.act(self.obs)
-            obs_b[t], act_b[t], logp_b[t], val_b[t] = self.obs, action, logp, value
-            nobs, rew, term, trunc, fin = self.engine.step(action.cpu().numpy().astype(np.int64))
-            rew_b[t], term_b[t], trunc_b[t] = rew, term, trunc
-            done = term | trunc
-            if done.any():
-                with torch.no_grad():
-                    fv = self.net(torch.as_tensor(fin[done], device=self.device))[1]
-                finv_b[t, torch.as_tensor(done, device=self.device)] = fv
-            self.obs = torch.as_tensor(nobs, device=self.device)
-        with torch.no_grad():
-            val_b[T] = self.net(self.obs)[1]
-
+        values_ext = np.concatenate(
+            [out["values"], out["last_values"][None, :]], axis=0
+        )
         adv, ret = compute_gae(
-            rew_b, val_b.cpu().numpy(), finv_b.cpu().numpy(), term_b, trunc_b,
+            out["rewards"], values_ext, out["final_values"],
+            out["terminated"], out["truncated"],
             self.cfg.ppo["gamma"], self.cfg.ppo["lam"],
         )
-        flat = lambda x: x.reshape(-1, *x.shape[2:])
+        dev = self.device
+        flat_obs = torch.as_tensor(out["obs"].reshape(T * N, D), device=dev)
+        done_frac = (out["terminated"] | out["truncated"]).sum()
         return {
-            "obs": flat(obs_b), "actions": flat(act_b), "logprobs": flat(logp_b),
-            "advantages": torch.as_tensor(adv, device=self.device).reshape(-1),
-            "returns": torch.as_tensor(ret, device=self.device).reshape(-1),
-            "values": flat(val_b[:T]),
-            "ep_reward_mean": float(rew_b.sum() / max(1, (term_b | trunc_b).sum())),
+            "obs": flat_obs,
+            "actions": torch.as_tensor(out["actions"].reshape(-1), device=dev),
+            "logprobs": torch.as_tensor(out["logprobs"].reshape(-1), device=dev),
+            "advantages": torch.as_tensor(adv, device=dev).reshape(-1),
+            "returns": torch.as_tensor(ret, device=dev).reshape(-1),
+            "values": torch.as_tensor(out["values"].reshape(-1), device=dev),
+            "ep_reward_mean": float(out["rewards"].sum() / max(1, done_frac)),
         }
 
     def run(self, max_iterations: int | None = None):
