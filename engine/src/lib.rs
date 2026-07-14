@@ -6,6 +6,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub mod actions;
 pub mod curriculum;
@@ -171,16 +172,55 @@ impl Engine {
         self.inner.set_weights(pw).map_err(PyValueError::new_err)
     }
 
+    /// Loads up to 8 opponent-policy `state_dict`s (same conversion/key contract as
+    /// `set_weights`) into every worker's `opponents` slots, indexed 0..len by list
+    /// position. Rebuilds all slots wholesale each call — `[]` clears them. A
+    /// `collect(..., arena_opponents=...)` value `k >= 0` drives that arena's orange
+    /// side with `opponents[k]`; see `collect` below.
+    fn set_opponents(&mut self, opponents: Vec<HashMap<String, PyReadonlyArrayDyn<'_, f32>>>) -> PyResult<()> {
+        if opponents.len() > 8 {
+            return Err(PyValueError::new_err("at most 8 opponent slots"));
+        }
+        let parsed: Vec<policy::PolicyWeights> = opponents.into_iter()
+            .map(|w| {
+                let arrays: HashMap<String, (Vec<f32>, Vec<usize>)> = w.into_iter()
+                    .map(|(k, v)| {
+                        let shape = v.shape().to_vec();
+                        (k, (v.as_array().iter().copied().collect(), shape))
+                    })
+                    .collect();
+                engine::parse_state_dict(arrays)
+            })
+            .collect::<Result<_, _>>()
+            .map_err(PyValueError::new_err)?;
+        self.inner.set_opponents(parsed).map_err(PyValueError::new_err)
+    }
+
     /// Runs `steps` rounds of on-worker rollout (policy-driven actions, sampled with
     /// each arena's own deterministic Pcg32 — see `engine::MultiEngine::collect`) and
     /// returns a dict of numpy arrays for the trainer: `obs (T,N,94) f32`, `actions
     /// (T,N) i64`, `logprobs`/`values`/`rewards`/`final_values (T,N) f32`,
-    /// `terminated`/`truncated (T,N) bool`, `last_values (N,) f32`. Requires
-    /// `set_weights` to have been called first (else `ValueError`). The gather blocks
-    /// for multiple seconds, so it runs under `py.detach` to free the GIL.
-    fn collect<'py>(&mut self, py: Python<'py>, steps: usize) -> PyResult<Bound<'py, PyDict>> {
-        let out = py.detach(|| self.inner.collect(steps)).map_err(PyValueError::new_err)?;
-        let (t, n, d) = (steps, self.inner.num_agents, self.inner.obs_size);
+    /// `terminated`/`truncated (T,N) bool`, `last_values (N,) f32`, plus
+    /// `learner_agents` (python int) — the buffer width `N`. `N` is the FULL agent
+    /// count when `arena_opponents` is `None` (legacy, every arena self-play — byte-
+    /// identical to the pre-league behavior) or shrinks to just the learner-driven
+    /// rows (all agents of self-play arenas + blue agents of opponent arenas) when
+    /// `arena_opponents[i]` names an opponent slot (`-1` self-play, `k >= 0` slot `k`
+    /// set by `set_opponents`) for one or more arenas. Requires `set_weights` to have
+    /// been called first (else `ValueError`); a bad `arena_opponents` (wrong length,
+    /// unset slot, or an all-opponent assignment with zero learner rows) is also a
+    /// `ValueError`, raised before any worker does any work. The gather blocks for
+    /// multiple seconds, so it runs under `py.detach` to free the GIL.
+    #[pyo3(signature = (steps, arena_opponents=None))]
+    fn collect<'py>(
+        &mut self,
+        py: Python<'py>,
+        steps: usize,
+        arena_opponents: Option<Vec<i32>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let assignment = Arc::new(arena_opponents.unwrap_or_else(|| vec![-1; self.inner.num_arenas]));
+        let out = py.detach(|| self.inner.collect(steps, assignment)).map_err(PyValueError::new_err)?;
+        let (t, n, d) = (steps, out.learner_agents, self.inner.obs_size);
         let obs: Bound<'py, PyArray3<f32>> =
             numpy::ndarray::Array3::from_shape_vec((t, n, d), out.obs).unwrap().into_pyarray(py);
         let actions: Bound<'py, PyArray2<i64>> =
@@ -209,6 +249,7 @@ impl Engine {
         dict.set_item("truncated", truncated)?;
         dict.set_item("final_values", final_values)?;
         dict.set_item("last_values", last_values)?;
+        dict.set_item("learner_agents", n)?;
         Ok(dict)
     }
 
