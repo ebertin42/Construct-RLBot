@@ -10,3 +10,4 @@ assets/collision_meshes/
 checkpoints/
 wandb/
 *.pt
+/rlviser
