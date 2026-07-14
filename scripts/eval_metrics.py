@@ -18,9 +18,12 @@ obs = torch.as_tensor(eng.reset())
 STEPS = 4500  # 5 min of game time
 touches = 0
 dist_sum = 0.0
+torch.manual_seed(0)  # sampled actions, reproducible: argmax play deadlocks in
+# mirror-symmetric standoffs (both cars park at the ball) and zeroes the metric
 for _ in range(STEPS):
     with torch.no_grad():
-        acts = net(obs)[0].argmax(-1).numpy().astype(np.int64)
+        logits = net(obs)[0]
+        acts = torch.distributions.Categorical(logits=logits).sample().numpy().astype(np.int64)
     nobs, rew, term, trunc, _ = eng.step(acts)
     touches += int((rew >= 0.5).sum())  # touch weight fires at >= 0.5
     # obs[28:31] is (ball - car) * pos_norm
