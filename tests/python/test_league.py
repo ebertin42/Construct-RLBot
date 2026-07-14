@@ -38,3 +38,38 @@ def test_atomic_persistence(tmp_path):
     import json
     e = json.loads(lines[0])
     assert e["ck"] == "A" and e["games"] == 0
+
+
+import numpy as np
+import torch
+
+from construct.league.matches import MatchRunner, load_sd
+from construct.learn.model import PolicyValueNet
+
+
+def _sd(seed):
+    torch.manual_seed(seed)
+    return {k: v.detach().numpy().astype(np.float32)
+            for k, v in PolicyValueNet(94, 90, (64, 64)).state_dict().items()}
+
+
+def test_match_runs_and_counts(tmp_path):
+    mr = MatchRunner(num_arenas=4, seed=2)
+    ga, gb = mr.play(_sd(1), _sd(2), steps=600)
+    assert ga >= 0 and gb >= 0  # random-ish nets rarely score in 40s; counting must not crash
+
+
+def test_match_deterministic(tmp_path):
+    a = MatchRunner(num_arenas=4, seed=7).play(_sd(1), _sd(2), steps=400)
+    b = MatchRunner(num_arenas=4, seed=7).play(_sd(1), _sd(2), steps=400)
+    assert a == b
+
+
+def test_load_sd_roundtrip(tmp_path):
+    net = PolicyValueNet(94, 90, (64, 64))
+    ck = {"model": net.state_dict(), "config": {"net": {"hidden": [64, 64]}}, "total_steps": 1,
+          "schema_version": 0}
+    p = str(tmp_path / "ck.pt")
+    torch.save(ck, p)
+    sd = load_sd(p)
+    assert sd["policy_head.weight"].dtype == np.float32
