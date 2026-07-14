@@ -1,3 +1,4 @@
+# reward v2 = v1 + team-spirit blending (kept separate so v1-path resumes never change regime)
 # Stage 2/3 hybrid (spec §4): goal-dominant, impact-scaled touches, shot shaping.
 # Kills the flat-touch income that converged v0 runs into a non-scoring
 # possession farm (0.0-0.04 goals/min at 1.5B steps vs 1.62 at 150M).
@@ -9,3 +10,7 @@ touch_accel = 2.0           # pay for IMPACT: hard hits, clears, shots
 vel_ball_to_goal = 0.5      # ball moving at their net = income
 offensive_potential = 0.3   # positioned-to-shoot shaping (KRC)
 # note: touch and touch_accel STACK if both nonzero — set at most one.
+
+# Team play (identity at 1v1: own == team mean). Lucy-SKG used tau=0.3.
+team_spirit = 0.3
+opp_spirit = 0.3
