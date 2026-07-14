@@ -212,11 +212,14 @@ impl MultiEngine {
                     .collect();
                 let agents = count * per_agent;
                 // One Pcg32 per ARENA (not per agent), seeded by GLOBAL arena index —
-                // same key as the arena's own kickoff seed above — so sampling is
-                // invariant to how arenas are split across worker threads. Each arena's
-                // agents (blue-then-orange, matching `EpisodeArena::car_ids` order) draw
-                // from that arena's rng only; arenas never share an rng, so per-arena
-                // consumption order is fixed regardless of thread layout.
+                // same key as the arena's own kickoff seed above. Each arena's agents
+                // (blue-then-orange, matching `EpisodeArena::car_ids` order) draw from
+                // that arena's rng only; arenas never share an rng, so the RNG stream
+                // consumed per arena is fixed regardless of thread layout. Note this
+                // does NOT make collect() thread-count invariant end to end — the
+                // batched forward's float rounding varies with worker batch size (see
+                // the Cmd::Collect arm); the determinism contract is fixed
+                // (seed, num_arenas, num_threads) only.
                 let mut rngs: Vec<Pcg32> = (0..count)
                     .map(|i| Pcg32::new((seed as u64) * 1_000_000 + (global_base + i) as u64))
                     .collect();
@@ -312,82 +315,94 @@ impl MultiEngine {
                             let d = OBS_SIZE;
                             let action_count = actions::TABLE_SIZE;
                             let mut out = CollectOut::zeros(steps, agents, d);
-                            // Scratch sized to ONE arena (== per_agent rows), not the whole
-                            // worker batch. candle's CPU gemm rounds the *same* input row
-                            // differently depending on total batch size (verified empirically:
-                            // identical rows embedded in an 8-row vs 2-row forward differ by
-                            // up to ~6e-8 in the logits) — a worker's batch size is
-                            // `arenas_on_this_worker * per_agent`, which varies with the
-                            // thread count, so batching a whole worker's arenas together
-                            // would make values/logprobs thread-count-dependent at the bit
-                            // level. Forwarding one arena at a time keeps every forward call's
-                            // batch shape (`per_agent`) fixed regardless of how arenas are
-                            // split across workers, which is what makes the determinism test
-                            // (assert_array_equal across thread counts) pass exactly.
-                            let mut obs_buf = vec![0f32; per_agent * d];
+                            let mut obs_buf = vec![0f32; agents * d];
                             let mut rew_buf = vec![0f32; per_agent];
                             let mut flag_buf = vec![StepFlags::default(); per_agent];
-                            let mut fin_buf = vec![0f32; per_agent * d];
+                            let mut fin_buf = vec![0f32; agents * d];
 
                             let mut worker_err: Option<String> = None;
                             'rounds: for t in 0..steps {
-                                let mut a_base = 0usize; // this worker's running column offset
-                                for (ai, ar) in arenas.iter_mut().enumerate() {
-                                    let n = ar.num_agents(); // == per_agent
-                                    let row_s = t * agents + a_base;
+                                // 1. obs for all my arenas
+                                let mut off = 0;
+                                for ar in arenas.iter_mut() {
+                                    let n = ar.num_agents() * d;
+                                    ar.write_obs(&mut obs_buf[off..off + n]);
+                                    off += n;
+                                }
+                                out.obs[t * agents * d..(t + 1) * agents * d].copy_from_slice(&obs_buf);
 
-                                    // 1. obs for this arena
-                                    ar.write_obs(&mut obs_buf[..n * d]);
-                                    out.obs[row_s * d..(row_s + n) * d].copy_from_slice(&obs_buf[..n * d]);
+                                // 2. ONE batched forward for the whole worker (all agents of
+                                // all this worker's arenas). NOTE: this makes float outputs
+                                // (values/logits) depend on the worker's batch size, which
+                                // depends on how arenas are split across threads — candle's
+                                // CPU gemm rounds the *same* input row differently at
+                                // different batch sizes (~1e-7 in the logits, verified
+                                // empirically). Cross-thread-count determinism is therefore
+                                // NOT provided: those ~1e-7 logit differences occasionally
+                                // flip which CDF bucket a sample lands in, actions diverge,
+                                // and trajectories separate entirely — so no useful
+                                // cross-thread-count guarantee exists at any tolerance.
+                                // The determinism contract is exact reproducibility for a
+                                // fixed (seed, num_arenas, num_threads) config only. A
+                                // per-arena-forward variant that WAS thread-count exact was
+                                // tried and reverted: batch=per_agent gemm calls are
+                                // overhead-dominated (18k env-steps/s vs the Python path's
+                                // ~45k at 96 arenas).
+                                let (logits, values) = match pol.forward(&obs_buf, agents, d) {
+                                    Ok(x) => x,
+                                    Err(e) => { worker_err = Some(e); break 'rounds; }
+                                };
+                                out.values[t * agents..(t + 1) * agents].copy_from_slice(&values);
 
-                                    // 2. forward for just this arena's agents
-                                    let (logits, values) = match pol.forward(&obs_buf[..n * d], n, d) {
-                                        Ok(x) => x,
-                                        Err(e) => { worker_err = Some(e); break 'rounds; }
-                                    };
-                                    out.values[row_s..row_s + n].copy_from_slice(&values);
+                                // 3. sample per agent — agent a belongs to arena a/per_agent
+                                // (arenas hold per_agent agents each, in worker order); each
+                                // arena's agents draw from that arena's own rng in
+                                // blue-then-orange order, never shared across arenas.
+                                let mut acts = vec![0i64; agents];
+                                for a in 0..agents {
+                                    let row = &logits[a * action_count..(a + 1) * action_count];
+                                    let (idx, lp) = sample_categorical(row, &mut rngs[a / per_agent]);
+                                    acts[a] = idx as i64;
+                                    out.actions[t * agents + a] = idx as i64;
+                                    out.logprobs[t * agents + a] = lp;
+                                }
 
-                                    // 3. sample per agent, blue-then-orange, from this arena's
-                                    // own rng (never shared with another arena).
-                                    let mut acts = vec![0i64; n];
+                                // 4. step arenas, collect rewards/flags/final_obs
+                                let mut aoff = 0;
+                                for ar in arenas.iter_mut() {
+                                    let n = ar.num_agents();
+                                    ar.step(
+                                        &acts[aoff..aoff + n],
+                                        &mut rew_buf[..n],
+                                        &mut flag_buf[..n],
+                                        &mut fin_buf[aoff * d..(aoff + n) * d],
+                                    );
                                     for i in 0..n {
-                                        let logit_row = &logits[i * action_count..(i + 1) * action_count];
-                                        let (idx, lp) = sample_categorical(logit_row, &mut rngs[ai]);
-                                        acts[i] = idx as i64;
-                                        out.actions[row_s + i] = idx as i64;
-                                        out.logprobs[row_s + i] = lp;
+                                        out.rewards[t * agents + aoff + i] = rew_buf[i];
+                                        out.terminated[t * agents + aoff + i] = flag_buf[i].terminated;
+                                        out.truncated[t * agents + aoff + i] = flag_buf[i].truncated;
                                     }
+                                    aoff += n;
+                                }
 
-                                    // 4. step this arena, collect rewards/flags/final_obs
-                                    ar.step(&acts, &mut rew_buf[..n], &mut flag_buf[..n], &mut fin_buf[..n * d]);
-                                    let mut done_local: Vec<usize> = Vec::new();
-                                    for i in 0..n {
-                                        out.rewards[row_s + i] = rew_buf[i];
-                                        out.terminated[row_s + i] = flag_buf[i].terminated;
-                                        out.truncated[row_s + i] = flag_buf[i].truncated;
-                                        if flag_buf[i].terminated || flag_buf[i].truncated {
-                                            done_local.push(i);
-                                        }
+                                // 5. final values for done rows (single batched forward over
+                                // just the done subset, worker-wide)
+                                let done: Vec<usize> = (0..agents)
+                                    .filter(|&a| out.terminated[t * agents + a] || out.truncated[t * agents + a])
+                                    .collect();
+                                if !done.is_empty() {
+                                    let mut fobs = vec![0f32; done.len() * d];
+                                    for (j, &a) in done.iter().enumerate() {
+                                        fobs[j * d..(j + 1) * d].copy_from_slice(&fin_buf[a * d..(a + 1) * d]);
                                     }
-
-                                    // 5. final values for this arena's done rows (still a
-                                    // fixed, thread-invariant batch: it depends only on this
-                                    // arena's own terminal state, not on worker layout).
-                                    if !done_local.is_empty() {
-                                        let mut fobs = vec![0f32; done_local.len() * d];
-                                        for (j, &i) in done_local.iter().enumerate() {
-                                            fobs[j * d..(j + 1) * d].copy_from_slice(&fin_buf[i * d..(i + 1) * d]);
-                                        }
-                                        match pol.forward(&fobs, done_local.len(), d) {
-                                            Ok((_, fv)) => {
-                                                for (j, &i) in done_local.iter().enumerate() {
-                                                    out.final_values[row_s + i] = fv[j];
-                                                }
+                                    match pol.forward(&fobs, done.len(), d) {
+                                        Ok((_, fv)) => {
+                                            for (j, &a) in done.iter().enumerate() {
+                                                out.final_values[t * agents + a] = fv[j];
                                             }
-                                            Err(e) => { worker_err = Some(e); break 'rounds; }
                                         }
+                                        Err(e) => { worker_err = Some(e); break 'rounds; }
                                     }
-                                    a_base += n;
                                 }
                             }
 
@@ -396,21 +411,19 @@ impl MultiEngine {
                                 continue;
                             }
 
-                            // 6. bootstrap values of the post-rollout obs, again per arena
-                            let mut a_base = 0usize;
-                            let mut boot_err: Option<String> = None;
+                            // 6. bootstrap values of the post-rollout obs (one batched forward)
+                            let mut off = 0;
                             for ar in arenas.iter_mut() {
-                                let n = ar.num_agents();
-                                ar.write_obs(&mut obs_buf[..n * d]);
-                                match pol.forward(&obs_buf[..n * d], n, d) {
-                                    Ok((_, lv)) => out.last_values[a_base..a_base + n].copy_from_slice(&lv),
-                                    Err(e) => { boot_err = Some(e); break; }
-                                }
-                                a_base += n;
+                                let n = ar.num_agents() * d;
+                                ar.write_obs(&mut obs_buf[off..off + n]);
+                                off += n;
                             }
-                            if let Some(e) = boot_err {
-                                let _ = otx.send(WorkerOut::err(e));
-                                continue;
+                            match pol.forward(&obs_buf, agents, d) {
+                                Ok((_, lv)) => out.last_values.copy_from_slice(&lv),
+                                Err(e) => {
+                                    let _ = otx.send(WorkerOut::err(e));
+                                    continue;
+                                }
                             }
                             let _ = otx.send(WorkerOut::collect(out));
                         }
