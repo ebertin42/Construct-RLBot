@@ -50,3 +50,11 @@ If any of the above don't match, update `compat_to_state_dict()` in
 `deploy/bot.py` accordingly — `deploy/obs.py` and `deploy/actions.py` are
 already parity-tested against the Rust engine (see
 `tests/python/test_parity.py`) and should not need changes.
+
+## Collision meshes (required)
+
+`SimExtraInfo` runs RocketSim internally and needs the game's collision
+meshes at `collision_meshes/soccar/*.cmf` inside THIS folder (16 files).
+They are game-derived assets and never committed — copy them from the
+training box: `assets/collision_meshes/soccar/` (fetched there by
+`scripts/fetch_meshes.sh`).
