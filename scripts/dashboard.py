@@ -287,11 +287,11 @@ const METRICS = [
    why:"Share of gradient updates hitting PPO's trust-region ceiling. 0.05–0.2 healthy. Sustained >0.3 = updates too aggressive (learning rate hot or stale data)."},
 ];
 const SYSMETRICS = [
-  {key:"gpu", title:"GPU utilization (%)", fmt:v=>v+"%",
+  {key:"gpu", title:"GPU utilization (%)", fmt:v=>Math.round(v)+"%",
    why:"Batched inference + PPO updates. Bursty by design: collect (low) then learn (spike). Sustained 100% = learner-bound; near 0 = collection-bound."},
-  {key:"gpu_temp", title:"GPU temperature (°C)", fmt:v=>v+"°C",
+  {key:"gpu_temp", title:"GPU temperature (°C)", fmt:v=>Math.round(v)+"°C",
    why:"Laptop GPUs throttle around ~87°C — when this climbs, watch throughput sag in the chart above."},
-  {key:"cpu", title:"CPU utilization (%)", fmt:v=>v+"%",
+  {key:"cpu", title:"CPU utilization (%)", fmt:v=>Math.round(v)+"%",
    why:"RocketSim arena workers live here. Pegged CPU is expected and good — physics simulation is the throughput bottleneck."},
 ];
 const EVALMETRICS = [
