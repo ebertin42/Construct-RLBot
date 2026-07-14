@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Contract amendment (2026-07-14, during execution):** cross-thread-count exact
+> determinism was dropped — candle's gemm rounds batch-size-dependently, flipping
+> sampled actions, so no useful cross-config guarantee exists. Binding contract:
+> exact determinism for fixed (seed, num_arenas, num_threads). Inference is one
+> batched forward per worker per round.
+
 **Goal:** Move rollout collection entirely into the Rust engine — per-worker candle CPU inference, sampling, and buffer accumulation — so sim threads never wait on Python, roughly doubling training throughput.
 
 **Architecture:** Each worker thread owns a candle MLP copy (policy + value heads) rebuilt from raw weight arrays pushed via `Engine.set_weights()` each iteration. `Engine.collect(T)` runs T rounds per worker (forward → sample → step → accumulate) fully in parallel across workers and returns complete rollout buffers as numpy arrays. Python keeps GAE + PPO on GPU unchanged. `Engine.step/reset` stay for the viewer, evals, and parity tests.
