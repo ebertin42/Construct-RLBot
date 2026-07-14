@@ -73,6 +73,10 @@ pub fn compute(
         && hit_now.tick_count_when_hit != hit_before.tick_count_when_hit
         && hit_now.tick_count_when_hit > prev.tick_count
         && hit_now.tick_count_when_hit <= cur.tick_count;
+
+    // NOTE: `touch` (flat) and `touch_accel` (impact-scaled) both fire on the same
+    // contact if both weights are nonzero — they stack. v1 configs set touch = 0.0;
+    // combining them is legal but double-pays contact, so do it deliberately.
     if touched {
         r += cfg.touch;
     }
@@ -99,6 +103,11 @@ pub fn compute(
     }
 
     if cfg.vel_ball_to_goal != 0.0 {
+        // Ball velocity toward the opponent's net, per each agent's own goal vector.
+        // NOT antisymmetric between teams in general (each team normalizes by its own
+        // goal distance; exact antisymmetry holds only for a ball on the y-axis) —
+        // this is intentional: shaping components are per-agent, not zero-sum (spec §4
+        // reserves zero-sum wrapping for contested quantities like goals/boost/demos).
         let g = [0.0 - cur.ball.pos.x, opp_goal_y - cur.ball.pos.y, 0.0];
         let gn = (g[0] * g[0] + g[1] * g[1]).sqrt().max(1e-6);
         let toward = (cur.ball.vel.x * g[0] + cur.ball.vel.y * g[1]) / gn;
@@ -376,7 +385,8 @@ mod tests {
         let ro = compute(&gs, &gs, orange_idx, None, &cfg);
         assert!(rb > 0.2, "ball flying at orange net pays blue, got {rb}");
         assert!(ro < -0.2, "and costs orange, got {ro}");
-        assert!((rb + ro).abs() < 1e-5, "component is antisymmetric");
+        // antisymmetry holds only in this x=0 configuration (see component comment)
+        assert!((rb + ro).abs() < 1e-5, "antisymmetric at x=0 by construction");
     }
 
     #[test]
