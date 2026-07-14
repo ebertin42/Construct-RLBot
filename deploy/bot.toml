@@ -1,0 +1,14 @@
+#:schema https://rlbot.org/schemas/agent.json
+[settings]
+name = "Construct"
+loadout_file = "loadout.toml"
+root_dir = ""
+run_command = "..\\venv\\Scripts\\python bot.py"
+run_command_linux = "../venv/bin/python bot.py"
+agent_id = "construct/construct_v0"
+
+[details]
+description = "RLGym-trained PPO bot (Construct P0)"
+developer = "steamo"
+language = "Python"
+tags = []

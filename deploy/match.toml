@@ -1,0 +1,18 @@
+[rlbot]
+launcher = "steam"
+
+[match]
+game_mode = "Soccar"
+game_map_upk = "Stadium_P"
+
+[[cars]]
+config_file = "bot.toml"
+team = 0
+
+[[cars]]
+type = "psyonix"
+skill = "allstar"
+team = 1
+
+[mutators]
+match_length = "five_minutes"
