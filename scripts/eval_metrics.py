@@ -17,6 +17,7 @@ net.eval()
 obs = torch.as_tensor(eng.reset())
 STEPS = 4500  # 5 min of game time
 touches = 0
+goals = 0
 dist_sum = 0.0
 torch.manual_seed(0)  # sampled actions, reproducible: argmax play deadlocks in
 # mirror-symmetric standoffs (both cars park at the ball) and zeroes the metric
@@ -26,10 +27,13 @@ for _ in range(STEPS):
         acts = torch.distributions.Categorical(logits=logits).sample().numpy().astype(np.int64)
     nobs, rew, term, trunc, _ = eng.step(acts)
     touches += int((rew >= 0.5).sum())  # touch weight fires at >= 0.5
+    goals += int((rew >= 9.5).sum())    # goal pays +10 to the scorer, unambiguous
     # obs[28:31] is (ball - car) * pos_norm
     dist_sum += float(np.linalg.norm(nobs[:, 28:31], axis=1).mean() / (1 / 2300))
     obs = torch.as_tensor(nobs)
 
 minutes = STEPS / 15 / 60 * eng.num_agents
+match_minutes = STEPS / 15 / 60 * 16  # 16 arenas = 16 concurrent matches
 print(f"touches/min/agent: {touches / minutes:.2f}")
 print(f"mean dist to ball: {dist_sum / STEPS:.0f} uu")
+print(f"goals/min/match: {goals / match_minutes:.2f}")

@@ -162,11 +162,15 @@ class EvalRunner(threading.Thread):
                         ).stdout
                         touches = float(re.search(r"touches/min/agent: ([\d.]+)", out).group(1))
                         dist = float(re.search(r"mean dist to ball: (\d+)", out).group(1))
+                        entry = {
+                            "ts": int(time.time()), "steps": steps,
+                            "touches_per_min": touches, "dist_uu": dist,
+                        }
+                        gm = re.search(r"goals/min/match: ([\d.]+)", out)
+                        if gm:
+                            entry["goals_per_min"] = float(gm.group(1))
                         with EVAL_HISTORY.open("a") as f:
-                            f.write(json.dumps({
-                                "ts": int(time.time()), "steps": steps,
-                                "touches_per_min": touches, "dist_uu": dist,
-                            }) + "\n")
+                            f.write(json.dumps(entry) + "\n")
                         self.status = "idle"
                     except Exception as e:
                         self.status = f"eval failed: {e}"
@@ -302,6 +306,8 @@ const SYSMETRICS = [
 const EVALMETRICS = [
   {key:"touches_per_min", title:"Ball touches / min / agent", fmt:v=>v.toFixed(1), marks:true,
    why:"From a 5-game-minute headless eval of each checkpoint: how often the bot contacts the ball. Random baseline 0.0; P0 exit gate was 3x baseline."},
+  {key:"goals_per_min", title:"Goals / min / match", fmt:v=>v.toFixed(2), marks:true,
+   why:"Goals scored per match-minute in the eval — the objective skill metric. Rising goals with falling touches = shooting play displacing dribble-farming; both falling = real regression."},
   {key:"dist_uu", title:"Mean distance to ball (uu)", fmt:v=>v.toFixed(0), marks:true, lowerBetter:true,
    why:"Average car-to-ball distance during eval. Random baseline 3769 uu. Lower = stays involved in the play. Field is ~10,000 uu long."},
 ];
@@ -419,13 +425,18 @@ async function refresh() {
     if (!egrid.children.length)
       EVALMETRICS.forEach(() => egrid.appendChild(Object.assign(document.createElement("div"), {className:"card"})));
     EVALMETRICS.forEach((m,i) => {
-      if (d.evals.length === 1) {
-        const e0 = d.evals[0];
+      const rows = d.evals.filter(e => m.key in e);  // older entries may lack newer metrics
+      if (!rows.length) {
+        egrid.children[i].innerHTML = `<h3>${m.title}</h3>
+          <div class="d">no data yet — appears after the next eval</div>
+          <div class="why">${m.why}</div>`;
+      } else if (rows.length === 1) {
+        const e0 = rows[0];
         egrid.children[i].innerHTML = `<h3>${m.title}</h3>
           <div class="tile" style="border:none;padding:6px 0"><div class="v">${m.fmt(e0[m.key])}</div>
           <div class="d">single eval at ${fmtSteps(e0.steps)} steps — chart appears after the next one</div></div>
           <div class="why">${m.why}</div>`;
-      } else chart(egrid.children[i], d.evals, m, "steps", fmtSteps);
+      } else chart(egrid.children[i], rows, m, "steps", fmtSteps);
     });
   }
 
