@@ -10,6 +10,7 @@ class TrainConfig:
     net: dict = field(default_factory=dict)
     ppo: dict = field(default_factory=dict)
     run: dict = field(default_factory=dict)
+    curriculum_config_path: str = ""
 
     @classmethod
     def load(cls, path: str) -> "TrainConfig":

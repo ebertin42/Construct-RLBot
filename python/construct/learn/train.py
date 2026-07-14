@@ -19,6 +19,8 @@ class Trainer:
             num_arenas=cfg.env["num_arenas"], blue=cfg.env["blue"], orange=cfg.env["orange"],
             schema_path=cfg.schema_path, reward_config_path=cfg.reward_config_path,
             seed=cfg.env["seed"],
+            team_size_weights=cfg.env.get("team_size_weights"),
+            curriculum_config_path=cfg.curriculum_config_path or None,
         )
         dev = cfg.run.get("device", "cuda")
         self.device = torch.device(dev if (dev != "cuda" or torch.cuda.is_available()) else "cpu")
@@ -101,6 +103,7 @@ class Trainer:
                 # provenance only (resume takes the path from CLI/config, not from here):
                 # records which reward regime produced this checkpoint
                 "reward_config_path": self.cfg.reward_config_path,
+                "curriculum_config_path": self.cfg.curriculum_config_path,
             },
             path,
         )

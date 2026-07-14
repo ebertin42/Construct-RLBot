@@ -52,3 +52,23 @@ def test_default_none_matches_legacy():
                             reward_config_path="configs/reward_v0.toml", seed=4)
     a, b = mk_old(), mk_old()
     np.testing.assert_array_equal(a.reset(), b.reset())
+
+
+from construct.learn.config import TrainConfig
+from construct.learn.train import Trainer
+
+
+def test_trainer_runs_mixed_sizes_with_curriculum(tmp_path):
+    cfg = TrainConfig.load("configs/train_v0.toml")
+    cfg.env.update(num_arenas=4, team_size_weights=[0.5, 0.25, 0.25])
+    cfg.curriculum_config_path = "configs/curriculum_v1.toml"
+    cfg.ppo.update(rollout_steps=16, minibatch_size=128)
+    cfg.run.update(device="cpu", checkpoint_dir=str(tmp_path), save_every_iters=1)
+    t = Trainer(cfg)
+    assert t.engine.num_agents == 14
+    t.run(max_iterations=1)
+    assert t.total_steps == 16 * 14
+    import torch
+    ck = torch.load(f"{tmp_path}/ck_{t.total_steps:012d}.pt", map_location="cpu", weights_only=False)
+    assert ck["config"]["env"]["team_size_weights"] == [0.5, 0.25, 0.25]
+    assert ck["curriculum_config_path"] == "configs/curriculum_v1.toml"

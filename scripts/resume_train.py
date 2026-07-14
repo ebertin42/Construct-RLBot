@@ -21,6 +21,8 @@ p.add_argument("--checkpoint-dir", default=None)
 p.add_argument("--device", default=None)
 p.add_argument("--config", default="configs/train_v0.toml")
 p.add_argument("--reward-config", default=None)
+p.add_argument("--team-sizes", default=None, help="W1,W2,W3 weights for 1v1/2v2/3v3 arena mix")
+p.add_argument("--curriculum-config", default=None)
 p.add_argument("--reset-optimizer", action="store_true",
                help="drop Adam state (use when swapping reward regimes — stale "
                     "moments belong to the old loss landscape)")
@@ -41,6 +43,10 @@ if args.device:
     cfg.run["device"] = args.device
 if args.reward_config:
     cfg.reward_config_path = args.reward_config
+if args.team_sizes:
+    cfg.env["team_size_weights"] = [float(x) for x in args.team_sizes.split(",")]
+if args.curriculum_config:
+    cfg.curriculum_config_path = args.curriculum_config
 if args.reset_optimizer:
     state["optimizer"] = None
 

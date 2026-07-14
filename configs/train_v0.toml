@@ -1,11 +1,13 @@
 schema_path = "schema/v0.toml"
 reward_config_path = "configs/reward_v0.toml"
+curriculum_config_path = ""  # e.g. "configs/curriculum_v1.toml"
 
 [env]
 num_arenas = 64
 blue = 1
 orange = 1
 seed = 0
+# team_size_weights = [0.5, 0.3, 0.2]   # 1v1/2v2/3v3 arena mix; omit = pure 1v1
 
 [net]
 hidden = [512, 512]
