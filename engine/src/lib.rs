@@ -18,6 +18,13 @@ fn version() -> &'static str {
 }
 
 #[pyfunction]
+fn action_table<'py>(py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
+    let t = actions::make_lookup_table();
+    let flat: Vec<f32> = t.iter().flatten().copied().collect();
+    numpy::ndarray::Array2::from_shape_vec((t.len(), 8), flat).unwrap().into_pyarray(py)
+}
+
+#[pyfunction]
 fn schema_dict<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
     let s = crate::schema::Schema::load(path)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
@@ -63,6 +70,12 @@ impl Engine {
     ) -> PyResult<Self> {
         sim_init::ensure_init(meshes_path);
         let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
+        if sch.obs_size != obs::OBS_SIZE || sch.action_count != actions::TABLE_SIZE || sch.action_table != "rlgym_lookup_90" {
+            return Err(PyValueError::new_err(format!(
+                "schema {} disagrees with compiled engine (obs {} vs {}, actions {} vs {}, table {:?})",
+                schema_path, sch.obs_size, obs::OBS_SIZE, sch.action_count, actions::TABLE_SIZE, sch.action_table
+            )));
+        }
         let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
         Ok(Engine { inner: engine::MultiEngine::new(num_arenas, blue, orange, sch, cfg, seed, num_threads) })
     }
@@ -152,6 +165,12 @@ impl RenderSession {
            meshes_path: Option<&str>, seed: u32) -> PyResult<Self> {
         sim_init::ensure_init(meshes_path);
         let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
+        if sch.obs_size != obs::OBS_SIZE || sch.action_count != actions::TABLE_SIZE || sch.action_table != "rlgym_lookup_90" {
+            return Err(PyValueError::new_err(format!(
+                "schema {} disagrees with compiled engine (obs {} vs {}, actions {} vs {}, table {:?})",
+                schema_path, sch.obs_size, obs::OBS_SIZE, sch.action_count, actions::TABLE_SIZE, sch.action_table
+            )));
+        }
         let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
         let tick_skip = sch.tick_skip;
         Ok(RenderSession {
@@ -217,6 +236,7 @@ impl RenderSession {
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(schema_dict, m)?)?;
+    m.add_function(wrap_pyfunction!(action_table, m)?)?;
     m.add_class::<Engine>()?;
     m.add_class::<RenderSession>()?;
     Ok(())

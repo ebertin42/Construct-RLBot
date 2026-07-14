@@ -1,5 +1,5 @@
 rlbot>=2.0.0b52
 torch
 numpy
-rlgym_compat@git+https://github.com/JPK314/rlgym-compat.git
-rocketsim
+rlgym_compat @ git+https://github.com/JPK314/rlgym-compat.git@50b70c87b9af7bbce46f4d939d85e9117d2dc3c0
+rocketsim==2.2.1

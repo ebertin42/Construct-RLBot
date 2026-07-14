@@ -27,7 +27,10 @@ def test_deploy_obs_matches_engine_obs_exactly():
 
 def test_action_tables_match():
     from actions import make_lookup_table  # deploy/actions.py
+    from construct._engine import action_table
     t = make_lookup_table()
     assert t.shape == (90, 8)
     # spot-check against the Rust-side contract rows (see Task 3 tests)
     np.testing.assert_array_equal(t[0], [-1, -1, 0, -1, 0, 0, 0, 0])
+    # full parity: every row of deploy's table matches the Rust engine's table exactly
+    np.testing.assert_array_equal(action_table(), t)

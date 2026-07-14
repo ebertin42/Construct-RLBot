@@ -43,8 +43,9 @@ and check the following, e.g. by temporarily adding a `print(state)` /
       inside `build_obs`.
 - [ ] End-to-end sanity: with the bot loaded and the ball stationary at
       kickoff, confirm the printed `obs` vector's ball-position entries
-      (indices 15-17, before the `pos_norm` scale) are near `[0, 0, 93.15]`
-      and that `obs.shape == (94,)`.
+      (indices 19-21; index 15 is `boost/100`, not part of the ball block)
+      are near `[0, 0, 0.0405]` — this is the ball's z-position (~93.15) after
+      the `pos_norm` (1/2300) scale is applied — and that `obs.shape == (94,)`.
 
 If any of the above don't match, update `compat_to_state_dict()` in
 `deploy/bot.py` accordingly — `deploy/obs.py` and `deploy/actions.py` are
