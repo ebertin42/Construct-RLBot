@@ -37,6 +37,19 @@ impl CurriculumConfig {
         if c.kickoff_weight < 0.0 || c.random_weight < 0.0 || c.kickoff_weight + c.random_weight <= 0.0 {
             return Err(format!("{path}: weights must be nonnegative and sum > 0"));
         }
+        let b = &c.random;
+        if b.z_max <= 93.15 {
+            return Err(format!("{path}: z_max must be > 93.15 (ball resting height), got {}", b.z_max));
+        }
+        if b.car_speed_max <= 0.0 {
+            return Err(format!("{path}: car_speed_max must be > 0, got {}", b.car_speed_max));
+        }
+        if b.ball_speed_max <= 0.0 {
+            return Err(format!("{path}: ball_speed_max must be > 0, got {}", b.ball_speed_max));
+        }
+        if b.min_separation < 0.0 {
+            return Err(format!("{path}: min_separation must be >= 0, got {}", b.min_separation));
+        }
         Ok(c)
     }
 }
@@ -109,6 +122,9 @@ pub fn random_reset(mut arena: Pin<&mut Arena>, rng: &mut Pcg32, b: &RandomState
         cs.ang_vel = Vec3::new(0.0, 0.0, 0.0);
         let ang = Angle {
             yaw: rand_range(rng, 0.0, TAU),
+            // Airborne pitch/roll deliberately restricted to ±1.0 rad (not full range):
+            // near-vertical spawns are degenerate — floor/wall clipping, unrecoverable
+            // states. See the plan's contract amendment.
             pitch: if grounded { 0.0 } else { rand_range(rng, -1.0, 1.0) },
             roll: if grounded { 0.0 } else { rand_range(rng, -1.0, 1.0) },
         };
@@ -139,6 +155,20 @@ mod tests {
         std::fs::write(&path, "kickoff_weight = 0.0\nrandom_weight = 0.0\n").unwrap();
         let err = CurriculumConfig::load(path.to_str().unwrap()).unwrap_err();
         assert!(err.contains("sum > 0"), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_bad_z_max() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("construct_curriculum_bad_z_max_test.toml");
+        std::fs::write(
+            &path,
+            "kickoff_weight = 0.5\nrandom_weight = 0.5\n\n[random]\ncar_speed_max = 1800.0\nball_speed_max = 2500.0\nz_max = 50.0\nmin_separation = 300.0\n",
+        )
+        .unwrap();
+        let err = CurriculumConfig::load(path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("z_max"), "error must name the field: {err}");
         let _ = std::fs::remove_file(&path);
     }
 }

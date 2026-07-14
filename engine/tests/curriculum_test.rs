@@ -75,6 +75,34 @@ fn no_curriculum_means_kickoff_only() {
     }
 }
 
+// Legacy bit-identity: a fresh no-curriculum EpisodeArena's constructor kickoff
+// must be byte-for-byte the same as a raw RocketSim arena kicked off with the RAW
+// engine seed (the LCG seed advance happens only between episodes, never before
+// the first). Pins the pre-curriculum behavior against the actual RocketSim
+// reference rather than magic numbers.
+#[test]
+fn constructor_kickoff_bit_identical_to_raw_arena() {
+    use rocketsim_rs::sim::{Arena, CarConfig, Team};
+
+    ensure_init(None);
+    let s = Schema::load("../schema/v0.toml").unwrap();
+    let cfg = RewardConfig::load("../configs/reward_v0.toml").unwrap();
+    let mut a = EpisodeArena::new(1, 1, s.tick_skip, cfg, s.normalization, 42);
+    let gs = a.game_state();
+
+    let mut raw = Arena::default_standard();
+    let _ = raw.pin_mut().add_car(Team::Blue, CarConfig::octane());
+    let _ = raw.pin_mut().add_car(Team::Orange, CarConfig::octane());
+    raw.pin_mut().reset_to_random_kickoff(Some(42));
+    let gr = raw.pin_mut().get_game_state();
+
+    assert_eq!(gs.ball.pos, gr.ball.pos, "ball pos differs from raw seed-42 kickoff");
+    assert_eq!(gs.cars.len(), gr.cars.len());
+    for (c, r) in gs.cars.iter().zip(gr.cars.iter()) {
+        assert_eq!(c.state.pos, r.state.pos, "car {} pos differs from raw seed-42 kickoff", c.id);
+    }
+}
+
 #[test]
 fn stepping_after_random_reset_is_stable() {
     let mut a = mk(Some(all_random()), 21);

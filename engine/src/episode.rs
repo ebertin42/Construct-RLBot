@@ -129,7 +129,6 @@ impl EpisodeArena {
     /// scenario when the curriculum draw says so — this keeps pad/hit-info hygiene
     /// identical across both reset flavors.
     fn reset_episode(&mut self) {
-        self.seed = self.seed.wrapping_mul(747796405).wrapping_add(2891336453);
         let use_random = match &self.curriculum {
             Some(c) => {
                 let p = c.random_weight / (c.random_weight + c.kickoff_weight);
@@ -142,6 +141,12 @@ impl EpisodeArena {
             let bounds = self.curriculum.as_ref().unwrap().random.clone();
             crate::curriculum::random_reset(self.arena.pin_mut(), &mut self.rng, &bounds);
         }
+        // Advance the kickoff seed AFTER using it, so the constructor's first reset
+        // uses the RAW engine seed (bit-identical to the legacy constructor, which
+        // kicked off with the unmutated seed) while every subsequent reset k uses
+        // advance^k(raw) — exactly the sequence the pre-curriculum end-of-episode
+        // sites (advance-then-kick) produced.
+        self.seed = self.seed.wrapping_mul(747796405).wrapping_add(2891336453);
         let gs = self.arena.pin_mut().get_game_state();
         self.episode_start_tick = gs.tick_count;
         self.last_touch_tick = gs.tick_count;

@@ -2,6 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Contract amendment (2026-07-15, during execution):** "Airborne spawn: full
+> random orientation" is narrowed — airborne orientation is yaw-full, pitch/roll
+> ±1.0 rad by design. Near-vertical spawns are degenerate (floor/wall clipping,
+> unrecoverable states), so the restricted range is the binding contract.
+
 **Goal:** Train 2v2/3v3 alongside 1v1 in one engine (team-spirit reward blending + mixed team sizes across arenas) and break the kickoff-only monotony with random-state episode resets.
 
 **Architecture:** All engine-side. Team-spirit blending happens in `EpisodeArena::step` after per-agent rewards (config-gated, bit-identical when zero). Team sizes are allocated per-arena at Engine construction from a 3-weight vector (largest-remainder method, deterministic); the collect path drops its uniform agents-per-arena assumption. Curriculum is a new `curriculum.rs` module: per-reset weighted choice between kickoff and a bounded random state, driven by the arena's own PCG32.
