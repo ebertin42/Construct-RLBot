@@ -1,0 +1,4 @@
+# P0 ball-chaser rewards. Bounded components, weights set magnitude.
+goal = 10.0          # +goal for scoring team, -goal for conceding team
+touch = 0.5          # flat, on new ball contact
+vel_to_ball = 0.05   # max(0, dot(vel, unit(ball-car))) / 2300, in [0,1]

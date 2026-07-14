@@ -3,6 +3,7 @@ use pyo3::types::PyDict;
 
 pub mod actions;
 pub mod obs;
+pub mod reward;
 pub mod schema;
 pub mod sim_init;
 
