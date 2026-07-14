@@ -1,7 +1,10 @@
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 pub mod actions;
+pub mod engine;
 pub mod episode;
 pub mod obs;
 pub mod reward;
@@ -29,9 +32,88 @@ fn schema_dict<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>>
     Ok(d)
 }
 
+// `unsendable`: MultiEngine holds `std::sync::mpsc::Receiver<WorkerOut>` internally
+// (per worker), which is Send but not Sync, so pyo3's default Send+Sync pyclass bound
+// fails to compile. The actor model itself (worker threads own their arenas; the main
+// thread only touches Sender/Receiver ends) is exactly per the brief and is unaffected —
+// `unsendable` only pins the *Python-facing* Engine wrapper to the single OS thread that
+// constructed it (i.e. the thread holding the GIL when Engine() is called), which matches
+// how the trainer contract uses this class (single Python thread drives reset()/step()).
+#[pyclass(unsendable)]
+struct Engine {
+    inner: engine::MultiEngine,
+}
+
+#[pymethods]
+impl Engine {
+    #[new]
+    #[pyo3(signature = (num_arenas=32, blue=1, orange=1, schema_path="schema/v0.toml",
+                        reward_config_path="configs/reward_v0.toml", meshes_path=None,
+                        seed=0, num_threads=0))]
+    fn new(
+        num_arenas: usize,
+        blue: usize,
+        orange: usize,
+        schema_path: &str,
+        reward_config_path: &str,
+        meshes_path: Option<&str>,
+        seed: u32,
+        num_threads: usize,
+    ) -> PyResult<Self> {
+        sim_init::ensure_init(meshes_path);
+        let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
+        let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
+        Ok(Engine { inner: engine::MultiEngine::new(num_arenas, blue, orange, sch, cfg, seed, num_threads) })
+    }
+
+    #[getter]
+    fn num_agents(&self) -> usize { self.inner.num_agents }
+    #[getter]
+    fn obs_size(&self) -> usize { self.inner.obs_size }
+    #[getter]
+    fn action_count(&self) -> usize { self.inner.action_count }
+
+    fn reset<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
+        let (n, d) = (self.inner.num_agents, self.inner.obs_size);
+        let mut obs = vec![0.0f32; n * d];
+        py.detach(|| self.inner.reset_into(&mut obs));
+        numpy::ndarray::Array2::from_shape_vec((n, d), obs).unwrap().into_pyarray(py)
+    }
+
+    fn step<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: PyReadonlyArray1<'py, i64>,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray2<f32>>,
+    )> {
+        let acts = actions.as_slice()?.to_vec();
+        let (n, d) = (self.inner.num_agents, self.inner.obs_size);
+        let (mut obs, mut fin) = (vec![0.0f32; n * d], vec![0.0f32; n * d]);
+        let mut rew = vec![0.0f32; n];
+        let (mut term, mut trunc) = (vec![false; n], vec![false; n]);
+        py.detach(|| {
+            self.inner.step_into(&acts, &mut obs, &mut rew, &mut term, &mut trunc, &mut fin)
+        })
+        .map_err(PyValueError::new_err)?;
+        Ok((
+            numpy::ndarray::Array2::from_shape_vec((n, d), obs).unwrap().into_pyarray(py),
+            rew.into_pyarray(py),
+            term.into_pyarray(py),
+            trunc.into_pyarray(py),
+            numpy::ndarray::Array2::from_shape_vec((n, d), fin).unwrap().into_pyarray(py),
+        ))
+    }
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(schema_dict, m)?)?;
+    m.add_class::<Engine>()?;
     Ok(())
 }
