@@ -1,6 +1,6 @@
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
-    PyUntypedArrayMethods,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArrayDyn, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -143,6 +143,47 @@ impl Engine {
             .collect();
         let pw = engine::parse_state_dict(arrays).map_err(PyValueError::new_err)?;
         self.inner.set_weights(pw).map_err(PyValueError::new_err)
+    }
+
+    /// Runs `steps` rounds of on-worker rollout (policy-driven actions, sampled with
+    /// each arena's own deterministic Pcg32 — see `engine::MultiEngine::collect`) and
+    /// returns a dict of numpy arrays for the trainer: `obs (T,N,94) f32`, `actions
+    /// (T,N) i64`, `logprobs`/`values`/`rewards`/`final_values (T,N) f32`,
+    /// `terminated`/`truncated (T,N) bool`, `last_values (N,) f32`. Requires
+    /// `set_weights` to have been called first (else `ValueError`). The gather blocks
+    /// for multiple seconds, so it runs under `py.detach` to free the GIL.
+    fn collect<'py>(&mut self, py: Python<'py>, steps: usize) -> PyResult<Bound<'py, PyDict>> {
+        let out = py.detach(|| self.inner.collect(steps)).map_err(PyValueError::new_err)?;
+        let (t, n, d) = (steps, self.inner.num_agents, self.inner.obs_size);
+        let obs: Bound<'py, PyArray3<f32>> =
+            numpy::ndarray::Array3::from_shape_vec((t, n, d), out.obs).unwrap().into_pyarray(py);
+        let actions: Bound<'py, PyArray2<i64>> =
+            numpy::ndarray::Array2::from_shape_vec((t, n), out.actions).unwrap().into_pyarray(py);
+        let logprobs: Bound<'py, PyArray2<f32>> =
+            numpy::ndarray::Array2::from_shape_vec((t, n), out.logprobs).unwrap().into_pyarray(py);
+        let values: Bound<'py, PyArray2<f32>> =
+            numpy::ndarray::Array2::from_shape_vec((t, n), out.values).unwrap().into_pyarray(py);
+        let rewards: Bound<'py, PyArray2<f32>> =
+            numpy::ndarray::Array2::from_shape_vec((t, n), out.rewards).unwrap().into_pyarray(py);
+        let terminated: Bound<'py, PyArray2<bool>> =
+            numpy::ndarray::Array2::from_shape_vec((t, n), out.terminated).unwrap().into_pyarray(py);
+        let truncated: Bound<'py, PyArray2<bool>> =
+            numpy::ndarray::Array2::from_shape_vec((t, n), out.truncated).unwrap().into_pyarray(py);
+        let final_values: Bound<'py, PyArray2<f32>> =
+            numpy::ndarray::Array2::from_shape_vec((t, n), out.final_values).unwrap().into_pyarray(py);
+        let last_values: Bound<'py, PyArray1<f32>> = out.last_values.into_pyarray(py);
+
+        let dict = PyDict::new(py);
+        dict.set_item("obs", obs)?;
+        dict.set_item("actions", actions)?;
+        dict.set_item("logprobs", logprobs)?;
+        dict.set_item("values", values)?;
+        dict.set_item("rewards", rewards)?;
+        dict.set_item("terminated", terminated)?;
+        dict.set_item("truncated", truncated)?;
+        dict.set_item("final_values", final_values)?;
+        dict.set_item("last_values", last_values)?;
+        Ok(dict)
     }
 
     /// Runs `obs` (np f32, shape (B, obs_size)) through the policy loaded by the most

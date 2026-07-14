@@ -1,8 +1,10 @@
 use crate::{
+    actions,
     episode::{EpisodeArena, StepFlags},
     obs::OBS_SIZE,
     policy::{LayerWeights, MlpPolicy, PolicyWeights},
     reward::RewardConfig,
+    sampler::{sample_categorical, Pcg32},
     schema::Schema,
 };
 use std::collections::HashMap;
@@ -15,15 +17,51 @@ enum Cmd {
     Step(Vec<i64>),
     Debug { local_idx: usize },
     SetWeights(Arc<PolicyWeights>),
+    Collect { steps: usize },
     Shutdown,
+}
+
+/// Plain-Vecs rollout buffer produced by one worker's `Cmd::Collect` (and, after
+/// gather, by `MultiEngine::collect`). Round-major layout: for shape `(T, N, ...)`
+/// fields, round `t`'s data occupies `[t*N*k .. (t+1)*N*k)`. `last_values` is the
+/// single post-rollout bootstrap value per agent (no T dimension). `pub`/`pub`
+/// fields (not just the struct) because `MultiEngine::collect` returns this across
+/// the module boundary into lib.rs, which reads each field directly to build numpy
+/// arrays — same reasoning as `policy::PolicyWeights`/`LayerWeights`.
+pub struct CollectOut {
+    pub obs: Vec<f32>,
+    pub actions: Vec<i64>,
+    pub logprobs: Vec<f32>,
+    pub values: Vec<f32>,
+    pub rewards: Vec<f32>,
+    pub terminated: Vec<bool>,
+    pub truncated: Vec<bool>,
+    pub final_values: Vec<f32>,
+    pub last_values: Vec<f32>,
+}
+
+impl CollectOut {
+    fn zeros(steps: usize, agents: usize, obs_dim: usize) -> Self {
+        CollectOut {
+            obs: vec![0.0; steps * agents * obs_dim],
+            actions: vec![0; steps * agents],
+            logprobs: vec![0.0; steps * agents],
+            values: vec![0.0; steps * agents],
+            rewards: vec![0.0; steps * agents],
+            terminated: vec![false; steps * agents],
+            truncated: vec![false; steps * agents],
+            final_values: vec![0.0; steps * agents],
+            last_values: vec![0.0; agents],
+        }
+    }
 }
 
 /// Worker -> main-thread reply. `Step`/`Reset`/`Debug` populate the step-shaped
 /// buffers and leave `error` as `None`; `SetWeights` leaves the buffers empty and
-/// uses `error` to signal ack (`None`) vs failure (`Some(msg)`). One struct (rather
-/// than a response enum per Cmd) keeps the worker's single `Sender<WorkerOut>`
-/// channel type unchanged and gives Task 4's `Cmd::Collect` the same ack/err slot
-/// to reuse alongside whatever payload fields it adds.
+/// uses `error` to signal ack (`None`) vs failure (`Some(msg)`). `Collect` leaves
+/// the step-shaped buffers empty and populates `collect` on success (or `error`
+/// on failure, same as `SetWeights`). One struct (rather than a response enum per
+/// Cmd) keeps the worker's single `Sender<WorkerOut>` channel type unchanged.
 struct WorkerOut {
     obs: Vec<f32>,
     rewards: Vec<f32>,
@@ -32,6 +70,7 @@ struct WorkerOut {
     final_obs: Vec<f32>,
     debug_json: Option<String>,
     error: Option<String>,
+    collect: Option<CollectOut>,
 }
 
 impl WorkerOut {
@@ -44,6 +83,7 @@ impl WorkerOut {
             final_obs: vec![],
             debug_json: None,
             error: None,
+            collect: None,
         }
     }
 
@@ -53,6 +93,10 @@ impl WorkerOut {
 
     fn err(msg: String) -> Self {
         WorkerOut { error: Some(msg), ..WorkerOut::empty() }
+    }
+
+    fn collect(out: CollectOut) -> Self {
+        WorkerOut { collect: Some(out), ..WorkerOut::empty() }
     }
 }
 
@@ -167,11 +211,18 @@ impl MultiEngine {
                     })
                     .collect();
                 let agents = count * per_agent;
-                // Holds the worker's own MlpPolicy, set via Cmd::SetWeights. Unused by
-                // Reset/Step/Debug today; Task 4's Cmd::Collect (on-worker rollout with
-                // policy-driven actions) will read it. `debug_policy_forward` (Task 3)
+                // One Pcg32 per ARENA (not per agent), seeded by GLOBAL arena index —
+                // same key as the arena's own kickoff seed above — so sampling is
+                // invariant to how arenas are split across worker threads. Each arena's
+                // agents (blue-then-orange, matching `EpisodeArena::car_ids` order) draw
+                // from that arena's rng only; arenas never share an rng, so per-arena
+                // consumption order is fixed regardless of thread layout.
+                let mut rngs: Vec<Pcg32> = (0..count)
+                    .map(|i| Pcg32::new((seed as u64) * 1_000_000 + (global_base + i) as u64))
+                    .collect();
+                // Holds the worker's own MlpPolicy, set via Cmd::SetWeights and read by
+                // Cmd::Collect for on-worker rollout. `debug_policy_forward` (Task 3)
                 // does not route through here — see MultiEngine::debug_policy_forward.
-                #[allow(unused_assignments, unused_variables)]
                 let mut policy: Option<MlpPolicy> = None;
                 while let Ok(cmd) = crx.recv() {
                     match cmd {
@@ -185,6 +236,7 @@ impl MultiEngine {
                                 final_obs: vec![0.0; agents * OBS_SIZE],
                                 debug_json: None,
                                 error: None,
+                                collect: None,
                             };
                             let mut off = 0;
                             for ar in arenas.iter_mut() {
@@ -203,6 +255,7 @@ impl MultiEngine {
                                 final_obs: vec![0.0; agents * OBS_SIZE],
                                 debug_json: None,
                                 error: None,
+                                collect: None,
                             };
                             let mut a_off = 0;
                             let mut flags = vec![StepFlags::default(); per_agent];
@@ -234,6 +287,7 @@ impl MultiEngine {
                                 final_obs: vec![],
                                 debug_json: None,
                                 error: None,
+                                collect: None,
                             };
                             ar.write_obs(&mut out.obs);
                             out.debug_json = Some(ar.debug_state_json());
@@ -242,16 +296,123 @@ impl MultiEngine {
                         Cmd::SetWeights(w) => {
                             match MlpPolicy::new(&w) {
                                 Ok(p) => {
-                                    #[allow(unused_assignments)]
-                                    {
-                                        policy = Some(p);
-                                    }
+                                    policy = Some(p);
                                     let _ = otx.send(WorkerOut::ack());
                                 }
                                 Err(e) => {
                                     let _ = otx.send(WorkerOut::err(e));
                                 }
                             }
+                        }
+                        Cmd::Collect { steps } => {
+                            let Some(pol) = policy.as_ref() else {
+                                let _ = otx.send(WorkerOut::err("collect before set_weights".into()));
+                                continue;
+                            };
+                            let d = OBS_SIZE;
+                            let action_count = actions::TABLE_SIZE;
+                            let mut out = CollectOut::zeros(steps, agents, d);
+                            // Scratch sized to ONE arena (== per_agent rows), not the whole
+                            // worker batch. candle's CPU gemm rounds the *same* input row
+                            // differently depending on total batch size (verified empirically:
+                            // identical rows embedded in an 8-row vs 2-row forward differ by
+                            // up to ~6e-8 in the logits) — a worker's batch size is
+                            // `arenas_on_this_worker * per_agent`, which varies with the
+                            // thread count, so batching a whole worker's arenas together
+                            // would make values/logprobs thread-count-dependent at the bit
+                            // level. Forwarding one arena at a time keeps every forward call's
+                            // batch shape (`per_agent`) fixed regardless of how arenas are
+                            // split across workers, which is what makes the determinism test
+                            // (assert_array_equal across thread counts) pass exactly.
+                            let mut obs_buf = vec![0f32; per_agent * d];
+                            let mut rew_buf = vec![0f32; per_agent];
+                            let mut flag_buf = vec![StepFlags::default(); per_agent];
+                            let mut fin_buf = vec![0f32; per_agent * d];
+
+                            let mut worker_err: Option<String> = None;
+                            'rounds: for t in 0..steps {
+                                let mut a_base = 0usize; // this worker's running column offset
+                                for (ai, ar) in arenas.iter_mut().enumerate() {
+                                    let n = ar.num_agents(); // == per_agent
+                                    let row_s = t * agents + a_base;
+
+                                    // 1. obs for this arena
+                                    ar.write_obs(&mut obs_buf[..n * d]);
+                                    out.obs[row_s * d..(row_s + n) * d].copy_from_slice(&obs_buf[..n * d]);
+
+                                    // 2. forward for just this arena's agents
+                                    let (logits, values) = match pol.forward(&obs_buf[..n * d], n, d) {
+                                        Ok(x) => x,
+                                        Err(e) => { worker_err = Some(e); break 'rounds; }
+                                    };
+                                    out.values[row_s..row_s + n].copy_from_slice(&values);
+
+                                    // 3. sample per agent, blue-then-orange, from this arena's
+                                    // own rng (never shared with another arena).
+                                    let mut acts = vec![0i64; n];
+                                    for i in 0..n {
+                                        let logit_row = &logits[i * action_count..(i + 1) * action_count];
+                                        let (idx, lp) = sample_categorical(logit_row, &mut rngs[ai]);
+                                        acts[i] = idx as i64;
+                                        out.actions[row_s + i] = idx as i64;
+                                        out.logprobs[row_s + i] = lp;
+                                    }
+
+                                    // 4. step this arena, collect rewards/flags/final_obs
+                                    ar.step(&acts, &mut rew_buf[..n], &mut flag_buf[..n], &mut fin_buf[..n * d]);
+                                    let mut done_local: Vec<usize> = Vec::new();
+                                    for i in 0..n {
+                                        out.rewards[row_s + i] = rew_buf[i];
+                                        out.terminated[row_s + i] = flag_buf[i].terminated;
+                                        out.truncated[row_s + i] = flag_buf[i].truncated;
+                                        if flag_buf[i].terminated || flag_buf[i].truncated {
+                                            done_local.push(i);
+                                        }
+                                    }
+
+                                    // 5. final values for this arena's done rows (still a
+                                    // fixed, thread-invariant batch: it depends only on this
+                                    // arena's own terminal state, not on worker layout).
+                                    if !done_local.is_empty() {
+                                        let mut fobs = vec![0f32; done_local.len() * d];
+                                        for (j, &i) in done_local.iter().enumerate() {
+                                            fobs[j * d..(j + 1) * d].copy_from_slice(&fin_buf[i * d..(i + 1) * d]);
+                                        }
+                                        match pol.forward(&fobs, done_local.len(), d) {
+                                            Ok((_, fv)) => {
+                                                for (j, &i) in done_local.iter().enumerate() {
+                                                    out.final_values[row_s + i] = fv[j];
+                                                }
+                                            }
+                                            Err(e) => { worker_err = Some(e); break 'rounds; }
+                                        }
+                                    }
+                                    a_base += n;
+                                }
+                            }
+
+                            if let Some(e) = worker_err {
+                                let _ = otx.send(WorkerOut::err(e));
+                                continue;
+                            }
+
+                            // 6. bootstrap values of the post-rollout obs, again per arena
+                            let mut a_base = 0usize;
+                            let mut boot_err: Option<String> = None;
+                            for ar in arenas.iter_mut() {
+                                let n = ar.num_agents();
+                                ar.write_obs(&mut obs_buf[..n * d]);
+                                match pol.forward(&obs_buf[..n * d], n, d) {
+                                    Ok((_, lv)) => out.last_values[a_base..a_base + n].copy_from_slice(&lv),
+                                    Err(e) => { boot_err = Some(e); break; }
+                                }
+                                a_base += n;
+                            }
+                            if let Some(e) = boot_err {
+                                let _ = otx.send(WorkerOut::err(e));
+                                continue;
+                            }
+                            let _ = otx.send(WorkerOut::collect(out));
                         }
                     }
                 }
@@ -354,6 +515,52 @@ impl MultiEngine {
         }
         self.debug_policy = Some(debug_policy);
         Ok(())
+    }
+
+    /// Fans `Cmd::Collect { steps }` to every worker (drain-all: send to all, then
+    /// recv from all — same pattern as `set_weights`) and interleaves the per-worker
+    /// `CollectOut`s into global `(T, N, ...)` buffers. Worker `w`'s agents occupy
+    /// contiguous columns `[w_base .. w_base + w_agents)`, same column order
+    /// `reset_into`/`step_into` use. Errors (e.g. collect before set_weights) from
+    /// any worker are surfaced as `Err`.
+    pub fn collect(&mut self, steps: usize) -> Result<CollectOut, String> {
+        for w in &self.workers {
+            w.tx.send(Cmd::Collect { steps }).map_err(|e| e.to_string())?;
+        }
+        let mut worker_outs = Vec::with_capacity(self.workers.len());
+        for w in &self.workers {
+            worker_outs.push(w.rx.recv().map_err(|e| e.to_string())?);
+        }
+        if let Some(e) = worker_outs.iter_mut().find_map(|o| o.error.take()) {
+            return Err(e);
+        }
+
+        let d = self.obs_size;
+        let agents = self.num_agents;
+        let mut merged = CollectOut::zeros(steps, agents, d);
+        let mut off = 0usize;
+        for (w, out) in self.workers.iter().zip(worker_outs.into_iter()) {
+            let n = w.num_agents;
+            let co = out.collect.expect("collect payload missing on worker success");
+            for t in 0..steps {
+                let o_src = t * n * d..(t + 1) * n * d;
+                let o_dst = t * agents * d + off * d;
+                merged.obs[o_dst..o_dst + n * d].copy_from_slice(&co.obs[o_src]);
+
+                let s_src = t * n..(t + 1) * n;
+                let s_dst = t * agents + off;
+                merged.actions[s_dst..s_dst + n].copy_from_slice(&co.actions[s_src.clone()]);
+                merged.logprobs[s_dst..s_dst + n].copy_from_slice(&co.logprobs[s_src.clone()]);
+                merged.values[s_dst..s_dst + n].copy_from_slice(&co.values[s_src.clone()]);
+                merged.rewards[s_dst..s_dst + n].copy_from_slice(&co.rewards[s_src.clone()]);
+                merged.terminated[s_dst..s_dst + n].copy_from_slice(&co.terminated[s_src.clone()]);
+                merged.truncated[s_dst..s_dst + n].copy_from_slice(&co.truncated[s_src.clone()]);
+                merged.final_values[s_dst..s_dst + n].copy_from_slice(&co.final_values[s_src]);
+            }
+            merged.last_values[off..off + n].copy_from_slice(&co.last_values);
+            off += n;
+        }
+        Ok(merged)
     }
 
     /// Runs `obs` (row-major batch*obs_size) through the `MultiEngine`-held policy
