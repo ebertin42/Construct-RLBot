@@ -130,3 +130,17 @@ Approach: **Rust engine + Python brain.** Rust owns the CPU-bound hot loop (sim 
 - Online/ranked play of any kind (RLBot is offline-only; this project targets local matches).
 - Pixel-based observations, model-based RL, full AlphaStar league with concurrent exploiter populations (single exploiter slot only — full league is a possible P4).
 - Tick-skip-4 and per-mode finetunes before P3.
+
+## P0 Results (2026-07-14)
+
+| Metric | Random baseline | 107M steps | 150M steps |
+|---|---|---|---|
+| touches/min/agent | 0.00 | 15.16 | 31.97 |
+| mean dist-to-ball | 3769 uu | 1294 uu | 1288 uu |
+
+- Training throughput: ~48-58k policy-steps/sec (64 arenas, 14 worker threads, RTX 4060 Laptop learner+inference; ~20k when thermally throttled). Raw engine bench without NN: 87k env-steps/sec.
+- ep_reward: 3.5 (5M) → 10-12 (40M) → 15.8 (150M); goals scored regularly in self-play.
+- Eval gates (≥3x baseline touches, <half baseline dist): passed at 107M.
+- Checkpoint/resume exercised in production (pause + exact resume at 114.7M).
+- RLViser streaming verified (WSLg local; Windows-host streaming via CONSTRUCT_VISER_ADDR).
+- Remaining P0 exit item: bot visible in real Rocket League via RLBot v5 (Windows-side, user-assisted).
