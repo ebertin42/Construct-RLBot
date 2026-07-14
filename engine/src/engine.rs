@@ -184,6 +184,35 @@ pub fn parse_state_dict(
     Ok(PolicyWeights { trunk, policy, value })
 }
 
+/// Split num_arenas into team sizes 1/2/3 proportional to `weights`
+/// (largest-remainder method), ordered as a 1s block, 2s block, 3s block.
+pub fn allocate_team_sizes(num_arenas: usize, weights: [f64; 3]) -> Vec<usize> {
+    let total: f64 = weights.iter().sum();
+    assert!(total > 0.0, "team size weights must sum > 0");
+    let exact: Vec<f64> = weights.iter().map(|w| w / total * num_arenas as f64).collect();
+    let mut counts: Vec<usize> = exact.iter().map(|e| e.floor() as usize).collect();
+    let mut short = num_arenas - counts.iter().sum::<usize>();
+    // hand out remainders by largest fractional part; ties -> smaller size first (stable)
+    let mut order: Vec<usize> = (0..3).collect();
+    order.sort_by(|&a, &b| {
+        let fa = exact[a] - exact[a].floor();
+        let fb = exact[b] - exact[b].floor();
+        fb.partial_cmp(&fa).unwrap().then(a.cmp(&b))
+    });
+    for &i in &order {
+        if short == 0 {
+            break;
+        }
+        counts[i] += 1;
+        short -= 1;
+    }
+    let mut out = Vec::with_capacity(num_arenas);
+    for (i, &c) in counts.iter().enumerate() {
+        out.extend(std::iter::repeat(i + 1).take(c));
+    }
+    out
+}
+
 struct Worker {
     tx: Sender<Cmd>,
     rx: Receiver<WorkerOut>,
@@ -203,22 +232,26 @@ pub struct MultiEngine {
 }
 
 impl MultiEngine {
+    /// `sizes[arena] = (blue, orange)` cars-per-team for that arena, one entry per
+    /// arena (so `sizes.len()` is the arena count). Uniform legacy construction is
+    /// `vec![(blue, orange); num_arenas]`; mixed-team-size construction (Task 2) maps
+    /// `engine::allocate_team_sizes` output `s` to `(s, s)` per arena. Kept as pairs
+    /// (rather than a single size) so the asymmetric case (e.g. blue != orange, used
+    /// by tests) keeps working uniformly with the mixed-size path.
     pub fn new(
-        num_arenas: usize,
-        blue: usize,
-        orange: usize,
+        sizes: Vec<(usize, usize)>,
         schema: Schema,
         reward_cfg: RewardConfig,
         seed: u32,
         num_threads: usize,
     ) -> Self {
+        let num_arenas = sizes.len();
         let threads = if num_threads == 0 {
             std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).max(1)).unwrap_or(4)
         } else {
             num_threads
         }
         .min(num_arenas);
-        let per_agent = blue + orange;
 
         // distribute arenas round-robin-contiguously over threads
         let mut workers = Vec::with_capacity(threads);
@@ -236,15 +269,32 @@ impl MultiEngine {
             // see the fuller comment below on why num_threads still affects the
             // batched-forward float rounding.
             let global_base = assigned - count;
+            let arena_sizes: Vec<(usize, usize)> = sizes[global_base..global_base + count].to_vec();
+            let worker_agents: usize = arena_sizes.iter().map(|&(b, o)| b + o).sum();
             let handle = std::thread::spawn(move || {
                 // arenas created inside the worker thread
-                let mut arenas: Vec<EpisodeArena> = (0..count)
-                    .map(|i| {
-                        EpisodeArena::new(blue, orange, sch.tick_skip, cfg.clone(),
+                let mut arenas: Vec<EpisodeArena> = arena_sizes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(b, o))| {
+                        EpisodeArena::new(b, o, sch.tick_skip, cfg.clone(),
                                           sch.normalization.clone(), seed.wrapping_add((global_base + i) as u32))
                     })
                     .collect();
-                let agents = count * per_agent;
+                // Per-arena agent counts (blue+orange, may vary across arenas now)
+                // and the flattened agent->arena lookup used by the Collect sampling
+                // loop below (replaces the old uniform `a / per_agent` division).
+                let arena_agent_counts: Vec<usize> = arenas.iter().map(|ar| ar.num_agents()).collect();
+                let agents: usize = arena_agent_counts.iter().sum();
+                debug_assert_eq!(agents, worker_agents);
+                let mut a_to_arena = Vec::with_capacity(agents);
+                for (ai, &c) in arena_agent_counts.iter().enumerate() {
+                    a_to_arena.extend(std::iter::repeat(ai).take(c));
+                }
+                // Scratch-buffer size for the largest single arena on this worker
+                // (buffers below are reused across arenas within a round, sliced to
+                // each arena's own agent count) — replaces the old uniform `per_agent`.
+                let max_arena_agents = arena_agent_counts.iter().copied().max().unwrap_or(0);
                 // One Pcg32 per ARENA (not per agent), seeded by GLOBAL arena index —
                 // same key as the arena's own kickoff seed above. Each arena's agents
                 // (blue-then-orange, matching `EpisodeArena::car_ids` order) draw from
@@ -295,7 +345,7 @@ impl MultiEngine {
                                 collect: None,
                             };
                             let mut a_off = 0;
-                            let mut flags = vec![StepFlags::default(); per_agent];
+                            let mut flags = vec![StepFlags::default(); max_arena_agents];
                             for ar in arenas.iter_mut() {
                                 let n = ar.num_agents();
                                 ar.step(
@@ -350,8 +400,8 @@ impl MultiEngine {
                             let action_count = actions::TABLE_SIZE;
                             let mut out = CollectOut::zeros(steps, agents, d);
                             let mut obs_buf = vec![0f32; agents * d];
-                            let mut rew_buf = vec![0f32; per_agent];
-                            let mut flag_buf = vec![StepFlags::default(); per_agent];
+                            let mut rew_buf = vec![0f32; max_arena_agents];
+                            let mut flag_buf = vec![StepFlags::default(); max_arena_agents];
                             let mut fin_buf = vec![0f32; agents * d];
 
                             let mut worker_err: Option<String> = None;
@@ -388,14 +438,14 @@ impl MultiEngine {
                                 };
                                 out.values[t * agents..(t + 1) * agents].copy_from_slice(&values);
 
-                                // 3. sample per agent — agent a belongs to arena a/per_agent
-                                // (arenas hold per_agent agents each, in worker order); each
-                                // arena's agents draw from that arena's own rng in
-                                // blue-then-orange order, never shared across arenas.
+                                // 3. sample per agent — agent a belongs to arena a_to_arena[a]
+                                // (arenas may hold different agent counts now, in worker
+                                // order); each arena's agents draw from that arena's own rng
+                                // in blue-then-orange order, never shared across arenas.
                                 let mut acts = vec![0i64; agents];
                                 for a in 0..agents {
                                     let row = &logits[a * action_count..(a + 1) * action_count];
-                                    let (idx, lp) = sample_categorical(row, &mut rngs[a / per_agent]);
+                                    let (idx, lp) = sample_categorical(row, &mut rngs[a_to_arena[a]]);
                                     acts[a] = idx as i64;
                                     out.actions[t * agents + a] = idx as i64;
                                     out.logprobs[t * agents + a] = lp;
@@ -468,13 +518,13 @@ impl MultiEngine {
                 tx: ctx,
                 rx: orx,
                 handle: Some(handle),
-                num_agents: count * per_agent,
+                num_agents: worker_agents,
                 num_arenas: count,
             });
         }
 
         MultiEngine {
-            num_agents: num_arenas * per_agent,
+            num_agents: sizes.iter().map(|&(b, o)| b + o).sum(),
             obs_size: OBS_SIZE,
             action_count: crate::actions::TABLE_SIZE,
             workers,
@@ -653,5 +703,27 @@ impl Drop for MultiEngine {
                 let _ = h.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocates_largest_remainder_deterministic() {
+        assert_eq!(allocate_team_sizes(4, [1.0, 0.0, 0.0]), vec![1, 1, 1, 1]);
+        // 192 arenas at [0.5, 0.3, 0.2] -> 96/58/38 (0.5*192=96, 57.6->58 via remainder, 38.4->38)
+        let s = allocate_team_sizes(192, [0.5, 0.3, 0.2]);
+        assert_eq!(s.iter().filter(|&&x| x == 1).count(), 96);
+        assert_eq!(s.iter().filter(|&&x| x == 2).count(), 58);
+        assert_eq!(s.iter().filter(|&&x| x == 3).count(), 38);
+        assert_eq!(s.len(), 192);
+        // blocks are ordered 1s, 2s, 3s
+        let mut sorted = s.clone();
+        sorted.sort_unstable();
+        assert_eq!(s, sorted);
+        // exact division stays exact
+        assert_eq!(allocate_team_sizes(4, [0.5, 0.25, 0.25]), vec![1, 1, 2, 3]);
     }
 }

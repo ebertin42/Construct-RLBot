@@ -63,7 +63,7 @@ impl Engine {
     #[new]
     #[pyo3(signature = (num_arenas=32, blue=1, orange=1, schema_path="schema/v0.toml",
                         reward_config_path="configs/reward_v0.toml", meshes_path=None,
-                        seed=0, num_threads=0))]
+                        seed=0, num_threads=0, team_size_weights=None))]
     fn new(
         num_arenas: usize,
         blue: usize,
@@ -73,6 +73,7 @@ impl Engine {
         meshes_path: Option<&str>,
         seed: u32,
         num_threads: usize,
+        team_size_weights: Option<Vec<f64>>,
     ) -> PyResult<Self> {
         sim_init::ensure_init(meshes_path);
         let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
@@ -83,7 +84,26 @@ impl Engine {
             )));
         }
         let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
-        Ok(Engine { inner: engine::MultiEngine::new(num_arenas, blue, orange, sch, cfg, seed, num_threads) })
+        // `sizes[arena] = (blue, orange)`. `None` -> legacy uniform behavior (keeps the
+        // asymmetric blue != orange case, e.g. tests' 1v0-style configs, working exactly
+        // as before). `Some(w)` -> mixed 1v1/2v2/3v3 arenas via the largest-remainder
+        // allocator; blue/orange args are ignored in that case (each mixed arena is size
+        // vs size, i.e. (s, s)).
+        let sizes: Vec<(usize, usize)> = match team_size_weights {
+            Some(w) => {
+                if w.len() != 3 || w.iter().any(|x| *x < 0.0) || w.iter().sum::<f64>() <= 0.0 {
+                    return Err(PyValueError::new_err(
+                        "team_size_weights must be 3 nonnegative floats summing > 0",
+                    ));
+                }
+                engine::allocate_team_sizes(num_arenas, [w[0], w[1], w[2]])
+                    .into_iter()
+                    .map(|s| (s, s))
+                    .collect()
+            }
+            None => vec![(blue, orange); num_arenas],
+        };
+        Ok(Engine { inner: engine::MultiEngine::new(sizes, sch, cfg, seed, num_threads) })
     }
 
     #[getter]
