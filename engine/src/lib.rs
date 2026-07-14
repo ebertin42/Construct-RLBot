@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 pub mod actions;
+pub mod episode;
 pub mod obs;
 pub mod reward;
 pub mod schema;
