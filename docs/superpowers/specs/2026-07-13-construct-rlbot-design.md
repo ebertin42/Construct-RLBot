@@ -144,3 +144,14 @@ Approach: **Rust engine + Python brain.** Rust owns the CPU-bound hot loop (sim 
 - Checkpoint/resume exercised in production (pause + exact resume at 114.7M).
 - RLViser streaming verified (WSLg local; Windows-host streaming via CONSTRUCT_VISER_ADDR).
 - Remaining P0 exit item: bot visible in real Rocket League via RLBot v5 (Windows-side, user-assisted).
+
+### P0 exit confirmed (2026-07-14)
+
+Bot deployed via RLBot v5 and played live in Rocket League on the Windows
+host (~460M-step checkpoint). Deploy-seam bugs found and fixed during
+live verification, exactly where the plan predicted (rlgym-compat field
+mapping): `SimExtraInfo` API drift (tick_skip removed), collision meshes
+needed beside the bot, and boost double-scaling (compat stores 0..100 —
+the wrong 0..1 assumption froze the policy out-of-distribution).
+Lesson for P1: the Rust↔Python parity test cannot cover the
+compat→state-dict seam; a recorded-packet fixture test should.
