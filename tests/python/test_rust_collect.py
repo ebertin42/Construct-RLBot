@@ -41,6 +41,26 @@ def test_set_weights_rejects_garbage():
         eng.set_weights({"trunk.0.weight": np.zeros((3, 3), dtype=np.float32)})
 
 
+def test_set_weights_rejects_wrong_dims():
+    torch.manual_seed(0)
+    eng = mk()
+    bad_obs = state_dict_np(PolicyValueNet(93, 90, (32, 32)))   # wrong obs size
+    with pytest.raises(Exception, match="obs size"):
+        eng.set_weights(bad_obs)
+    bad_actions = state_dict_np(PolicyValueNet(94, 89, (32, 32)))  # wrong action count
+    with pytest.raises(Exception):
+        eng.set_weights(bad_actions)
+
+
+def test_set_weights_rejects_unexpected_keys():
+    torch.manual_seed(0)
+    sd = state_dict_np(PolicyValueNet(94, 90, (32, 32)))
+    sd["extra_head.weight"] = np.zeros((4, 32), dtype=np.float32)
+    eng = mk()
+    with pytest.raises(Exception, match="unexpected"):
+        eng.set_weights(sd)
+
+
 def _weights(hidden=(64, 64), seed=3):
     torch.manual_seed(seed)
     return state_dict_np(PolicyValueNet(94, 90, hidden))

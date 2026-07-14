@@ -131,6 +131,11 @@ pub fn parse_state_dict(
     if trunk_ids.is_empty() {
         return Err("no trunk layers found".into());
     }
+    if !trunk_ids.iter().enumerate().all(|(i, &id)| id == i * 2) {
+        return Err(format!(
+            "trunk layer indices must be 0,2,4,... (nn.Sequential with interleaved ReLU), got {trunk_ids:?}"
+        ));
+    }
     let trunk = trunk_ids.iter()
         .map(|i| take_layer(&arrays, &format!("trunk.{i}")))
         .collect::<Result<Vec<_>, _>>()?;
@@ -152,6 +157,30 @@ pub fn parse_state_dict(
     {
         return Err("head shapes do not match trunk output".into());
     }
+    if trunk[0].in_dim != crate::obs::OBS_SIZE {
+        return Err(format!(
+            "trunk input dim {} != engine obs size {}", trunk[0].in_dim, crate::obs::OBS_SIZE
+        ));
+    }
+    if policy.out_dim != crate::actions::TABLE_SIZE {
+        return Err(format!(
+            "policy output dim {} != engine action table size {}", policy.out_dim, crate::actions::TABLE_SIZE
+        ));
+    }
+
+    // Reject any key not consumed above (trunk.N.{weight,bias} for discovered N,
+    // policy_head.*, value_head.*) — catches stale/extra heads silently ignored otherwise.
+    let mut consumed: std::collections::HashSet<String> = trunk_ids.iter()
+        .flat_map(|i| [format!("trunk.{i}.weight"), format!("trunk.{i}.bias")])
+        .collect();
+    consumed.insert("policy_head.weight".into());
+    consumed.insert("policy_head.bias".into());
+    consumed.insert("value_head.weight".into());
+    consumed.insert("value_head.bias".into());
+    if let Some(k) = arrays.keys().find(|k| !consumed.contains(k.as_str())) {
+        return Err(format!("unexpected state_dict key: {k}"));
+    }
+
     Ok(PolicyWeights { trunk, policy, value })
 }
 
@@ -200,7 +229,12 @@ impl MultiEngine {
             let (ctx, crx) = channel::<Cmd>();
             let (otx, orx) = channel::<WorkerOut>();
             let (sch, cfg) = (schema.clone(), reward_cfg.clone());
-            // seed by GLOBAL arena index so rollouts are invariant to num_threads
+            // Seed by GLOBAL arena index: this makes each arena's own sim state
+            // (kickoff RNG, per-arena action-sample RNG below) invariant to how
+            // arenas are sharded across worker threads. That is NOT the same as
+            // collect()'s end-to-end determinism contract, which is narrower —
+            // see the fuller comment below on why num_threads still affects the
+            // batched-forward float rounding.
             let global_base = assigned - count;
             let handle = std::thread::spawn(move || {
                 // arenas created inside the worker thread
