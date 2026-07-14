@@ -10,6 +10,7 @@ pub mod obs;
 pub mod reward;
 pub mod schema;
 pub mod sim_init;
+pub mod viser;
 
 #[pyfunction]
 fn version() -> &'static str {
@@ -110,10 +111,93 @@ impl Engine {
     }
 }
 
+// `unsendable`: `EpisodeArena` holds a `cxx::UniquePtr<Arena>`, which contains raw
+// pointers (`cxx::private::Opaque`) that aren't `Sync`. Same rationale as `Engine`
+// above: this only pins the Python-facing wrapper to the constructing thread, which
+// matches how `RenderSession` is used (single Python thread drives reset()/step()).
+#[pyclass(unsendable)]
+struct RenderSession {
+    arena: episode::EpisodeArena,
+    stream: viser::ViserStream,
+    pacer: viser::Pacer,
+    num_agents: usize,
+}
+
+#[pymethods]
+impl RenderSession {
+    #[new]
+    #[pyo3(signature = (blue=1, orange=1, schema_path="schema/v0.toml",
+                        reward_config_path="configs/reward_v0.toml", meshes_path=None, seed=0))]
+    fn new(blue: usize, orange: usize, schema_path: &str, reward_config_path: &str,
+           meshes_path: Option<&str>, seed: u32) -> PyResult<Self> {
+        sim_init::ensure_init(meshes_path);
+        let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
+        let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
+        let tick_skip = sch.tick_skip;
+        Ok(RenderSession {
+            arena: episode::EpisodeArena::new(blue, orange, tick_skip, cfg, sch.normalization, seed),
+            stream: viser::ViserStream::new().map_err(|e| PyValueError::new_err(e.to_string()))?,
+            pacer: viser::Pacer::new(tick_skip),
+            num_agents: blue + orange,
+        })
+    }
+
+    #[getter]
+    fn obs_size(&self) -> usize { obs::OBS_SIZE }
+    #[getter]
+    fn action_count(&self) -> usize { actions::TABLE_SIZE }
+    #[getter]
+    fn num_agents(&self) -> usize { self.num_agents }
+
+    fn reset<'py>(&mut self, py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
+        let (n, d) = (self.num_agents, obs::OBS_SIZE);
+        let mut o = vec![0.0f32; n * d];
+        self.arena.write_obs(&mut o);
+        numpy::ndarray::Array2::from_shape_vec((n, d), o).unwrap().into_pyarray(py)
+    }
+
+    fn step<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions_in: PyReadonlyArray1<'py, i64>,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray1<f32>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray1<bool>>,
+        Bound<'py, PyArray2<f32>>,
+    )> {
+        let acts = actions_in.as_slice()?.to_vec();
+        let (n, d) = (self.num_agents, obs::OBS_SIZE);
+        let (mut o, mut fin) = (vec![0.0f32; n * d], vec![0.0f32; n * d]);
+        let mut rew = vec![0.0f32; n];
+        let mut flags = vec![episode::StepFlags::default(); n];
+        self.arena.step(&acts, &mut rew, &mut flags, &mut fin);
+        self.arena.write_obs(&mut o);
+        let gs = self.arena.game_state();
+        let _ = self.stream.send_state(gs);
+        self.pacer.pace();
+        let term: Vec<bool> = flags.iter().map(|f| f.terminated).collect();
+        let trunc: Vec<bool> = flags.iter().map(|f| f.truncated).collect();
+        Ok((
+            numpy::ndarray::Array2::from_shape_vec((n, d), o).unwrap().into_pyarray(py),
+            rew.into_pyarray(py),
+            term.into_pyarray(py),
+            trunc.into_pyarray(py),
+            numpy::ndarray::Array2::from_shape_vec((n, d), fin).unwrap().into_pyarray(py),
+        ))
+    }
+
+    fn close(&mut self) {
+        self.stream.quit();
+    }
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(schema_dict, m)?)?;
     m.add_class::<Engine>()?;
+    m.add_class::<RenderSession>()?;
     Ok(())
 }
