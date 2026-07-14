@@ -328,9 +328,13 @@ impl RenderSession {
         }
         let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
         let tick_skip = sch.tick_skip;
+        let mut arena = episode::EpisodeArena::new(blue, orange, tick_skip, cfg, sch.normalization, seed);
+        let mut stream = viser::ViserStream::new().map_err(|e| PyValueError::new_err(e.to_string()))?;
+        // real state (valid tick_rate) with cars cleared — see send_flush docs
+        let _ = stream.send_flush(arena.game_state());
         Ok(RenderSession {
-            arena: episode::EpisodeArena::new(blue, orange, tick_skip, cfg, sch.normalization, seed),
-            stream: viser::ViserStream::new().map_err(|e| PyValueError::new_err(e.to_string()))?,
+            arena,
+            stream,
             pacer: viser::Pacer::new(tick_skip),
             num_agents: blue + orange,
         })
