@@ -30,8 +30,9 @@ def compat_to_state_dict(game_state: GameState) -> dict:
         column accessors on this installed rlgym-compat version, or is the
         forward vector obtained differently (e.g. via a quaternion or an
         explicit rotation matrix indexing)?
-      - car.boost_amount: confirm it is 0..1 scaled (as assumed here, hence
-        the *100.0 below) and not already 0..100.
+      - car.boost_amount: VERIFIED 0..100 (rlgym_compat 2.3.6 car.py:48);
+        passed through unscaled. The original 0..1 assumption froze the bot
+        (boost=33 in obs instead of 0.33 = out-of-distribution).
       - car.can_flip: confirm this is the correct attribute name for "has
         a flip/double-jump available" (vs. e.g. has_flip, has_jump).
       - car.on_ground, car.is_demoed, car.team_num: confirm attribute names
@@ -51,7 +52,7 @@ def compat_to_state_dict(game_state: GameState) -> dict:
             "ang_vel": phys.angular_velocity.tolist(),
             "forward": phys.forward.tolist(),
             "up": phys.up.tolist(),
-            "boost": float(car.boost_amount * 100.0),   # compat stores 0..1; engine uses 0..100
+            "boost": float(car.boost_amount),  # compat stores 0..100 (verified car.py:48) — same scale as engine
             "is_on_ground": bool(car.on_ground),
             "has_flip": bool(car.can_flip),
             "is_demoed": bool(car.is_demoed),
@@ -79,8 +80,24 @@ class ConstructBot(Bot):
         self.ticks = TICK_SKIP  # act on first packet
         self.prev_control = ControllerState()
         self.prev_frame = -1
+        self._debug_budget = 30  # log first N acting frames / exceptions
 
     def get_output(self, packet: GamePacket) -> ControllerState:
+        try:
+            return self._get_output(packet)
+        except Exception:
+            if self._debug_budget > 0:
+                self._debug_budget -= 1
+                import traceback
+
+                self._dbg("EXCEPTION:\n" + traceback.format_exc())
+            return self.prev_control
+
+    def _dbg(self, msg: str):
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_debug.log"), "a") as f:
+            f.write(msg + "\n")
+
+    def _get_output(self, packet: GamePacket) -> ControllerState:
         if not packet.balls:
             return self.prev_control  # replay/kickoff countdown frames
         frame = packet.match_info.frame_num
@@ -97,6 +114,15 @@ class ConstructBot(Bot):
         with torch.no_grad():
             logits, _ = self.net(torch.from_numpy(obs).unsqueeze(0))
         row = self.table[int(logits.argmax(-1))]
+
+        if self._debug_budget > 0:
+            self._debug_budget -= 1
+            self._dbg(
+                f"frame={frame} player_id={self.player_id!r} index={self.index} "
+                f"cars={[(c['id'], c['team']) for c in state['cars']]} "
+                f"obs[:6]={obs[:6].tolist()} obs_absmax={float(abs(obs).max()):.3f} "
+                f"action_row={row.tolist()}"
+            )
 
         c = ControllerState()
         c.throttle, c.steer = float(row[0]), float(row[1])
