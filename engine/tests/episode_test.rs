@@ -93,6 +93,66 @@ fn physics_nan_contained_as_termination() {
 }
 
 #[test]
+fn physics_insane_but_finite_contained_as_termination() {
+    // A contact-solver blowup can ramp through huge-but-finite values before (or
+    // instead of) ever reaching NaN/inf. `state_is_finite` alone accepts these
+    // (investigation: engine/examples/blowup_probe.rs demonstrated a by-construction
+    // "levitating ball" persists 449 steps as valid, non-terminal transitions). The
+    // engine must contain an insane-but-finite state exactly like the NaN case:
+    // terminate on the FIRST frame it's visible, zero reward, no leaked transition.
+    let mut a = mk(1, 1, 5);
+    // In-field x/y (can't score) but z/vel far beyond any legal value.
+    a.debug_place_ball([2000.0, 0.0, 5.0e8], [0.0, 0.0, 5.0e6]);
+    let mut r = vec![0.0; 2];
+    let mut f = vec![StepFlags::default(); 2];
+    let mut fo = vec![0.0; 2 * OBS_SIZE];
+    a.step(&[0, 0], &mut r, &mut f, &mut fo);
+    assert!(r.iter().all(|&x| x == 0.0), "insane-state termination must zero reward, got {r:?}");
+    assert!(
+        f[0].terminated && f[1].terminated,
+        "insane state must terminate on the first frame it's visible, got {f:?}"
+    );
+    assert!(!f[0].truncated && !f[1].truncated);
+    assert!(fo.iter().all(|x| x.is_finite()), "final_obs must stay finite");
+    // Post-reset state must be back in sane range (not still latched insane).
+    let mut obs = vec![0.0; 2 * OBS_SIZE];
+    a.write_obs(&mut obs);
+    let max_abs = obs.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    assert!(max_abs < 100.0, "post-reset obs must be sane, got max|obs|={max_abs}");
+    // and stepping again works normally, without re-triggering containment
+    a.step(&[0, 0], &mut r, &mut f, &mut fo);
+    assert!(r.iter().all(|x| x.is_finite()));
+}
+
+#[test]
+fn insane_state_takes_precedence_over_phantom_goal() {
+    // Investigation outcome 3: a blowup that ejects the ball past the goal line
+    // makes `is_ball_scored()` fire a REAL (not fake) goal for a physically
+    // impossible position, injecting a spurious +/-goal reward before the episode
+    // resets (observed live with reward_v2: +24.55; reproduced here at y=1e8 with
+    // goal=20.0 -> rewards=[20.0, -19.998]). The insane-state guard must take
+    // precedence over goal detection so this can never pay out.
+    let mut cfg = RewardConfig::load("../configs/reward_v0.toml").unwrap();
+    cfg.goal = 20.0;
+    ensure_init(None);
+    let s = Schema::load("../schema/v0.toml").unwrap();
+    let mut a = EpisodeArena::new(1, 1, s.tick_skip, cfg, s.normalization, 5);
+    // Same x/z as the legitimate scored_ball_terminates_and_pays_goal test (inside
+    // the goal frame), but y is a blowup value far beyond the goal line AND the
+    // sane bound (12,000) -- an insane state that ALSO satisfies is_ball_scored.
+    a.debug_place_ball([0.0, 1.0e8, 320.0], [0.0, 0.0, 0.0]);
+    let mut r = vec![0.0; 2];
+    let mut f = vec![StepFlags::default(); 2];
+    let mut fo = vec![0.0; 2 * OBS_SIZE];
+    a.step(&[0, 0], &mut r, &mut f, &mut fo);
+    assert!(f[0].terminated && f[1].terminated, "insane state must still terminate");
+    assert!(
+        r.iter().all(|&x| x == 0.0),
+        "insane-state termination must NOT award the phantom goal, got {r:?}"
+    );
+}
+
+#[test]
 fn team_spirit_blends_rewards_within_team() {
     ensure_init(None);
     let s = Schema::load("../schema/v0.toml").unwrap();
