@@ -79,3 +79,24 @@ def test_goal_threshold_covers_shaped_concede():
     from construct.league.matches import GOAL_THRESHOLD
     assert GOAL_THRESHOLD <= 9.45 - 1e-6   # concede magnitude floor
     assert GOAL_THRESHOLD >= 0.55 + 1e-6   # non-goal shaping ceiling
+
+
+import random
+
+from construct.league.sampling import choose_opponents
+
+
+def test_choose_opponents_mix(tmp_path):
+    r = Registry(path=str(tmp_path / "reg.jsonl"))
+    for i in range(10):
+        r.add(f"ck{i}", steps=i, run="main", reward_config="x")
+    # give ck0 a huge rating so it must appear as a top pick
+    r.record_match("ck0", "ck5", 5, 0)
+    r.record_match("ck0", "ck6", 5, 0)
+    picks = choose_opponents(r, k=4, recent=5, rng=random.Random(3))
+    names = [p["ck"] for p in picks]
+    assert "ck0" in names
+    assert len(names) == len(set(names)) <= 4
+    # deterministic
+    again = [p["ck"] for p in choose_opponents(r, k=4, recent=5, rng=random.Random(3))]
+    assert names == again
