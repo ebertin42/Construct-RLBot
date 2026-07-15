@@ -429,6 +429,8 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "cxx",
+ "ndarray 0.16.1",
+ "ndarray-npy",
  "numpy",
  "pyo3",
  "rocketsim_rs",

@@ -16,6 +16,7 @@ pub mod episode;
 pub mod obs;
 pub mod obs_v1;
 pub mod policy;
+pub mod policy_v1;
 pub mod reward;
 pub mod sampler;
 pub mod schema;
