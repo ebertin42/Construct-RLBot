@@ -3,6 +3,11 @@
 //! extraction (Task 2), analytic pitch/yaw/roll (Task 3), RocketSim
 //! tick-stepping reconstruction (Task 4), and shard writer (Task 5).
 //!
+//! Optionally (`--reset-pool-out` + `--reset-samples-per-replay > 0`) also
+//! samples a `reset_pool::ResetState` pool from each replay's reconstruction
+//! (Task 6) and appends it, in jsonl form, to one pool file for the whole
+//! batch.
+//!
 //! ## Working directory requirement
 //! Reconstruction steps a RocketSim `Arena`, which loads collision-mesh
 //! assets via `construct_replay::sim_init::ensure_init` the first time it
@@ -21,12 +26,15 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use clap::Parser;
 use construct_replay::{
-    frames::extract_frames, meta::parse_meta, reconstruct::reconstruct_120hz, shard::write_shard,
+    frames::extract_frames,
+    meta::parse_meta,
+    reconstruct::reconstruct_120hz,
+    reset_pool::{sample_reset_states, write_pool_jsonl, ResetState},
+    shard::write_shard,
 };
 use rayon::prelude::*;
 
@@ -59,6 +67,32 @@ struct Args {
     /// or written), and counted separately from failures in the summary.
     #[arg(long, default_value_t = 1)]
     min_team_size: u8,
+
+    /// Path to a single reset-state-pool jsonl file. Only takes effect when
+    /// paired with `--reset-samples-per-replay > 0`; reset states sampled
+    /// from every replay in the batch are collected in memory and appended
+    /// to this one file after the whole batch finishes (see
+    /// `construct_replay::reset_pool`'s module doc for the jsonl schema).
+    #[arg(long)]
+    reset_pool_out: Option<PathBuf>,
+
+    /// Number of reset states to sample per replay for `--reset-pool-out`.
+    /// `0` (default) disables reset-pool sampling entirely.
+    #[arg(long, default_value_t = 0)]
+    reset_samples_per_replay: usize,
+}
+
+/// Deterministic per-replay seed for reset-state sampling, derived from the
+/// replay's id (file stem) via FNV-1a so re-running the CLI over the same
+/// input file always samples the same states regardless of rayon's
+/// scheduling order or `--jobs`.
+fn seed_for_replay(replay_id: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in replay_id.bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 enum Outcome {
@@ -67,32 +101,43 @@ enum Outcome {
     Failed,
 }
 
-fn parse_one(path: &Path, output_dir: &Path, fps: u32, min_team_size: u8) -> Outcome {
+fn parse_one(
+    path: &Path,
+    output_dir: &Path,
+    fps: u32,
+    min_team_size: u8,
+    reset_samples_per_replay: usize,
+) -> (Outcome, Vec<ResetState>) {
     let replay_id = match path.file_stem().and_then(|s| s.to_str()) {
         Some(s) => s.to_string(),
         None => {
             eprintln!("failed {}: unreadable file stem", path.display());
-            return Outcome::Failed;
+            return (Outcome::Failed, Vec::new());
         }
     };
 
-    let result: Result<Outcome, String> = (|| {
+    let result: Result<(Outcome, Vec<ResetState>), String> = (|| {
         let bytes = fs::read(path).map_err(|e| format!("read: {e}"))?;
         let meta = parse_meta(&bytes)?;
         if meta.team_size < min_team_size {
-            return Ok(Outcome::Skipped);
+            return Ok((Outcome::Skipped, Vec::new()));
         }
         let frames = extract_frames(&bytes, fps)?;
         let rec = reconstruct_120hz(&frames)?;
         write_shard(output_dir, &replay_id, &meta, &rec)?;
-        Ok(Outcome::Parsed)
+        let states = if reset_samples_per_replay > 0 {
+            sample_reset_states(&rec, reset_samples_per_replay, seed_for_replay(&replay_id))
+        } else {
+            Vec::new()
+        };
+        Ok((Outcome::Parsed, states))
     })();
 
     match result {
-        Ok(outcome) => outcome,
+        Ok(out) => out,
         Err(e) => {
             eprintln!("failed {}: {e}", path.display());
-            Outcome::Failed
+            (Outcome::Failed, Vec::new())
         }
     }
 }
@@ -124,24 +169,43 @@ fn main() {
         std::process::exit(1);
     }
 
-    let parsed = AtomicUsize::new(0);
-    let skipped = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
+    // Collect-then-write-once: each worker's outcome + sampled reset states
+    // are gathered by rayon's `collect` (no shared mutable state during the
+    // parallel phase), then the whole batch's reset states are appended to
+    // `--reset-pool-out` in one single-threaded write after `par_iter`
+    // finishes — avoids interleaved/corrupted jsonl lines from concurrent
+    // appends without needing a `Mutex`-guarded writer.
+    let results: Vec<(Outcome, Vec<ResetState>)> = entries
+        .par_iter()
+        .map(|path| {
+            parse_one(path, &args.output_dir, args.fps, args.min_team_size, args.reset_samples_per_replay)
+        })
+        .collect();
 
-    entries.par_iter().for_each(|path| {
-        let outcome = parse_one(path, &args.output_dir, args.fps, args.min_team_size);
-        let counter = match outcome {
-            Outcome::Parsed => &parsed,
-            Outcome::Skipped => &skipped,
-            Outcome::Failed => &failed,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-    });
+    let mut parsed = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut reset_states: Vec<ResetState> = Vec::new();
+    for (outcome, states) in results {
+        match outcome {
+            Outcome::Parsed => parsed += 1,
+            Outcome::Skipped => skipped += 1,
+            Outcome::Failed => failed += 1,
+        }
+        reset_states.extend(states);
+    }
+
+    if args.reset_samples_per_replay > 0 {
+        if let Some(pool_path) = &args.reset_pool_out {
+            if let Err(e) = write_pool_jsonl(pool_path, &reset_states, true) {
+                eprintln!("failed to write reset pool {}: {e}", pool_path.display());
+                std::process::exit(1);
+            }
+        }
+    }
 
     println!(
-        "parsed={} skipped={} failed={}",
-        parsed.load(Ordering::Relaxed),
-        skipped.load(Ordering::Relaxed),
-        failed.load(Ordering::Relaxed)
+        "parsed={parsed} skipped={skipped} failed={failed} reset_states={}",
+        reset_states.len()
     );
 }
