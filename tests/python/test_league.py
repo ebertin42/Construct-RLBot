@@ -217,3 +217,63 @@ def test_trainer_league_refresh(tmp_path):
     t.run(max_iterations=2)
     # 4 arenas, frac 0.5 -> 2 opponent arenas -> learner agents = 4*2 - 2 = 6
     assert t.total_steps == 2 * 8 * 6
+
+
+def _save_tiny_ck(tmp_path, name):
+    import torch
+    from construct.learn.model import PolicyValueNet
+    net = PolicyValueNet(94, 90, (512, 512))
+    p = str(tmp_path / name)
+    torch.save({"model": net.state_dict(), "total_steps": 1,
+                "config": {"net": {"hidden": [512, 512]}}, "schema_version": 0,
+                "reward_config_path": "x"}, p)
+    return p
+
+
+def test_refresh_opponents_reloads_registry_from_disk(tmp_path, capsys):
+    # scripts/league_tick.py runs out-of-process and appends to the registry
+    # via its own Registry instance. The Trainer's in-memory snapshot (taken
+    # once at __init__) must not go stale -- a later refresh must see entries
+    # added to the jsonl after the Trainer was constructed.
+    reg_path = str(tmp_path / "reg.jsonl")
+    reg = Registry(path=reg_path)
+    reg.add(_save_tiny_ck(tmp_path, "opp1.pt"), steps=1, run="main", reward_config="x")
+
+    cfg = _league_cfg(tmp_path, reg_path, slots=2)
+    t = Trainer(cfg)
+    t._refresh_opponents()
+    capsys.readouterr()  # drain first refresh's output
+
+    # a second, independent Registry instance (standing in for league_tick.py)
+    # appends a new entry to the same on-disk jsonl.
+    p2 = _save_tiny_ck(tmp_path, "opp2.pt")
+    Registry(path=reg_path).add(p2, steps=2, run="main", reward_config="x")
+
+    t._refresh_opponents()
+    out = capsys.readouterr().out
+    # k=2, only 2 entries total in the reloaded registry -> both must be picked
+    assert p2 in out
+
+
+def test_refresh_opponents_seeded_rng_is_deterministic(tmp_path):
+    reg_path = str(tmp_path / "reg.jsonl")
+    reg = Registry(path=reg_path)
+    for i in range(6):
+        reg.add(_save_tiny_ck(tmp_path, f"opp{i}.pt"), steps=i, run="main", reward_config="x")
+
+    cfg = _league_cfg(tmp_path, reg_path, slots=3)
+    t1 = Trainer(cfg)
+    t1._refresh_opponents(it=5)
+    t2 = Trainer(cfg)
+    t2._refresh_opponents(it=5)
+    # same config + registry + iteration -> identical opponent assignment
+    # (fixed-config determinism contract for league runs)
+    assert t1._assignment == t2._assignment
+
+
+def test_league_slots_upper_bound_validated():
+    cfg = TrainConfig.load("configs/train_v0.toml")
+    cfg.run.update(device="cpu")
+    cfg.league = {"enabled": True, "slots": 9}
+    with pytest.raises(AssertionError, match="slots"):
+        Trainer(cfg)

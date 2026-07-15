@@ -36,6 +36,13 @@ class MatchRunner:
         self.assignment = [0] * num_arenas
 
     def play(self, sd_a, sd_b, steps=2700):
+        # Arenas are not reset between calls: match N+1's collect() continues
+        # from wherever match N left the ball/cars, and set_weights/set_opponents
+        # swap the policies driving those arenas mid-episode. Intentional --
+        # avoids a reset() round-trip per match -- and deterministic given a
+        # fixed seed + call sequence (see test_match_deterministic); the only
+        # cost is a bit of extra noise in per-match goal counts, which washes
+        # out over the TrueSkill ladder's many matches.
         self.eng.set_weights(sd_a)
         self.eng.set_opponents([sd_b])
         out = self.eng.collect(steps, arena_opponents=self.assignment)

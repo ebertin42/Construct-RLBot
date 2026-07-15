@@ -1,4 +1,5 @@
 import os
+import random
 import time
 
 import numpy as np
@@ -43,13 +44,17 @@ class Trainer:
             from construct.league.matches import load_sd
             frac = float(lg.get("opponent_frac", 0.2))
             assert 0 <= frac < 1, f"league.opponent_frac must be in [0, 1), got {frac}"
+            slots = int(lg.get("slots", 4))
+            # engine.set_opponents rejects more than 8 slots (lib.rs) -- catch it at
+            # init time rather than mid-run.
+            assert 1 <= slots <= 8, f"league.slots must be in [1, 8], got {slots}"
             self._league = {
                 "registry": Registry(path=lg.get("registry", "league/registry.jsonl")),
                 "choose": choose_opponents, "load_sd": load_sd,
                 "frac": frac,
                 # floor at 1: refresh_iters=0 would make `it % refresh` divide by zero.
                 "refresh": max(1, int(lg.get("refresh_iters", 200))),
-                "slots": int(lg.get("slots", 4)),
+                "slots": slots,
             }
 
         if _state:
@@ -58,9 +63,22 @@ class Trainer:
                 self.opt.load_state_dict(_state["optimizer"])
             self.total_steps = _state["total_steps"]
 
-    def _refresh_opponents(self):
+    def _refresh_opponents(self, it: int = 0):
         """Pull a fresh opponent pool from the registry and rebuild the arena
         assignment. Called every `league.refresh_iters` iterations from run().
+
+        Reloads the registry from disk on every call: scripts/league_tick.py
+        appends to the same jsonl out-of-process (via its own Registry
+        instance), and the in-memory snapshot taken at Trainer.__init__ would
+        otherwise never see those entries for the life of the run.
+        Registry._save writes via a temp-file + os.replace, so a concurrent
+        read here always sees either the old or the new file, never a torn
+        one. If the reload itself fails (e.g. transient I/O error), keep the
+        previous in-memory snapshot and warn, rather than taking down the run.
+
+        Opponent picks are seeded from (run seed, iteration) so assignments
+        are reproducible across identical runs but still vary refresh to
+        refresh -- part of the repo's fixed-config determinism contract.
 
         Assignment: the last `round(frac * num_arenas)` arenas (arenas are
         ordered in 1v1/2v2/3v3 blocks -- see Engine's team_size_weights
@@ -77,7 +95,14 @@ class Trainer:
         is left in place rather than falling back to an empty pool.
         """
         L = self._league
-        picks = L["choose"](L["registry"], k=L["slots"])
+        from construct.league.registry import Registry
+        try:
+            L["registry"] = Registry(path=L["registry"].path)
+        except Exception as e:
+            print(f"league: failed to reload registry from disk ({e}), "
+                  "keeping previous snapshot", flush=True)
+        rng = random.Random(hash((self.cfg.env["seed"], it)))
+        picks = L["choose"](L["registry"], k=L["slots"], rng=rng)
         if not picks:
             self._assignment = None
             print("league: no opponents available (pure self-play)", flush=True)
@@ -143,7 +168,7 @@ class Trainer:
         while max_iterations is None or it < max_iterations:
             t0 = time.perf_counter()
             if self._league and it % self._league["refresh"] == 0:
-                self._refresh_opponents()
+                self._refresh_opponents(it)
             batch = self.collect(p["rollout_steps"])
             stats = ppo_update(
                 self.net, self.opt, batch, clip=p["clip"], entropy_coef=p["entropy_coef"],
