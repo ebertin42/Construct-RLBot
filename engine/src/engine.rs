@@ -1,9 +1,11 @@
 use crate::{
     actions,
     curriculum::CurriculumConfig,
-    episode::{EpisodeArena, StepFlags},
+    episode::{EpisodeArena, ObsMode, StepFlags},
     obs::OBS_SIZE,
+    obs_v1::{ENT_FEAT, MAX_ENT, PREV_ACTIONS, Q_FEAT},
     policy::{LayerWeights, MlpPolicy, PolicyWeights},
+    policy_v1::EntityPolicy,
     reward::RewardConfig,
     sampler::{sample_categorical, Pcg32},
     schema::Schema,
@@ -13,12 +15,26 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+/// Raw state-dict arrays as they arrive from Python: `name -> (flat
+/// row-major f32 data, shape)`. V0 parses this into `PolicyWeights`
+/// (`parse_state_dict`); v1 hands it to `EntityPolicy::new` unparsed (that
+/// constructor does its own name/shape validation).
+pub type RawStateDict = HashMap<String, (Vec<f32>, Vec<usize>)>;
+
+/// A policy state dict tagged by net family. `MultiEngine::set_weights` /
+/// `set_opponents` reject a variant that doesn't match the engine's
+/// `ObsMode` (schema version), so workers can assume the match.
+pub enum NetWeights {
+    V0(PolicyWeights),
+    V1 { raw: RawStateDict, heads: usize },
+}
+
 enum Cmd {
     Reset,
     Step(Vec<i64>),
     Debug { local_idx: usize },
-    SetWeights(Arc<PolicyWeights>),
-    SetOpponents(Arc<Vec<PolicyWeights>>),
+    SetWeights(Arc<NetWeights>),
+    SetOpponents(Arc<Vec<NetWeights>>),
     // `assignment` is the FULL (global, length num_arenas) opponent assignment;
     // each worker slices its own `[global_base..global_base+count)` range out of
     // it (see the Cmd::Collect arm). Legacy calls (Python `arena_opponents=None`)
@@ -39,6 +55,18 @@ enum Cmd {
 /// arrays — same reasoning as `policy::PolicyWeights`/`LayerWeights`.
 pub struct CollectOut {
     pub obs: Vec<f32>,
+    // --- v1 (entity) obs buffers; empty in v0 mode, `obs` empty in v1 ---
+    /// `[T, N, MAX_ENT, ENT_FEAT]` flattened.
+    pub ents: Vec<f32>,
+    /// `[T, N, MAX_ENT]` flattened (true = masked/absent).
+    pub mask: Vec<bool>,
+    /// `[T, N, Q_FEAT]` flattened.
+    pub query: Vec<f32>,
+    /// `[T, N, PREV_ACTIONS]` flattened (action-table indices).
+    pub prev: Vec<i64>,
+    /// Kickstart-teacher input `[T, N, OBS_SIZE]`; populated only when the
+    /// engine was built with `emit_v0_obs=true` (v1 mode), else empty.
+    pub obs_v0: Vec<f32>,
     pub actions: Vec<i64>,
     pub logprobs: Vec<f32>,
     pub values: Vec<f32>,
@@ -59,6 +87,32 @@ impl CollectOut {
     fn zeros(steps: usize, agents: usize, obs_dim: usize) -> Self {
         CollectOut {
             obs: vec![0.0; steps * agents * obs_dim],
+            ents: vec![],
+            mask: vec![],
+            query: vec![],
+            prev: vec![],
+            obs_v0: vec![],
+            actions: vec![0; steps * agents],
+            logprobs: vec![0.0; steps * agents],
+            values: vec![0.0; steps * agents],
+            rewards: vec![0.0; steps * agents],
+            terminated: vec![false; steps * agents],
+            truncated: vec![false; steps * agents],
+            final_values: vec![0.0; steps * agents],
+            last_values: vec![0.0; agents],
+            learner_agents: agents,
+        }
+    }
+
+    /// V1 counterpart of `zeros`: entity buffers sized, `obs` unused.
+    fn zeros_v1(steps: usize, agents: usize, emit_v0_obs: bool) -> Self {
+        CollectOut {
+            obs: vec![],
+            ents: vec![0.0; steps * agents * MAX_ENT * ENT_FEAT],
+            mask: vec![false; steps * agents * MAX_ENT],
+            query: vec![0.0; steps * agents * Q_FEAT],
+            prev: vec![0; steps * agents * PREV_ACTIONS],
+            obs_v0: if emit_v0_obs { vec![0.0; steps * agents * OBS_SIZE] } else { vec![] },
             actions: vec![0; steps * agents],
             logprobs: vec![0.0; steps * agents],
             values: vec![0.0; steps * agents],
@@ -200,6 +254,246 @@ pub fn parse_state_dict(
     Ok(PolicyWeights { trunk, policy, value })
 }
 
+/// One worker's v1 (entity-obs) rollout: the exact structure of the v0
+/// `Cmd::Collect` arm — per-round {build obs for all agents, ONE batched
+/// learner forward + one per used opponent slot, sample EVERY agent from its
+/// arena's own rng in arena-major blue-then-orange order, step arenas,
+/// final-value forward for done learner rows} then a post-rollout bootstrap
+/// forward — with the flat 94-float obs replaced by ents/mask/query/prev
+/// tensors and `MlpPolicy` by `EntityPolicy`. Kept as a separate function
+/// (rather than branching inside the v0 loop) so the v0 path stays literally
+/// untouched; the sampling order/rng-stream discipline is identical, so the
+/// fixed-(seed, num_arenas, num_threads, schema) determinism contract holds
+/// the same way. `emit_v0_obs` additionally records the legacy 94-float obs
+/// per learner row for the kickstart teacher (T7).
+#[allow(clippy::too_many_arguments)]
+fn collect_v1_worker(
+    steps: usize,
+    my_assignment: &[i32],
+    arenas: &mut [EpisodeArena],
+    arena_sizes: &[(usize, usize)],
+    a_to_arena: &[usize],
+    max_arena_agents: usize,
+    rngs: &mut [Pcg32],
+    pol: &EntityPolicy,
+    opponents: &[EntityPolicy],
+    emit_v0_obs: bool,
+) -> Result<CollectOut, String> {
+    let agents = a_to_arena.len();
+    // per-agent buffer widths
+    let ek = MAX_ENT * ENT_FEAT;
+    let (mk, qk, pk) = (MAX_ENT, Q_FEAT, PREV_ACTIONS);
+    let action_count = actions::TABLE_SIZE_V1;
+
+    // Learner/opponent index maps — same construction as the v0 arm.
+    let mut learner_idx: Vec<usize> = Vec::with_capacity(agents);
+    let mut opp_idx: Vec<Vec<usize>> = vec![Vec::new(); opponents.len()];
+    let mut learner_col: Vec<Option<usize>> = vec![None; agents];
+    {
+        let mut a_off = 0usize;
+        for (li, &(b, o)) in arena_sizes.iter().enumerate() {
+            let k = my_assignment[li];
+            if k < 0 {
+                for i in 0..(b + o) {
+                    learner_idx.push(a_off + i);
+                }
+            } else {
+                let slot = k as usize;
+                for i in 0..b {
+                    learner_idx.push(a_off + i);
+                }
+                for i in b..(b + o) {
+                    opp_idx[slot].push(a_off + i);
+                }
+            }
+            a_off += b + o;
+        }
+        for (col, &a) in learner_idx.iter().enumerate() {
+            learner_col[a] = Some(col);
+        }
+    }
+    let n_learner = learner_idx.len();
+
+    let mut out = CollectOut::zeros_v1(steps, n_learner, emit_v0_obs);
+
+    // Full-agent-width per-round obs scratch (current + terminal-final).
+    let mut ents_buf = vec![0f32; agents * ek];
+    let mut mask_buf = vec![false; agents * mk];
+    let mut query_buf = vec![0f32; agents * qk];
+    let mut prev_buf = vec![0i64; agents * pk];
+    let mut v0_buf = vec![0f32; if emit_v0_obs { agents * OBS_SIZE } else { 0 }];
+    let mut fin_ents = vec![0f32; agents * ek];
+    let mut fin_mask = vec![false; agents * mk];
+    let mut fin_query = vec![0f32; agents * qk];
+    let mut fin_prev = vec![0i64; agents * pk];
+
+    let mut rew_buf = vec![0f32; max_arena_agents];
+    let mut flag_buf = vec![StepFlags::default(); max_arena_agents];
+    let mut logits_all = vec![0f32; agents * action_count];
+    let mut acts = vec![0i64; agents];
+
+    // Batched-forward gather buffers (learner + per opponent slot).
+    let mut l_ents = vec![0f32; n_learner * ek];
+    let mut l_mask = vec![false; n_learner * mk];
+    let mut l_query = vec![0f32; n_learner * qk];
+    let mut l_prev = vec![0i64; n_learner * pk];
+    let mut o_ents: Vec<Vec<f32>> = opp_idx.iter().map(|ix| vec![0f32; ix.len() * ek]).collect();
+    let mut o_mask: Vec<Vec<bool>> = opp_idx.iter().map(|ix| vec![false; ix.len() * mk]).collect();
+    let mut o_query: Vec<Vec<f32>> = opp_idx.iter().map(|ix| vec![0f32; ix.len() * qk]).collect();
+    let mut o_prev: Vec<Vec<i64>> = opp_idx.iter().map(|ix| vec![0i64; ix.len() * pk]).collect();
+
+    // gather one agent's rows from the full-width buffers into row j of a batch
+    macro_rules! gather {
+        ($j:expr, $a:expr, $de:expr, $dm:expr, $dq:expr, $dp:expr,
+         $se:expr, $sm:expr, $sq:expr, $sp:expr) => {{
+            let (j, a) = ($j, $a);
+            $de[j * ek..(j + 1) * ek].copy_from_slice(&$se[a * ek..(a + 1) * ek]);
+            $dm[j * mk..(j + 1) * mk].copy_from_slice(&$sm[a * mk..(a + 1) * mk]);
+            $dq[j * qk..(j + 1) * qk].copy_from_slice(&$sq[a * qk..(a + 1) * qk]);
+            $dp[j * pk..(j + 1) * pk].copy_from_slice(&$sp[a * pk..(a + 1) * pk]);
+        }};
+    }
+
+    for t in 0..steps {
+        // 1. v1 obs for all arenas (every agent acts this round); plus the
+        // legacy obs when the kickstart teacher needs it.
+        let mut off = 0usize;
+        for ar in arenas.iter_mut() {
+            let n = ar.num_agents();
+            ar.write_obs_v1(
+                &mut ents_buf[off * ek..(off + n) * ek],
+                &mut mask_buf[off * mk..(off + n) * mk],
+                &mut query_buf[off * qk..(off + n) * qk],
+                &mut prev_buf[off * pk..(off + n) * pk],
+            );
+            if emit_v0_obs {
+                ar.write_obs(&mut v0_buf[off * OBS_SIZE..(off + n) * OBS_SIZE]);
+            }
+            off += n;
+        }
+
+        // 2. record obs for LEARNER rows only.
+        for (j, &a) in learner_idx.iter().enumerate() {
+            let r = t * n_learner + j;
+            out.ents[r * ek..(r + 1) * ek].copy_from_slice(&ents_buf[a * ek..(a + 1) * ek]);
+            out.mask[r * mk..(r + 1) * mk].copy_from_slice(&mask_buf[a * mk..(a + 1) * mk]);
+            out.query[r * qk..(r + 1) * qk].copy_from_slice(&query_buf[a * qk..(a + 1) * qk]);
+            out.prev[r * pk..(r + 1) * pk].copy_from_slice(&prev_buf[a * pk..(a + 1) * pk]);
+            if emit_v0_obs {
+                out.obs_v0[r * OBS_SIZE..(r + 1) * OBS_SIZE]
+                    .copy_from_slice(&v0_buf[a * OBS_SIZE..(a + 1) * OBS_SIZE]);
+            }
+        }
+
+        // 3. batched forwards: one learner batch + one per used opponent slot,
+        // logits scattered into full agent width for uniform sampling below.
+        if n_learner > 0 {
+            for (j, &a) in learner_idx.iter().enumerate() {
+                gather!(j, a, l_ents, l_mask, l_query, l_prev, ents_buf, mask_buf, query_buf, prev_buf);
+            }
+            let (l_logits, l_values) = pol.forward(&l_ents, &l_mask, &l_query, &l_prev, n_learner)?;
+            for (j, &a) in learner_idx.iter().enumerate() {
+                logits_all[a * action_count..(a + 1) * action_count]
+                    .copy_from_slice(&l_logits[j * action_count..(j + 1) * action_count]);
+            }
+            out.values[t * n_learner..(t + 1) * n_learner].copy_from_slice(&l_values);
+        }
+        for (slot, idxs) in opp_idx.iter().enumerate() {
+            if idxs.is_empty() {
+                continue;
+            }
+            for (j, &a) in idxs.iter().enumerate() {
+                gather!(j, a, o_ents[slot], o_mask[slot], o_query[slot], o_prev[slot],
+                        ents_buf, mask_buf, query_buf, prev_buf);
+            }
+            let (o_logits, _) = opponents[slot]
+                .forward(&o_ents[slot], &o_mask[slot], &o_query[slot], &o_prev[slot], idxs.len())?;
+            for (j, &a) in idxs.iter().enumerate() {
+                logits_all[a * action_count..(a + 1) * action_count]
+                    .copy_from_slice(&o_logits[j * action_count..(j + 1) * action_count]);
+            }
+        }
+
+        // 4. sample EVERY agent — same order and per-arena rng stream as v0.
+        for a in 0..agents {
+            let row = &logits_all[a * action_count..(a + 1) * action_count];
+            let (idx, lp) = sample_categorical(row, &mut rngs[a_to_arena[a]]);
+            acts[a] = idx as i64;
+            if let Some(col) = learner_col[a] {
+                out.actions[t * n_learner + col] = idx as i64;
+                out.logprobs[t * n_learner + col] = lp;
+            }
+        }
+
+        // 5. step arenas (all agents), record learner rewards/flags.
+        let mut aoff = 0usize;
+        let mut done: Vec<usize> = Vec::new();
+        for ar in arenas.iter_mut() {
+            let n = ar.num_agents();
+            ar.step_v1(
+                &acts[aoff..aoff + n],
+                &mut rew_buf[..n],
+                &mut flag_buf[..n],
+                &mut fin_ents[aoff * ek..(aoff + n) * ek],
+                &mut fin_mask[aoff * mk..(aoff + n) * mk],
+                &mut fin_query[aoff * qk..(aoff + n) * qk],
+                &mut fin_prev[aoff * pk..(aoff + n) * pk],
+            );
+            for i in 0..n {
+                let a = aoff + i;
+                if let Some(col) = learner_col[a] {
+                    out.rewards[t * n_learner + col] = rew_buf[i];
+                    out.terminated[t * n_learner + col] = flag_buf[i].terminated;
+                    out.truncated[t * n_learner + col] = flag_buf[i].truncated;
+                    if flag_buf[i].terminated || flag_buf[i].truncated {
+                        done.push(a);
+                    }
+                }
+            }
+            aoff += n;
+        }
+
+        // 6. final values for done rows (learner-only by construction) —
+        // single batched forward over the final v1 obs.
+        if !done.is_empty() {
+            let nd = done.len();
+            let mut d_ents = vec![0f32; nd * ek];
+            let mut d_mask = vec![false; nd * mk];
+            let mut d_query = vec![0f32; nd * qk];
+            let mut d_prev = vec![0i64; nd * pk];
+            for (j, &a) in done.iter().enumerate() {
+                gather!(j, a, d_ents, d_mask, d_query, d_prev, fin_ents, fin_mask, fin_query, fin_prev);
+            }
+            let (_, fv) = pol.forward(&d_ents, &d_mask, &d_query, &d_prev, nd)?;
+            for (j, &a) in done.iter().enumerate() {
+                let col = learner_col[a].expect("done rows are learner rows by construction");
+                out.final_values[t * n_learner + col] = fv[j];
+            }
+        }
+    }
+
+    // 7. bootstrap values of the post-rollout obs, learner rows only.
+    let mut off = 0usize;
+    for ar in arenas.iter_mut() {
+        let n = ar.num_agents();
+        ar.write_obs_v1(
+            &mut ents_buf[off * ek..(off + n) * ek],
+            &mut mask_buf[off * mk..(off + n) * mk],
+            &mut query_buf[off * qk..(off + n) * qk],
+            &mut prev_buf[off * pk..(off + n) * pk],
+        );
+        off += n;
+    }
+    if n_learner > 0 {
+        for (j, &a) in learner_idx.iter().enumerate() {
+            gather!(j, a, l_ents, l_mask, l_query, l_prev, ents_buf, mask_buf, query_buf, prev_buf);
+        }
+        let (_, lv) = pol.forward(&l_ents, &l_mask, &l_query, &l_prev, n_learner)?;
+        out.last_values.copy_from_slice(&lv);
+    }
+    Ok(out)
+}
+
 /// Split num_arenas into team sizes 1/2/3 proportional to `weights`
 /// (largest-remainder method), ordered as a 1s block, 2s block, 3s block.
 pub fn allocate_team_sizes(num_arenas: usize, weights: [f64; 3]) -> Vec<usize> {
@@ -243,6 +537,13 @@ pub struct MultiEngine {
     pub num_arenas: usize,
     pub obs_size: usize,
     pub action_count: usize,
+    /// Obs family, derived from `schema.version` at construction (0 -> V0,
+    /// 1 -> V1). Drives `set_weights`/`set_opponents` variant validation and
+    /// the collect buffer layout.
+    pub obs_mode: ObsMode,
+    /// V1-only: also record the legacy 94-float obs per learner row into
+    /// `CollectOut::obs_v0` (kickstart teacher input, T7).
+    emit_v0_obs: bool,
     // Debug-forward policy copy — see `set_weights`/`debug_policy_forward` doc comments
     // for why this lives here instead of routing through a worker.
     debug_policy: Option<MlpPolicy>,
@@ -263,6 +564,10 @@ impl MultiEngine {
     /// `engine::allocate_team_sizes` output `s` to `(s, s)` per arena. Kept as pairs
     /// (rather than a single size) so the asymmetric case (e.g. blue != orange, used
     /// by tests) keeps working uniformly with the mixed-size path.
+    /// `emit_v0_obs` is meaningful only for schema v1 (record the legacy
+    /// 94-float obs alongside the entity tensors, for the kickstart
+    /// teacher); v0 callers pass `false` (lib.rs rejects `true` with a v0
+    /// schema before constructing).
     pub fn new(
         sizes: Vec<(usize, usize)>,
         schema: Schema,
@@ -270,7 +575,9 @@ impl MultiEngine {
         seed: u32,
         num_threads: usize,
         curriculum: Option<CurriculumConfig>,
+        emit_v0_obs: bool,
     ) -> Self {
+        let obs_mode = if schema.version == 1 { ObsMode::V1 } else { ObsMode::V0 };
         let num_arenas = sizes.len();
         let threads = if num_threads == 0 {
             std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).max(1)).unwrap_or(4)
@@ -303,9 +610,9 @@ impl MultiEngine {
                     .iter()
                     .enumerate()
                     .map(|(i, &(b, o))| {
-                        EpisodeArena::new_with_curriculum(b, o, sch.tick_skip, cfg.clone(),
+                        EpisodeArena::new_full(b, o, sch.tick_skip, cfg.clone(),
                                           sch.normalization.clone(), seed.wrapping_add((global_base + i) as u32),
-                                          curr.clone())
+                                          curr.clone(), obs_mode)
                     })
                     .collect();
                 // Per-arena agent counts (blue+orange, may vary across arenas now)
@@ -338,11 +645,17 @@ impl MultiEngine {
                 // Cmd::Collect for on-worker rollout. `debug_policy_forward` (Task 3)
                 // does not route through here — see MultiEngine::debug_policy_forward.
                 let mut policy: Option<MlpPolicy> = None;
+                // V1 twin of `policy` — exactly one of the two is ever Some,
+                // decided by the NetWeights variant (which MultiEngine
+                // validated against obs_mode before broadcasting).
+                let mut policy_v1: Option<EntityPolicy> = None;
                 // Opponent-policy slots (indexed by the `k >= 0` values in a
                 // Collect assignment), rebuilt wholesale on every SetOpponents.
                 // Empty until set_opponents is called — legacy (all-self-play)
                 // collects never index into this.
                 let mut opponents: Vec<MlpPolicy> = Vec::new();
+                // V1 twin of `opponents` (same slot indexing).
+                let mut opponents_v1: Vec<EntityPolicy> = Vec::new();
                 while let Ok(cmd) = crx.recv() {
                     match cmd {
                         Cmd::Shutdown => break,
@@ -413,34 +726,73 @@ impl MultiEngine {
                             let _ = otx.send(out);
                         }
                         Cmd::SetWeights(w) => {
-                            match MlpPolicy::new(&w) {
-                                Ok(p) => {
+                            let built = match &*w {
+                                NetWeights::V0(pw) => MlpPolicy::new(pw).map(|p| {
                                     policy = Some(p);
-                                    let _ = otx.send(WorkerOut::ack());
+                                    policy_v1 = None;
+                                }),
+                                NetWeights::V1 { raw, heads } => {
+                                    EntityPolicy::new(raw, *heads).map(|p| {
+                                        policy_v1 = Some(p);
+                                        policy = None;
+                                    })
                                 }
-                                Err(e) => {
-                                    let _ = otx.send(WorkerOut::err(e));
-                                }
+                            };
+                            match built {
+                                Ok(()) => { let _ = otx.send(WorkerOut::ack()); }
+                                Err(e) => { let _ = otx.send(WorkerOut::err(e)); }
                             }
                         }
                         Cmd::SetOpponents(ws) => {
-                            let mut built = Vec::with_capacity(ws.len());
+                            let mut built_v0 = Vec::new();
+                            let mut built_v1 = Vec::new();
                             let mut build_err: Option<String> = None;
                             for w in ws.iter() {
-                                match MlpPolicy::new(w) {
-                                    Ok(p) => built.push(p),
-                                    Err(e) => { build_err = Some(e); break; }
+                                let r = match w {
+                                    NetWeights::V0(pw) => MlpPolicy::new(pw).map(|p| built_v0.push(p)),
+                                    NetWeights::V1 { raw, heads } => {
+                                        EntityPolicy::new(raw, *heads).map(|p| built_v1.push(p))
+                                    }
+                                };
+                                if let Err(e) = r {
+                                    build_err = Some(e);
+                                    break;
                                 }
                             }
                             match build_err {
                                 Some(e) => { let _ = otx.send(WorkerOut::err(e)); }
                                 None => {
-                                    opponents = built;
+                                    // MultiEngine::set_opponents validated the
+                                    // variants match obs_mode, so exactly one
+                                    // of these carries the slots.
+                                    opponents = built_v0;
+                                    opponents_v1 = built_v1;
                                     let _ = otx.send(WorkerOut::ack());
                                 }
                             }
                         }
                         Cmd::Collect { steps, assignment } => {
+                            // V1 (entity) rollout lives in its own function so
+                            // the v0 loop below stays literally untouched
+                            // (byte-identity gate). Same worker-batched
+                            // forward + per-arena rng discipline.
+                            if obs_mode == ObsMode::V1 {
+                                let Some(pol) = policy_v1.as_ref() else {
+                                    let _ = otx.send(WorkerOut::err("collect before set_weights".into()));
+                                    continue;
+                                };
+                                let my_assignment = &assignment[global_base..global_base + count];
+                                let msg = match collect_v1_worker(
+                                    steps, my_assignment, &mut arenas, &arena_sizes,
+                                    &a_to_arena, max_arena_agents, &mut rngs, pol,
+                                    &opponents_v1, emit_v0_obs,
+                                ) {
+                                    Ok(out) => WorkerOut::collect(out),
+                                    Err(e) => WorkerOut::err(e),
+                                };
+                                let _ = otx.send(msg);
+                                continue;
+                            }
                             let Some(pol) = policy.as_ref() else {
                                 let _ = otx.send(WorkerOut::err("collect before set_weights".into()));
                                 continue;
@@ -696,8 +1048,15 @@ impl MultiEngine {
         MultiEngine {
             num_agents: sizes.iter().map(|&(b, o)| b + o).sum(),
             num_arenas,
-            obs_size: OBS_SIZE,
-            action_count: crate::actions::TABLE_SIZE,
+            // V1 has no flat obs: obs_size 0 mirrors schema/v1.toml's
+            // obs_size = 0 (the lib.rs getter passes it straight through).
+            obs_size: match obs_mode { ObsMode::V0 => OBS_SIZE, ObsMode::V1 => 0 },
+            action_count: match obs_mode {
+                ObsMode::V0 => crate::actions::TABLE_SIZE,
+                ObsMode::V1 => crate::actions::TABLE_SIZE_V1,
+            },
+            obs_mode,
+            emit_v0_obs,
             workers,
             debug_policy: None,
             sizes,
@@ -765,9 +1124,27 @@ impl MultiEngine {
     /// call is a non-issue. The tradeoff is it technically evaluates "the trainer's
     /// weights" rather than literally "worker 0's net", but since every worker gets
     /// the identical broadcast weights, the two are equivalent in practice.
-    pub fn set_weights(&mut self, weights: PolicyWeights) -> Result<(), String> {
+    /// Dispatches on the `NetWeights` variant, which must match the engine's
+    /// `obs_mode` (v0 schema -> `NetWeights::V0`, v1 -> `NetWeights::V1`).
+    /// Both variants are validated on the calling thread BEFORE broadcasting
+    /// (v0 by building the debug `MlpPolicy` copy it also keeps, v1 by a
+    /// throwaway `EntityPolicy` build — no debug copy is kept because
+    /// `debug_policy_forward`'s flat-obs contract is v0-only).
+    pub fn set_weights(&mut self, weights: NetWeights) -> Result<(), String> {
         let arc = Arc::new(weights);
-        let debug_policy = MlpPolicy::new(&arc)?;
+        let debug_policy = match (self.obs_mode, &*arc) {
+            (ObsMode::V0, NetWeights::V0(pw)) => Some(MlpPolicy::new(pw)?),
+            (ObsMode::V1, NetWeights::V1 { raw, heads }) => {
+                EntityPolicy::new(raw, *heads)?;
+                None
+            }
+            (ObsMode::V0, NetWeights::V1 { .. }) => {
+                return Err("v1 state dict given to a v0-schema engine".into());
+            }
+            (ObsMode::V1, NetWeights::V0(_)) => {
+                return Err("v0 state dict given to a v1-schema engine".into());
+            }
+        };
         for w in &self.workers {
             w.tx.send(Cmd::SetWeights(arc.clone())).map_err(|e| e.to_string())?;
         }
@@ -783,7 +1160,9 @@ impl MultiEngine {
         if let Some(e) = first_err {
             return Err(e);
         }
-        self.debug_policy = Some(debug_policy);
+        if let Some(p) = debug_policy {
+            self.debug_policy = Some(p);
+        }
         Ok(())
     }
 
@@ -795,7 +1174,20 @@ impl MultiEngine {
     /// the new `opponent_slots` bound that `collect`'s assignment validation checks
     /// against. An empty `weights` (Python's `set_opponents([])`) clears every worker's
     /// slots and resets `opponent_slots` to 0.
-    pub fn set_opponents(&mut self, weights: Vec<PolicyWeights>) -> Result<(), String> {
+    pub fn set_opponents(&mut self, weights: Vec<NetWeights>) -> Result<(), String> {
+        // Every slot's variant must match the engine's obs mode (workers
+        // then never see a mixed/mismatched slot list).
+        for w in &weights {
+            match (self.obs_mode, w) {
+                (ObsMode::V0, NetWeights::V0(_)) | (ObsMode::V1, NetWeights::V1 { .. }) => {}
+                (ObsMode::V0, NetWeights::V1 { .. }) => {
+                    return Err("v1 opponent state dict given to a v0-schema engine".into());
+                }
+                (ObsMode::V1, NetWeights::V0(_)) => {
+                    return Err("v0 opponent state dict given to a v1-schema engine".into());
+                }
+            }
+        }
         let n = weights.len();
         let arc = Arc::new(weights);
         for w in &self.workers {
@@ -863,31 +1255,69 @@ impl MultiEngine {
             return Err(e);
         }
 
-        let d = self.obs_size;
-        let mut merged = CollectOut::zeros(steps, learner_count, d);
-        let mut off = 0usize;
-        for out in worker_outs.into_iter() {
-            let co = out.collect.expect("collect payload missing on worker success");
-            let n = co.learner_agents;
-            for t in 0..steps {
-                let o_src = t * n * d..(t + 1) * n * d;
-                let o_dst = t * learner_count * d + off * d;
-                merged.obs[o_dst..o_dst + n * d].copy_from_slice(&co.obs[o_src]);
+        match self.obs_mode {
+            ObsMode::V0 => {
+                let d = self.obs_size;
+                let mut merged = CollectOut::zeros(steps, learner_count, d);
+                let mut off = 0usize;
+                for out in worker_outs.into_iter() {
+                    let co = out.collect.expect("collect payload missing on worker success");
+                    let n = co.learner_agents;
+                    for t in 0..steps {
+                        let o_src = t * n * d..(t + 1) * n * d;
+                        let o_dst = t * learner_count * d + off * d;
+                        merged.obs[o_dst..o_dst + n * d].copy_from_slice(&co.obs[o_src]);
 
-                let s_src = t * n..(t + 1) * n;
-                let s_dst = t * learner_count + off;
-                merged.actions[s_dst..s_dst + n].copy_from_slice(&co.actions[s_src.clone()]);
-                merged.logprobs[s_dst..s_dst + n].copy_from_slice(&co.logprobs[s_src.clone()]);
-                merged.values[s_dst..s_dst + n].copy_from_slice(&co.values[s_src.clone()]);
-                merged.rewards[s_dst..s_dst + n].copy_from_slice(&co.rewards[s_src.clone()]);
-                merged.terminated[s_dst..s_dst + n].copy_from_slice(&co.terminated[s_src.clone()]);
-                merged.truncated[s_dst..s_dst + n].copy_from_slice(&co.truncated[s_src.clone()]);
-                merged.final_values[s_dst..s_dst + n].copy_from_slice(&co.final_values[s_src]);
+                        let s_src = t * n..(t + 1) * n;
+                        let s_dst = t * learner_count + off;
+                        merged.actions[s_dst..s_dst + n].copy_from_slice(&co.actions[s_src.clone()]);
+                        merged.logprobs[s_dst..s_dst + n].copy_from_slice(&co.logprobs[s_src.clone()]);
+                        merged.values[s_dst..s_dst + n].copy_from_slice(&co.values[s_src.clone()]);
+                        merged.rewards[s_dst..s_dst + n].copy_from_slice(&co.rewards[s_src.clone()]);
+                        merged.terminated[s_dst..s_dst + n].copy_from_slice(&co.terminated[s_src.clone()]);
+                        merged.truncated[s_dst..s_dst + n].copy_from_slice(&co.truncated[s_src.clone()]);
+                        merged.final_values[s_dst..s_dst + n].copy_from_slice(&co.final_values[s_src]);
+                    }
+                    merged.last_values[off..off + n].copy_from_slice(&co.last_values);
+                    off += n;
+                }
+                Ok(merged)
             }
-            merged.last_values[off..off + n].copy_from_slice(&co.last_values);
-            off += n;
+            ObsMode::V1 => {
+                // Same interleave as v0, with the flat obs replaced by the
+                // four entity buffers (+ optional obs_v0) at their own
+                // per-agent widths.
+                fn ilv<T: Copy>(dst: &mut [T], src: &[T], t: usize, n_total: usize, off: usize, n: usize, k: usize) {
+                    let d_start = (t * n_total + off) * k;
+                    dst[d_start..d_start + n * k].copy_from_slice(&src[t * n * k..(t + 1) * n * k]);
+                }
+                let mut merged = CollectOut::zeros_v1(steps, learner_count, self.emit_v0_obs);
+                let mut off = 0usize;
+                for out in worker_outs.into_iter() {
+                    let co = out.collect.expect("collect payload missing on worker success");
+                    let n = co.learner_agents;
+                    for t in 0..steps {
+                        ilv(&mut merged.ents, &co.ents, t, learner_count, off, n, MAX_ENT * ENT_FEAT);
+                        ilv(&mut merged.mask, &co.mask, t, learner_count, off, n, MAX_ENT);
+                        ilv(&mut merged.query, &co.query, t, learner_count, off, n, Q_FEAT);
+                        ilv(&mut merged.prev, &co.prev, t, learner_count, off, n, PREV_ACTIONS);
+                        if self.emit_v0_obs {
+                            ilv(&mut merged.obs_v0, &co.obs_v0, t, learner_count, off, n, OBS_SIZE);
+                        }
+                        ilv(&mut merged.actions, &co.actions, t, learner_count, off, n, 1);
+                        ilv(&mut merged.logprobs, &co.logprobs, t, learner_count, off, n, 1);
+                        ilv(&mut merged.values, &co.values, t, learner_count, off, n, 1);
+                        ilv(&mut merged.rewards, &co.rewards, t, learner_count, off, n, 1);
+                        ilv(&mut merged.terminated, &co.terminated, t, learner_count, off, n, 1);
+                        ilv(&mut merged.truncated, &co.truncated, t, learner_count, off, n, 1);
+                        ilv(&mut merged.final_values, &co.final_values, t, learner_count, off, n, 1);
+                    }
+                    merged.last_values[off..off + n].copy_from_slice(&co.last_values);
+                    off += n;
+                }
+                Ok(merged)
+            }
         }
-        Ok(merged)
     }
 
     /// Runs `obs` (row-major batch*obs_size) through the `MultiEngine`-held policy

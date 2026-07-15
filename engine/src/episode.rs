@@ -1,7 +1,9 @@
 use crate::{
     actions,
+    ballpred::Tracker,
     curriculum::CurriculumConfig,
     obs::{self, OBS_SIZE},
+    obs_v1::{self, ENT_FEAT, MAX_ENT, PREV_ACTIONS, Q_FEAT},
     reward::{self, RewardConfig},
     sampler::Pcg32,
     schema::Normalization,
@@ -21,6 +23,36 @@ const MAX_TICKS: u64 = 300 * TICKS_PER_SEC;
 pub struct StepFlags {
     pub terminated: bool,
     pub truncated: bool,
+}
+
+/// Which obs family an `EpisodeArena` (and the engine above it) builds.
+/// Selected by `schema.version` (0 = legacy 94-float MLP obs, 1 = entity
+/// set). V0 is the default everywhere so every pre-T6 constructor call site
+/// keeps its exact behavior.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ObsMode {
+    #[default]
+    V0,
+    V1,
+}
+
+/// V1-only per-arena state: the ball-prediction tracker (one `predict()` per
+/// arena per step, shared across its agents) plus a per-agent prev-action
+/// ring (`[i64; 5]`, most-recent-first; all zeros after episode reset).
+/// Constructed only in `ObsMode::V1` — it must never touch the arena's rng
+/// or reset seeding, so the v0 path stays bit-identical (the `Option` is
+/// simply `None` there).
+struct V1State {
+    tracker: Tracker,
+    prev: Vec<[i64; PREV_ACTIONS]>,
+}
+
+/// Where `step_impl` writes the terminal-step final obs — v0's flat 94-float
+/// rows or v1's entity tensors. Private plumbing so `step` (v0, signature
+/// unchanged) and `step_v1` share one episode-logic body.
+enum FinalObsOut<'a> {
+    V0(&'a mut [f32]),
+    V1 { ents: &'a mut [f32], mask: &'a mut [bool], query: &'a mut [f32], prev: &'a mut [i64] },
 }
 
 /// r_i' = (1-tau)*r_i + tau*mean(own team) - opp*mean(opponent team).
@@ -95,6 +127,8 @@ pub struct EpisodeArena {
     prev_state: GameState,
     curriculum: Option<CurriculumConfig>,
     rng: Pcg32,
+    // `Some` iff constructed with `ObsMode::V1` — see `V1State`.
+    v1: Option<V1State>,
 }
 
 impl EpisodeArena {
@@ -118,6 +152,24 @@ impl EpisodeArena {
         seed: u32,
         curriculum: Option<CurriculumConfig>,
     ) -> Self {
+        Self::new_full(blue, orange, tick_skip, reward_cfg, norm, seed, curriculum, ObsMode::V0)
+    }
+
+    /// Full constructor: `obs_mode` selects the v0 (legacy, default via the
+    /// wrappers above) or v1 (entity) obs family. V1 arenas use the 92-row
+    /// action table and own a `V1State`; nothing else differs — in
+    /// particular the reset/rng path is byte-identical across modes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full(
+        blue: usize,
+        orange: usize,
+        tick_skip: u32,
+        reward_cfg: RewardConfig,
+        norm: Normalization,
+        seed: u32,
+        curriculum: Option<CurriculumConfig>,
+        obs_mode: ObsMode,
+    ) -> Self {
         let mut arena = Arena::default_standard();
         let mut car_ids = Vec::with_capacity(blue + orange);
         for _ in 0..blue {
@@ -132,7 +184,10 @@ impl EpisodeArena {
         let start = prev_state.tick_count;
         let mut this = Self {
             arena,
-            table: actions::make_lookup_table(),
+            table: match obs_mode {
+                ObsMode::V0 => actions::make_lookup_table(),
+                ObsMode::V1 => actions::make_lookup_table_v1(),
+            },
             car_ids,
             blue_count: blue,
             tick_skip,
@@ -144,6 +199,13 @@ impl EpisodeArena {
             prev_state,
             curriculum,
             rng: Pcg32::new((seed as u64) * 7919 + 13),
+            v1: match obs_mode {
+                ObsMode::V0 => None,
+                ObsMode::V1 => Some(V1State {
+                    tracker: Tracker::new(),
+                    prev: vec![[0; PREV_ACTIONS]; blue + orange],
+                }),
+            },
         };
         this.reset_episode();
         this
@@ -178,6 +240,13 @@ impl EpisodeArena {
         self.episode_start_tick = gs.tick_count;
         self.last_touch_tick = gs.tick_count;
         self.prev_state = gs;
+        // V1: fresh episode starts with an all-zero prev-action history.
+        // No-op in v0 mode (and touches no rng), keeping v0 bit-identical.
+        if let Some(v1) = self.v1.as_mut() {
+            for ring in v1.prev.iter_mut() {
+                *ring = [0; PREV_ACTIONS];
+            }
+        }
     }
 
     /// Test/debug helper: force an episode reset (through the same curriculum-aware
@@ -203,6 +272,42 @@ impl EpisodeArena {
         }
     }
 
+    /// V1 obs for every agent (arena-major slices, like `write_obs`):
+    /// `ents` is `num_agents * MAX_ENT * ENT_FEAT`, `mask` `num_agents *
+    /// MAX_ENT`, `query` `num_agents * Q_FEAT`, `prev` `num_agents *
+    /// PREV_ACTIONS`. Runs ONE ball prediction for the whole arena, shared
+    /// across its agents, and copies each agent's prev-action ring out.
+    /// Panics if the arena was not constructed with `ObsMode::V1`.
+    pub fn write_obs_v1(
+        &mut self,
+        ents: &mut [f32],
+        mask: &mut [bool],
+        query: &mut [f32],
+        prev: &mut [i64],
+    ) {
+        let gs = self.arena.pin_mut().get_game_state();
+        let pred = self
+            .v1
+            .as_mut()
+            .expect("write_obs_v1 requires ObsMode::V1")
+            .tracker
+            .predict(&gs.ball);
+        for a in 0..self.num_agents() {
+            let ci = self.agent_car_index(&gs, a);
+            obs_v1::build(
+                &gs,
+                ci,
+                &pred,
+                &self.norm,
+                &mut ents[a * MAX_ENT * ENT_FEAT..(a + 1) * MAX_ENT * ENT_FEAT],
+                &mut mask[a * MAX_ENT..(a + 1) * MAX_ENT],
+                &mut query[a * Q_FEAT..(a + 1) * Q_FEAT],
+            );
+            prev[a * PREV_ACTIONS..(a + 1) * PREV_ACTIONS]
+                .copy_from_slice(&self.v1.as_ref().unwrap().prev[a]);
+        }
+    }
+
     pub fn step(
         &mut self,
         action_idx: &[i64],
@@ -210,8 +315,59 @@ impl EpisodeArena {
         flags: &mut [StepFlags],
         final_obs: &mut [f32],
     ) {
+        self.step_impl(action_idx, rewards, flags, FinalObsOut::V0(final_obs))
+    }
+
+    /// V1 twin of `step`: identical episode logic, but the terminal-step
+    /// final obs is written as entity tensors (`final_*` buffers sized like
+    /// `write_obs_v1`'s). Also shifts each agent's prev-action ring with the
+    /// executed action (rings reset to zeros whenever the episode resets).
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_v1(
+        &mut self,
+        action_idx: &[i64],
+        rewards: &mut [f32],
+        flags: &mut [StepFlags],
+        final_ents: &mut [f32],
+        final_mask: &mut [bool],
+        final_query: &mut [f32],
+        final_prev: &mut [i64],
+    ) {
+        self.step_impl(
+            action_idx,
+            rewards,
+            flags,
+            FinalObsOut::V1 {
+                ents: final_ents,
+                mask: final_mask,
+                query: final_query,
+                prev: final_prev,
+            },
+        )
+    }
+
+    fn step_impl(
+        &mut self,
+        action_idx: &[i64],
+        rewards: &mut [f32],
+        flags: &mut [StepFlags],
+        mut fin: FinalObsOut<'_>,
+    ) {
         let n = self.num_agents();
         assert_eq!(action_idx.len(), n);
+
+        // V1: shift the executed action into each agent's prev-action ring
+        // (most-recent-first) BEFORE any possible reset below — a reset then
+        // rightly zeroes it. No-op (and no state read) in v0 mode.
+        if let Some(v1) = self.v1.as_mut() {
+            for (a, &act) in action_idx.iter().enumerate() {
+                let ring = &mut v1.prev[a];
+                for i in (1..PREV_ACTIONS).rev() {
+                    ring[i] = ring[i - 1];
+                }
+                ring[0] = act;
+            }
+        }
 
         let controls: Vec<(u32, rocketsim_rs::sim::CarControls)> = (0..n)
             .map(|a| {
@@ -251,7 +407,18 @@ impl EpisodeArena {
                 rewards[a] = 0.0;
                 flags[a] = StepFlags { terminated: true, truncated: false };
             }
-            final_obs[..n * OBS_SIZE].fill(0.0);
+            match &mut fin {
+                FinalObsOut::V0(buf) => buf[..n * OBS_SIZE].fill(0.0),
+                // V1 poisoned-state equivalent of "finite zeros": zero
+                // entity/query rows, all UNMASKED (present zero entities —
+                // guaranteed-finite forward input), zero prev history.
+                FinalObsOut::V1 { ents, mask, query, prev } => {
+                    ents[..n * MAX_ENT * ENT_FEAT].fill(0.0);
+                    mask[..n * MAX_ENT].fill(false);
+                    query[..n * Q_FEAT].fill(0.0);
+                    prev[..n * PREV_ACTIONS].fill(0);
+                }
+            }
             self.reset_episode();
             return;
         }
@@ -301,9 +468,38 @@ impl EpisodeArena {
 
         if terminated || truncated {
             // capture final obs, then reset
-            for a in 0..n {
-                let ci = self.agent_car_index(&cur, a);
-                obs::build_obs(&cur, ci, &self.norm, &mut final_obs[a * OBS_SIZE..(a + 1) * OBS_SIZE]);
+            match &mut fin {
+                FinalObsOut::V0(buf) => {
+                    for a in 0..n {
+                        let ci = self.agent_car_index(&cur, a);
+                        obs::build_obs(&cur, ci, &self.norm, &mut buf[a * OBS_SIZE..(a + 1) * OBS_SIZE]);
+                    }
+                }
+                FinalObsOut::V1 { ents, mask, query, prev } => {
+                    // One prediction on the terminal state, shared across
+                    // agents; rings still hold the just-executed action
+                    // (reset_episode zeroes them right after).
+                    let pred = self
+                        .v1
+                        .as_mut()
+                        .expect("step_v1 requires ObsMode::V1")
+                        .tracker
+                        .predict(&cur.ball);
+                    for a in 0..n {
+                        let ci = self.agent_car_index(&cur, a);
+                        obs_v1::build(
+                            &cur,
+                            ci,
+                            &pred,
+                            &self.norm,
+                            &mut ents[a * MAX_ENT * ENT_FEAT..(a + 1) * MAX_ENT * ENT_FEAT],
+                            &mut mask[a * MAX_ENT..(a + 1) * MAX_ENT],
+                            &mut query[a * Q_FEAT..(a + 1) * Q_FEAT],
+                        );
+                        prev[a * PREV_ACTIONS..(a + 1) * PREV_ACTIONS]
+                            .copy_from_slice(&self.v1.as_ref().unwrap().prev[a]);
+                    }
+                }
             }
             self.reset_episode();
         } else {
