@@ -41,11 +41,14 @@ class Trainer:
             from construct.league.registry import Registry
             from construct.league.sampling import choose_opponents
             from construct.league.matches import load_sd
+            frac = float(lg.get("opponent_frac", 0.2))
+            assert 0 <= frac < 1, f"league.opponent_frac must be in [0, 1), got {frac}"
             self._league = {
                 "registry": Registry(path=lg.get("registry", "league/registry.jsonl")),
                 "choose": choose_opponents, "load_sd": load_sd,
-                "frac": float(lg.get("opponent_frac", 0.2)),
-                "refresh": int(lg.get("refresh_iters", 200)),
+                "frac": frac,
+                # floor at 1: refresh_iters=0 would make `it % refresh` divide by zero.
+                "refresh": max(1, int(lg.get("refresh_iters", 200))),
                 "slots": int(lg.get("slots", 4)),
             }
 
@@ -66,20 +69,38 @@ class Trainer:
         arenas first (3v3 before 2v2 before 1v1) when team sizes are mixed --
         acceptable v1 behavior per the design doc, revisit if team-size-aware
         placement is ever needed.
+
+        A pruned/corrupted checkpoint on disk must never take down a long
+        run at a refresh boundary: each pick is loaded independently, bad
+        ones are skipped with a warning, and if every pick fails the
+        previous assignment (and opponent weights already in the engine)
+        is left in place rather than falling back to an empty pool.
         """
         L = self._league
         picks = L["choose"](L["registry"], k=L["slots"])
         if not picks:
             self._assignment = None
+            print("league: no opponents available (pure self-play)", flush=True)
             return
-        sds = [L["load_sd"](p["ck"]) for p in picks]
+        sds, names = [], []
+        for p in picks:
+            try:
+                sds.append(L["load_sd"](p["ck"]))
+                names.append(p["ck"])
+            except Exception as e:
+                print(f"league: skipping opponent {p['ck']!r} ({e})", flush=True)
+        if not sds:
+            print("league: all picks failed to load, keeping previous assignment", flush=True)
+            return
         self.engine.set_opponents(sds)
         n = self.num_arenas
         n_opp = round(L["frac"] * n)
         a = [-1] * n
+        start = n - n_opp
         for i in range(n_opp):
-            a[n - 1 - i] = i % len(sds)
+            a[start + i] = i % len(sds)
         self._assignment = a
+        print(f"league: opponents {names}", flush=True)
 
     def collect(self, T: int) -> dict:
         D = self.engine.obs_size

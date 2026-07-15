@@ -102,8 +102,95 @@ def test_choose_opponents_mix(tmp_path):
     assert names == again
 
 
+import pytest
+
 from construct.learn.config import TrainConfig
 from construct.learn.train import Trainer
+
+
+def _league_cfg(tmp_path, reg_path, **league_overrides):
+    cfg = TrainConfig.load("configs/train_v0.toml")
+    cfg.env.update(num_arenas=4)
+    cfg.ppo.update(rollout_steps=8, minibatch_size=64)
+    cfg.run.update(device="cpu", checkpoint_dir=str(tmp_path), save_every_iters=100)
+    cfg.league = {"enabled": True, "opponent_frac": 0.5, "registry": reg_path,
+                  "refresh_iters": 1, "slots": 2, **league_overrides}
+    return cfg
+
+
+def test_refresh_skips_missing_checkpoint(tmp_path, capsys):
+    # A registry entry whose checkpoint file is gone (pruned/corrupted on disk)
+    # must not crash the trainer at a refresh boundary.
+    reg_path = str(tmp_path / "reg.jsonl")
+    reg = Registry(path=reg_path)
+    reg.add(str(tmp_path / "does_not_exist.pt"), steps=1, run="main", reward_config="x")
+
+    cfg = _league_cfg(tmp_path, reg_path)
+    t = Trainer(cfg)
+    t._refresh_opponents()  # must not raise
+    assert t._assignment is None  # all picks failed -> no prior assignment to fall back to
+    out = capsys.readouterr().out
+    assert "league" in out and "does_not_exist.pt" in out
+
+
+def test_refresh_keeps_previous_assignment_when_all_picks_fail(tmp_path, capsys):
+    reg_path = str(tmp_path / "reg.jsonl")
+    reg = Registry(path=reg_path)
+    reg.add(str(tmp_path / "missing.pt"), steps=1, run="main", reward_config="x")
+
+    cfg = _league_cfg(tmp_path, reg_path)
+    t = Trainer(cfg)
+    t._assignment = [-1, -1, 0, 0]  # simulate a prior good assignment
+    t._refresh_opponents()
+    assert t._assignment == [-1, -1, 0, 0]  # unchanged, not wiped to None
+    out = capsys.readouterr().out
+    assert "league" in out
+
+
+def test_assignment_layout_tail_round_robin(tmp_path):
+    import torch
+    from construct.learn.model import PolicyValueNet
+    reg_path = str(tmp_path / "reg.jsonl")
+    reg = Registry(path=reg_path)
+    for i in (1, 2):
+        net = PolicyValueNet(94, 90, (512, 512))
+        p = str(tmp_path / f"opp{i}.pt")
+        torch.save({"model": net.state_dict(), "total_steps": i,
+                    "config": {"net": {"hidden": [512, 512]}}, "schema_version": 0,
+                    "reward_config_path": "x"}, p)
+        reg.add(p, steps=i, run="main", reward_config="x")
+
+    cfg = _league_cfg(tmp_path, reg_path)
+    t = Trainer(cfg)
+    t._refresh_opponents()
+    # 4 arenas, frac 0.5 -> n_opp=2 -> tail-assigned, slot round-robin over 2 opponents
+    assert t._assignment == [-1, -1, 0, 1]
+
+
+def test_opponent_frac_bounds_validated():
+    cfg = TrainConfig.load("configs/train_v0.toml")
+    cfg.run.update(device="cpu")
+    cfg.league = {"enabled": True, "opponent_frac": 1.0}
+    with pytest.raises(AssertionError, match="opponent_frac"):
+        Trainer(cfg)
+
+
+def test_opponent_frac_negative_rejected():
+    cfg = TrainConfig.load("configs/train_v0.toml")
+    cfg.run.update(device="cpu")
+    cfg.league = {"enabled": True, "opponent_frac": -0.1}
+    with pytest.raises(AssertionError, match="opponent_frac"):
+        Trainer(cfg)
+
+
+def test_refresh_iters_floors_to_one(tmp_path):
+    reg_path = str(tmp_path / "reg.jsonl")
+    Registry(path=reg_path)  # empty registry is fine, just checking init doesn't div-by-zero
+    cfg = _league_cfg(tmp_path, reg_path, refresh_iters=0)
+    t = Trainer(cfg)
+    assert t._league["refresh"] == 1
+    it = 0
+    it % t._league["refresh"]  # would raise ZeroDivisionError pre-fix
 
 
 def test_trainer_league_refresh(tmp_path):
