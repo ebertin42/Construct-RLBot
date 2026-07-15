@@ -1,14 +1,20 @@
 """Head-to-head matches between two frozen checkpoints, via opponent arenas.
 
 The engine's reward stream is used purely as a scoring tape: with reward_v0
-(goal=10, bias 0, shaping << 9.5) a learner-row reward >= 9.5 means A scored,
-<= -9.5 means B scored. Matches always use reward_v0 regardless of what the
+(goal=10, bias 0, shaping << 9.4) a learner-row reward >= 9.4 means A scored,
+<= -9.4 means B scored. Matches always use reward_v0 regardless of what the
 policies were trained on.
 """
 import numpy as np
 import torch
 
 from construct._engine import Engine
+
+# Goal detection threshold: goal pays ±10; same-step shaping can offset a concede
+# by up to +0.55 (touch 0.5 + vel_to_ball 0.05), so a concede row can be as small
+# as -9.45 in magnitude. Non-goal rows never exceed |0.55|. 9.4 sits safely
+# inside the [0.55, 9.45] gap on both sides.
+GOAL_THRESHOLD = 9.4
 
 
 def load_sd(ck_path):
@@ -20,7 +26,7 @@ class MatchRunner:
     def __init__(self, num_arenas=8, seed=0, reward_config="configs/reward_v0.toml", mode=1):
         # Goal events pay every learner agent on the scoring team in that arena.
         # At mode=1 (1v1) each opponent arena has exactly one learner row (blue),
-        # so the >=9.5 / <=-9.5 count below is exact. 2v2+ would multi-count (both
+        # so the GOAL_THRESHOLD count below is exact. 2v2+ would multi-count (both
         # teammates get paid the same goal reward) -- divide by team size when that
         # arrives. YAGNI today: assert mode==1 until then.
         assert mode == 1, "MatchRunner only supports 1v1 (mode=1); 2v2+ would multi-count goals"
@@ -34,6 +40,6 @@ class MatchRunner:
         self.eng.set_opponents([sd_b])
         out = self.eng.collect(steps, arena_opponents=self.assignment)
         rew = np.asarray(out["rewards"])
-        goals_a = int((rew >= 9.5).sum())
-        goals_b = int((rew <= -9.5).sum())
+        goals_a = int((rew >= GOAL_THRESHOLD).sum())
+        goals_b = int((rew <= -GOAL_THRESHOLD).sum())
         return goals_a, goals_b

@@ -12,4 +12,4 @@ wandb/
 *.pt
 /rlviser
 checkpoints_b/
-league/
+/league/

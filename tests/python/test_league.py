@@ -73,3 +73,9 @@ def test_load_sd_roundtrip(tmp_path):
     torch.save(ck, p)
     sd = load_sd(p)
     assert sd["policy_head.weight"].dtype == np.float32
+
+
+def test_goal_threshold_covers_shaped_concede():
+    from construct.league.matches import GOAL_THRESHOLD
+    assert GOAL_THRESHOLD <= 9.45 - 1e-6   # concede magnitude floor
+    assert GOAL_THRESHOLD >= 0.55 + 1e-6   # non-goal shaping ceiling
