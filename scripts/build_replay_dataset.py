@@ -94,15 +94,29 @@ def acquire_hf(dest: Path, min_rank: str | None, playlist: str | None, max_files
     return count
 
 
+def _token_from_file() -> str | None:
+    """Fallback: read BALLCHASING_TOKEN from ~/.config/construct/ballchasing.env
+    (a gitignored `export BALLCHASING_TOKEN=<token>` line, mode 600), so pulls
+    work without manually sourcing it."""
+    p = Path.home() / ".config" / "construct" / "ballchasing.env"
+    if not p.is_file():
+        return None
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if "BALLCHASING_TOKEN=" in line:
+            return line.split("BALLCHASING_TOKEN=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
 def acquire_ballchasing(dest: Path, min_rank: str | None, playlist: str | None, max_n: int | None) -> int:
     from construct.data.ballchasing import Client
 
-    token = os.environ.get("BALLCHASING_TOKEN")
+    token = os.environ.get("BALLCHASING_TOKEN") or _token_from_file()
     if not token:
         print(
-            "error: BALLCHASING_TOKEN environment variable is not set. "
-            "Get a token from https://ballchasing.com/upload (Steam login) "
-            "and `export BALLCHASING_TOKEN=...` to use --source ballchasing.",
+            "error: BALLCHASING_TOKEN not set and ~/.config/construct/ballchasing.env "
+            "not found. Get a token from https://ballchasing.com/upload (Steam login), "
+            "then `export BALLCHASING_TOKEN=...` or write it to that file.",
             file=sys.stderr,
         )
         sys.exit(1)
