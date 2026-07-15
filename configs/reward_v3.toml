@@ -1,0 +1,28 @@
+# reward v3 = spec §4 stage 3 "Competition". Separate file for regime provenance
+# (v0/v1/v2 resumes never change regime).
+#
+# WHY: v2's dense shaping (touch_accel, vel_ball_to_goal, offensive_potential) is
+# farmable — PPO drifts to optimize positioning/impact/goalward-nudge income
+# WITHOUT finishing. Measured drift ~-45% goals/min per billion steps on both run B
+# and the promoted run (goals/min 1.35 -> 0.40 @1v1, 2.58 -> 0.85 @2v2) while shaped
+# ep_rew climbed. v3 strips that surface: goal/concede dominant, only a tiny
+# anti-degenerate approach term so a warm-started (already-competent) policy is
+# pushed to SCORE, not farm.
+#
+# Resume from the 2.24B peak (run-B ck_002236846080, our strongest scorer) with
+# --reset-optimizer (legit regime change: reward scale/shape differs from v2).
+
+goal = 10.0                 # dominant; concede = -goal*(1-bias) = -8.0
+touch = 0.0                 # flat touch income OFF (v0 farm)
+vel_to_ball = 0.05          # ONLY shaping kept: small anti-degenerate engagement
+aggression_bias = 0.2       # concede -8, score +10 -> attack
+
+# Farmable dense shaping DROPPED (this is the whole point of v3):
+touch_accel = 0.0           # was 2.0 — impact-touch farm
+vel_ball_to_goal = 0.0      # was 0.5 — goalward-nudge income farm
+offensive_potential = 0.0   # was 0.3 — positioning KRC farm
+
+# Team play unchanged from v2 to isolate the variable (only shaping changed).
+# Annealing tau 0.3->0.5 would need trainer support (backlog) — fixed for now.
+team_spirit = 0.3
+opp_spirit = 0.3
