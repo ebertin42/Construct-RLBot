@@ -44,11 +44,24 @@ use crate::{
 pub struct Tick {
     pub ball: RigidFrame,
     pub cars: Vec<CarFrame>,
+    /// Per-car applied control action for this tick, same order as `cars`.
+    /// Layout: `[throttle, steer, pitch, yaw, roll, jump, boost, handbrake]`
+    /// (jump/boost/handbrake as 0.0/1.0). Held constant across every 120 Hz
+    /// tick in the 30 Hz interval this tick belongs to — the replay only
+    /// samples inputs at `frames.fps` Hz to begin with, so this is the same
+    /// `CarControls` value `set_all_controls` was given for the interval,
+    /// not a re-derived value. Needed downstream by IDM/BC, which train on
+    /// (state, action) pairs rather than physics state alone.
+    pub actions: Vec<[f32; 8]>,
 }
 
 pub struct Reconstructed {
     pub ticks: Vec<Tick>,
     pub player_teams: Vec<u8>,
+    /// Source replay frame rate the reconstruction was built from (i.e. the
+    /// `target_fps` originally passed to `extract_frames`) — carried through
+    /// for shard sidecar metadata.
+    pub fps: u32,
 }
 
 /// Sanity bounds mirroring `engine::episode::state_is_sane` — see
@@ -206,7 +219,11 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
     }
 
     if num_frames < 2 {
-        return Ok(Reconstructed { ticks: Vec::new(), player_teams: frames.player_teams.clone() });
+        return Ok(Reconstructed {
+            ticks: Vec::new(),
+            player_teams: frames.player_teams.clone(),
+            fps: frames.fps,
+        });
     }
 
     if frames.fps == 0 {
@@ -265,6 +282,24 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
             car_ids.iter().zip(controls.iter()).map(|(&id, &c)| (id, c)).collect();
         arena.pin_mut().set_all_controls(&pairs).map_err(|e| e.to_string())?;
 
+        // Per-car 8-dim action vector for this interval (constant across all
+        // of its 120 Hz ticks) — see `Tick::actions` doc comment for layout.
+        let actions: Vec<[f32; 8]> = controls
+            .iter()
+            .map(|c| {
+                [
+                    c.throttle,
+                    c.steer,
+                    c.pitch,
+                    c.yaw,
+                    c.roll,
+                    if c.jump { 1.0 } else { 0.0 },
+                    if c.boost { 1.0 } else { 0.0 },
+                    if c.handbrake { 1.0 } else { 0.0 },
+                ]
+            })
+            .collect();
+
         // 3. Step one 120 Hz tick at a time, capturing state after each.
         for _ in 0..n_substeps {
             arena.pin_mut().step(1);
@@ -305,14 +340,14 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
                 });
             }
 
-            let tick = Tick { ball, cars: cars_out };
+            let tick = Tick { ball, cars: cars_out, actions: actions.clone() };
             if tick_is_sane(&tick) {
                 ticks.push(tick);
             }
         }
     }
 
-    Ok(Reconstructed { ticks, player_teams: frames.player_teams.clone() })
+    Ok(Reconstructed { ticks, player_teams: frames.player_teams.clone(), fps: frames.fps })
 }
 
 #[cfg(test)]
