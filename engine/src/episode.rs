@@ -225,12 +225,24 @@ impl EpisodeArena {
         let cur = self.arena.pin_mut().get_game_state();
 
         // Physics-blowup containment. RocketSim's contact solver can go nonfinite
-        // in degenerate multi-body squeezes (observed live at 2.2B steps: two
-        // near-static cars pinching the ball -> a car ejected to [nan,-inf,nan]).
-        // A poisoned state must never reach rewards, obs, or the learner: end the
-        // episode with finite zeros and a fresh kickoff. Terminated (not truncated)
-        // so GAE bootstraps 0 instead of a value estimate of garbage.
-        if !state_is_finite(&cur) {
+        // (observed live at 2.2B steps: two near-static cars pinching the ball ->
+        // a car ejected to [nan,-inf,nan]) OR ramp through huge-but-finite values
+        // for one or more tick_skip boundaries before that (observed live: a
+        // "levitating ball" latched at finite pos up to 8e10 uu / ball z as low as
+        // -33,137 uu, persisting hundreds to thousands of steps because
+        // `state_is_finite` alone accepts it). `state_is_sane` (bounds ~2-4x the
+        // hardest legal state) catches both: NaN/inf (it calls state_is_finite
+        // first) AND the finite-but-insane precursor, capping the blast radius at
+        // one contained transition instead of a long-lived poisoned latch. This
+        // check must run BEFORE goal detection below: an insane state that happens
+        // to eject the ball past the goal line makes `is_ball_scored()` fire a real
+        // (not fake) goal for a physically impossible position, which would inject
+        // a spurious +/-goal reward (observed live: +24.55) — running the sane
+        // check first means that can never happen. A poisoned state must never
+        // reach rewards, obs, or the learner: end the episode with finite zeros and
+        // a fresh kickoff. Terminated (not truncated) so GAE bootstraps 0 instead of
+        // a value estimate of garbage.
+        if !state_is_sane(&cur) {
             eprintln!(
                 "[construct-engine] physics blowup contained (tick {}): episode terminated, arena reset",
                 cur.tick_count
