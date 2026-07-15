@@ -39,7 +39,7 @@ All positions/velocities normalized as v0 (pos·1/2300, vel·1/2300, ang_vel·1/
 
 **Entity count: `MAX_ENT = 17`** = 1 ball + 6 cars + 6 big pads + 4 ball-pred. Absent cars → zero row + mask=1 (ignored). Order: self, mates (≤2), opps (≤3), ball, pads (fixed arena order), ball-pred (ascending τ).
 
-**Query/self row: 64 floats** (`Q_FEAT = 64`): self entity's 26 + 34 small-pad timers (0..1, fixed arena order, mirrored pairing) + prev-action index history is NOT here — prev actions enter as **4 floats**: bias… — no: exact split = 26 (self entity) + 34 (pad timers) + 3 (scoreboard: score_diff/5 clamped, time_frac, overtime) + 1 (reserved) = 64. **Prev-5 actions** are appended to the *pooled* embedding, not the query row (5 × one-hot-92 is too wide): they enter as 5 embedded action vectors via the same action-embedding MLP as the head, summed with learned position weights — implemented inside the net, fed as `prev_actions [B,5] int64`.
+**Query/self row: 64 floats** (`Q_FEAT = 64`): exact split = 26 (self entity row) + 34 (small-pad timers, 0..1, fixed arena order, mirrored pairing) + 3 (scoreboard: score_diff/5 clamped, time_frac, overtime) + 1 (reserved) = 64. **Prev-5 actions** are appended to the *pooled* embedding, not the query row (5 × one-hot-92 is too wide): they enter as 5 embedded action vectors via the same action-embedding MLP as the head, summed with learned position weights — implemented inside the net, fed as `prev_actions [B,5] int64`.
 
 **Net I/O contract (both Rust and Python):**
 `forward(entities [B,17,26], mask [B,17] bool, query [B,64], prev_actions [B,5]) -> (logits [B,92], value [B,1])`
