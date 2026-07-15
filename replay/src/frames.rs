@@ -103,9 +103,11 @@ pub struct ReplayFrames {
 }
 
 /// Maps a raw replay-input byte (throttle/steer, ~128 neutral/centered,
-/// 0..255) to a signed `-1..1` range.
+/// 0..255) to a signed `-1..1` range. Byte 0 maps to -128/127 (~-1.008)
+/// before clamping -- clamped here so callers never see a value outside
+/// `[-1.0, 1.0]`.
 fn signed_input_from_byte(byte: u8) -> f32 {
-    (byte as f32 - 128.0) / 127.0
+    ((byte as f32 - 128.0) / 127.0).clamp(-1.0, 1.0)
 }
 
 /// Raw boost byte (0..255) to `0..1`.

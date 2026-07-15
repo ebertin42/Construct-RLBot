@@ -11,4 +11,18 @@ fn extracts_resampled_frames() {
     // ball must move (not all-zero) and stay finite
     let moved = f.ball.iter().any(|r| r.pos[0].abs() + r.pos[1].abs() > 1.0);
     assert!(moved && f.ball.iter().all(|r| r.pos.iter().all(|x| x.is_finite())));
+
+    // Raw replay input bytes map to -1..1 via (byte - 128) / 127, which
+    // slightly overshoots at byte 0 (-1.008) unless clamped at the mapping
+    // site in frames.rs.
+    for row in &f.cars {
+        for car in row {
+            assert!(
+                car.throttle >= -1.0 && car.throttle <= 1.0,
+                "throttle out of [-1,1]: {}",
+                car.throttle
+            );
+            assert!(car.steer >= -1.0 && car.steer <= 1.0, "steer out of [-1,1]: {}", car.steer);
+        }
+    }
 }

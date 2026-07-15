@@ -27,6 +27,22 @@
 //!
 //! Any tick whose ball/car state falls outside `engine::episode::state_is_sane`'s
 //! bounds (pos/vel/ang_vel <= 12000/20000/100) is dropped rather than emitted.
+//!
+//! ## Tick provenance: `tick_index` and `is_boundary`
+//! Every [`Tick`] carries two extra fields so a downstream IDM/BC loader can
+//! avoid mispairing `(state[i], state[i+1]) -> action[i]` across either kind
+//! of discontinuity this module introduces:
+//! - `tick_index`: a global monotonic counter over every ATTEMPTED sub-step
+//!   across the whole replay (incremented before the sanity-drop check).
+//!   Dropped ticks are simply absent from the output, so a gap `>1` between
+//!   two surviving ticks' `tick_index` means one or more ticks were dropped
+//!   between them.
+//! - `is_boundary`: true for the first sub-step of each 30 Hz interval --
+//!   the one produced by stepping once from a freshly re-snapped arena
+//!   (step 1 above), not by continuing the previous tick's simulation. The
+//!   transition into that tick is not `action[i]` applied to the previous
+//!   tick's state, so consumers must drop the pair `(i, i+1)` whenever
+//!   `is_boundary[i+1]` is true.
 
 use rocketsim_rs::{
     cxx,
@@ -53,6 +69,22 @@ pub struct Tick {
     /// not a re-derived value. Needed downstream by IDM/BC, which train on
     /// (state, action) pairs rather than physics state alone.
     pub actions: Vec<[f32; 8]>,
+    /// Global monotonic 120 Hz tick position in the ORIGINAL undropped
+    /// sub-step sequence (incremented once per attempted sub-step across the
+    /// whole replay, before the sanity-drop check). Consecutive surviving
+    /// ticks whose `tick_index` differs by more than 1 mean one or more
+    /// ticks were dropped for insanity between them -- a gap a downstream
+    /// IDM pairing (state[i], state[i+1]) -> action[i] must not cross.
+    pub tick_index: i64,
+    /// True iff this tick is the first simulated sub-step immediately after
+    /// an authoritative snap to the replay's frame data (a 30 Hz interval
+    /// boundary), rather than a continuation of the same interval's prior
+    /// sub-step. The transition into a boundary tick is not `action[i]`
+    /// applied to the previous tick's state -- it's a fresh step from a
+    /// re-snapped arena -- so consumers building (state[i], state[i+1]) ->
+    /// action[i] IDM pairs must drop the pair when `is_boundary[i+1]` is
+    /// true.
+    pub is_boundary: bool,
 }
 
 pub struct Reconstructed {
@@ -245,6 +277,11 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
     let n_substeps = (120.0 * dt).round().max(1.0) as u32;
 
     let mut ticks: Vec<Tick> = Vec::with_capacity((num_frames - 1) * n_substeps as usize);
+    // Global monotonic sub-step counter across the WHOLE replay, incremented
+    // once per attempted sub-step regardless of whether the resulting tick
+    // survives the sanity check -- this is what lets a dropped tick leave a
+    // visible gap in `tick_index` for surviving ticks.
+    let mut tick_counter: i64 = 0;
 
     for t in 0..(num_frames - 1) {
         // 1. Snap ball + all cars to frame t's authoritative state.
@@ -301,7 +338,14 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
             .collect();
 
         // 3. Step one 120 Hz tick at a time, capturing state after each.
-        for _ in 0..n_substeps {
+        for sub in 0..n_substeps {
+            // Incremented before the sanity check below (for EVERY attempted
+            // sub-step, dropped or not), so a dropped tick leaves a gap in
+            // the surviving `tick_index` sequence.
+            let this_tick_index = tick_counter;
+            tick_counter += 1;
+            let is_boundary = sub == 0;
+
             arena.pin_mut().step(1);
             let gs = arena.pin_mut().get_game_state();
 
@@ -340,7 +384,13 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
                 });
             }
 
-            let tick = Tick { ball, cars: cars_out, actions: actions.clone() };
+            let tick = Tick {
+                ball,
+                cars: cars_out,
+                actions: actions.clone(),
+                tick_index: this_tick_index,
+                is_boundary,
+            };
             if tick_is_sane(&tick) {
                 ticks.push(tick);
             }

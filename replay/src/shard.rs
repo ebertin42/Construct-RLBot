@@ -12,6 +12,16 @@
 //!   boost, handbrake (jump/boost/handbrake as 0.0/1.0) — the applied
 //!   `CarControls` for that tick's 30 Hz interval (see `Tick::actions`).
 //! - `player_teams` `[P]` (`i64`, 0=blue/1=orange).
+//! - `tick_index` `[T]` (`i64`): global monotonic 120 Hz tick position in the
+//!   ORIGINAL undropped sub-step sequence (see `reconstruct`'s module doc).
+//!   A gap `>1` between consecutive entries means one or more ticks were
+//!   dropped between them for insanity.
+//! - `is_boundary` `[T]` (`i64`, 0/1): 1 iff this tick is the first
+//!   simulated sub-step right after an authoritative snap to the replay's
+//!   frame data (a 30 Hz interval boundary), 0 otherwise. Consumers building
+//!   `(state[i], state[i+1]) -> action[i]` IDM pairs must drop the pair
+//!   whenever `is_boundary[i+1] == 1` — that transition is a fresh step from
+//!   a re-snapped arena, not `action[i]` applied to `state[i]`.
 //!
 //! `cars_state`'s column count is 16, not the 15 a naive plan sketch assumed
 //! (pos3+vel3+ang_vel3+quat4 = 13, +boost+on_ground+demoed = 16) — every
@@ -36,7 +46,11 @@ use crate::{meta::ReplayMeta, reconstruct::Reconstructed};
 
 /// Bump whenever the array layout or column semantics below change.
 /// Downstream loaders should fail loud on a version they don't recognize.
-pub const SHARD_SCHEMA_VERSION: u32 = 1;
+///
+/// v2: added `tick_index` `[T]` i64 and `is_boundary` `[T]` i64 (0/1) arrays
+/// (see module doc) so a downstream IDM can detect dropped-tick gaps and
+/// 30 Hz snap boundaries instead of silently mispairing across them.
+pub const SHARD_SCHEMA_VERSION: u32 = 2;
 
 pub const BALL_COLUMNS: [&str; 13] = [
     "pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z", "ang_vel_x", "ang_vel_y", "ang_vel_z",
@@ -93,6 +107,8 @@ pub fn write_shard(
     let mut ball = Array2::<f32>::zeros((num_ticks, 13));
     let mut cars_state = Array3::<f32>::zeros((num_ticks, num_players, 16));
     let mut cars_action = Array3::<f32>::zeros((num_ticks, num_players, 8));
+    let mut tick_index = Array1::<i64>::zeros(num_ticks);
+    let mut is_boundary = Array1::<i64>::zeros(num_ticks);
 
     for (t, tick) in rec.ticks.iter().enumerate() {
         if tick.cars.len() != num_players || tick.actions.len() != num_players {
@@ -102,6 +118,9 @@ pub fn write_shard(
                 tick.actions.len()
             ));
         }
+
+        tick_index[t] = tick.tick_index;
+        is_boundary[t] = if tick.is_boundary { 1 } else { 0 };
 
         let b = &tick.ball;
         ball[[t, 0]] = b.pos[0];
@@ -157,6 +176,8 @@ pub fn write_shard(
     npz.add_array("cars_state", &cars_state).map_err(|e| e.to_string())?;
     npz.add_array("cars_action", &cars_action).map_err(|e| e.to_string())?;
     npz.add_array("player_teams", &player_teams).map_err(|e| e.to_string())?;
+    npz.add_array("tick_index", &tick_index).map_err(|e| e.to_string())?;
+    npz.add_array("is_boundary", &is_boundary).map_err(|e| e.to_string())?;
     npz.finish().map_err(|e| e.to_string())?;
 
     let sidecar = ShardSidecar {

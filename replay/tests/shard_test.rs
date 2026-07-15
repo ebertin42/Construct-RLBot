@@ -52,6 +52,17 @@ fn writes_loadable_shard_with_schema() {
 
     let player_teams: ndarray::Array1<i64> = npz.by_name("player_teams.npy").unwrap();
     assert_eq!(player_teams.len(), num_players);
+
+    let num_ticks = sidecar["num_ticks"].as_u64().unwrap() as usize;
+    let tick_index: ndarray::Array1<i64> = npz.by_name("tick_index.npy").unwrap();
+    assert_eq!(tick_index.len(), num_ticks, "tick_index must have length T");
+
+    let is_boundary: ndarray::Array1<i64> = npz.by_name("is_boundary.npy").unwrap();
+    assert_eq!(is_boundary.len(), num_ticks, "is_boundary must have length T");
+    assert!(
+        is_boundary.iter().all(|&v| v == 0 || v == 1),
+        "is_boundary must be 0/1-valued"
+    );
 }
 
 #[test]
