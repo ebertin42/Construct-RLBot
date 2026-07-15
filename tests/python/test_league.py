@@ -100,3 +100,33 @@ def test_choose_opponents_mix(tmp_path):
     # deterministic
     again = [p["ck"] for p in choose_opponents(r, k=4, recent=5, rng=random.Random(3))]
     assert names == again
+
+
+from construct.learn.config import TrainConfig
+from construct.learn.train import Trainer
+
+
+def test_trainer_league_refresh(tmp_path):
+    # seed a registry with two members built from tiny checkpoints
+    import torch
+    from construct.learn.model import PolicyValueNet
+    reg_path = str(tmp_path / "reg.jsonl")
+    reg = Registry(path=reg_path)
+    for i in (1, 2):
+        net = PolicyValueNet(94, 90, (512, 512))
+        p = str(tmp_path / f"opp{i}.pt")
+        torch.save({"model": net.state_dict(), "total_steps": i,
+                    "config": {"net": {"hidden": [512, 512]}}, "schema_version": 0,
+                    "reward_config_path": "x"}, p)
+        reg.add(p, steps=i, run="main", reward_config="x")
+
+    cfg = TrainConfig.load("configs/train_v0.toml")
+    cfg.env.update(num_arenas=4)
+    cfg.ppo.update(rollout_steps=8, minibatch_size=64)
+    cfg.run.update(device="cpu", checkpoint_dir=str(tmp_path), save_every_iters=100)
+    cfg.league = {"enabled": True, "opponent_frac": 0.5, "registry": reg_path,
+                  "refresh_iters": 1, "slots": 2}
+    t = Trainer(cfg)
+    t.run(max_iterations=2)
+    # 4 arenas, frac 0.5 -> 2 opponent arenas -> learner agents = 4*2 - 2 = 6
+    assert t.total_steps == 2 * 8 * 6

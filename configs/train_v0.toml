@@ -28,3 +28,10 @@ device = "cuda"            # falls back to cpu if unavailable
 checkpoint_dir = "checkpoints"
 save_every_iters = 20
 log_every_iters = 1
+
+# [league]
+# enabled = true
+# opponent_frac = 0.2        # fraction of arenas (tail-assigned) driven by opponent-pool checkpoints
+# registry = "league/registry.jsonl"
+# refresh_iters = 200        # how often to re-sample opponents + rebuild the arena assignment
+# slots = 4                  # opponent policies loaded at once (<= 8, engine limit)
