@@ -1,6 +1,7 @@
 use rocketsim_rs::sim::CarControls;
 
 pub const TABLE_SIZE: usize = 90;
+pub const TABLE_SIZE_V1: usize = 92;
 
 /// Row layout: [throttle, steer, pitch, yaw, roll, jump, boost, handbrake]
 pub fn make_lookup_table() -> Vec<[f32; 8]> {
@@ -42,6 +43,17 @@ pub fn make_lookup_table() -> Vec<[f32; 8]> {
         }
     }
     debug_assert_eq!(actions.len(), TABLE_SIZE);
+    actions
+}
+
+/// Action table v1.1: the existing 90 rows APPENDED with 2 stall rows
+/// (rlgym-tools-verified stall inputs; dodgeDir = (-pitch, yaw+roll) => yaw=-roll
+/// => zero impulse). Append-only: indices 0-89 keep their v0 meaning.
+pub fn make_lookup_table_v1() -> Vec<[f32; 8]> {
+    let mut actions = make_lookup_table();
+    actions.push([0., 0., 0., 1., -1., 1., 0., 1.]);
+    actions.push([0., 0., 0., -1., 1., 1., 0., 1.]);
+    debug_assert_eq!(actions.len(), TABLE_SIZE_V1);
     actions
 }
 
@@ -88,5 +100,16 @@ mod tests {
         let c = to_controls(&[1., 0., 0., 0., 0., 1., 1., 0.]);
         assert_eq!(c.throttle, 1.0);
         assert!(c.jump && c.boost && !c.handbrake);
+    }
+
+    #[test]
+    fn v1_table_appends_stalls_only() {
+        let v0 = make_lookup_table();
+        let v1 = make_lookup_table_v1();
+        assert_eq!(v1.len(), TABLE_SIZE_V1);
+        assert_eq!(TABLE_SIZE_V1, 92);
+        assert_eq!(&v1[..90], &v0[..]);
+        assert_eq!(v1[90], [0., 0., 0., 1., -1., 1., 0., 1.]);
+        assert_eq!(v1[91], [0., 0., 0., -1., 1., 1., 0., 1.]);
     }
 }
