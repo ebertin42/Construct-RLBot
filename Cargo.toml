@@ -1,0 +1,3 @@
+[workspace]
+members = ["engine", "replay"]
+resolver = "2"
