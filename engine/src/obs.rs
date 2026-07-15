@@ -8,8 +8,13 @@ use rocketsim_rs::{
 pub const OBS_SIZE: usize = 94;
 pub const MAX_OTHERS: usize = 5;
 
+/// Play-as-blue mirroring: orange negates x,y of every vector (z/height is
+/// unaffected — mirroring is a horizontal flip through the field center).
+/// `pub(crate)` so `obs_v1` reuses the exact v0 convention instead of
+/// duplicating it (see plan's "Obs v1 layout": "mirroring = play-as-blue
+/// ... exactly as v0's `mir`").
 #[inline]
-fn mir(v: Vec3, mirror: bool) -> [f32; 3] {
+pub(crate) fn mir(v: Vec3, mirror: bool) -> [f32; 3] {
     if mirror { [-v.x, -v.y, v.z] } else { [v.x, v.y, v.z] }
 }
 

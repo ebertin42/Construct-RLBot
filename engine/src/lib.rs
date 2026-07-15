@@ -9,10 +9,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod actions;
+pub mod ballpred;
 pub mod curriculum;
 pub mod engine;
 pub mod episode;
 pub mod obs;
+pub mod obs_v1;
 pub mod policy;
 pub mod reward;
 pub mod sampler;
