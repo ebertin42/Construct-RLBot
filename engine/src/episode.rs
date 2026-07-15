@@ -54,6 +54,33 @@ fn state_is_finite(gs: &GameState) -> bool {
     })
 }
 
+/// Physical plausibility bounds for streaming: a contact-solver blowup ramps
+/// through huge-but-finite values for a few ticks before reaching NaN, and
+/// rlviser's interpolation latches permanently if it ever receives one of
+/// those frames (observed live: levitating ball). Bounds are ~2-4x the
+/// hardest legal values (field |y| ~6000 uu, ball speed 6000 uu/s, car
+/// ang_vel 5.5 rad/s) so no legitimate state is ever dropped.
+fn vec3_within(v: &Vec3, limit: f32) -> bool {
+    v.x.abs() <= limit && v.y.abs() <= limit && v.z.abs() <= limit
+}
+
+pub fn state_is_sane(gs: &GameState) -> bool {
+    if !state_is_finite(gs) {
+        return false;
+    }
+    if !(vec3_within(&gs.ball.pos, 12_000.0)
+        && vec3_within(&gs.ball.vel, 20_000.0)
+        && vec3_within(&gs.ball.ang_vel, 100.0))
+    {
+        return false;
+    }
+    gs.cars.iter().all(|c| {
+        vec3_within(&c.state.pos, 12_000.0)
+            && vec3_within(&c.state.vel, 20_000.0)
+            && vec3_within(&c.state.ang_vel, 100.0)
+    })
+}
+
 pub struct EpisodeArena {
     arena: UniquePtr<Arena>,
     table: Vec<[f32; 8]>,
@@ -342,5 +369,17 @@ mod tests {
         let mut r = vec![2.0f32];
         blend_team_spirit(&mut r, 1, 0.5, 0.25); // opp mean = 0.0
         assert_eq!(r, vec![2.0]); // (1-.5)*2 + .5*2 - .25*0 = 2.0
+    }
+
+    #[test]
+    fn sane_rejects_blowup_ramp_but_keeps_hard_shots() {
+        let mut gs = GameState::default();
+        gs.ball.pos = Vec3::new(0.0, 5_100.0, 92.75);
+        gs.ball.vel = Vec3::new(0.0, 6_000.0, 0.0); // hardest legal shot
+        assert!(state_is_sane(&gs));
+        gs.ball.vel = Vec3::new(0.0, 3.4e7, 0.0); // finite blowup precursor
+        assert!(!state_is_sane(&gs));
+        gs.ball.vel = Vec3::new(0.0, f32::NAN, 0.0);
+        assert!(!state_is_sane(&gs));
     }
 }

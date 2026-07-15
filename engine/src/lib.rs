@@ -373,7 +373,11 @@ impl RenderSession {
         self.arena.step(&acts, &mut rew, &mut flags, &mut fin);
         self.arena.write_obs(&mut o);
         let gs = self.arena.game_state();
-        let _ = self.stream.send_state(gs);
+        // Drop frames from a blowup ramp (huge-but-finite precursors of a NaN
+        // state): one such frame permanently poisons rlviser's interpolation.
+        if episode::state_is_sane(&gs) {
+            let _ = self.stream.send_state(gs);
+        }
         self.pacer.pace();
         let term: Vec<bool> = flags.iter().map(|f| f.terminated).collect();
         let trunc: Vec<bool> = flags.iter().map(|f| f.truncated).collect();
