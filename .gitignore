@@ -15,5 +15,5 @@ checkpoints_b/
 /league/
 checkpoints_v1_archive/
 logs/
-data/
+/data/
 replay/target/
