@@ -21,6 +21,18 @@ impl ViserStream {
         Ok(s)
     }
 
+    /// Flush stale entities from any previous session: rlviser assigns a car's
+    /// team color only at spawn and keeps entities whose ids persist across
+    /// packets, so a session with a different team layout (1v1 -> 2v2 rotation)
+    /// would inherit wrong-colored cars. Sending a real state with the car list
+    /// cleared walks rlviser's despawn pass clean. MUST be a real arena state:
+    /// GameState::default() has tick_rate = 0.0, which NaN-poisons rlviser's
+    /// interpolation timing and freezes the scene (observed live).
+    pub fn send_flush(&mut self, mut gs: rocketsim_rs::GameState) -> std::io::Result<()> {
+        gs.cars.clear();
+        self.send(RlviserMessage::GameState(Box::new(gs)))
+    }
+
     pub fn send(&mut self, msg: RlviserMessage) -> std::io::Result<()> {
         let bytes = self.codec.encode(msg);
         self.socket.send_to(bytes, self.target.as_str())?;

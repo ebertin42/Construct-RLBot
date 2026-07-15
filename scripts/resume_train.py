@@ -26,6 +26,9 @@ p.add_argument("--curriculum-config", default=None)
 p.add_argument("--reset-optimizer", action="store_true",
                help="drop Adam state (use when swapping reward regimes — stale "
                     "moments belong to the old loss landscape)")
+p.add_argument("--league", action="store_true",
+               help="enable opponent-pool sampling with config-file/default "
+                    "league settings (registry/opponent_frac/refresh_iters/slots)")
 args = p.parse_args()
 
 state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -49,6 +52,8 @@ if args.curriculum_config:
     cfg.curriculum_config_path = args.curriculum_config
 if args.reset_optimizer:
     state["optimizer"] = None
+if args.league:
+    cfg.league = {**cfg.league, "enabled": True}
 
 t = Trainer(cfg, _state=state)
 print(f"resumed at {t.total_steps:,} steps | arenas={cfg.env['num_arenas']} "

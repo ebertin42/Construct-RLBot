@@ -18,7 +18,15 @@ enum Cmd {
     Step(Vec<i64>),
     Debug { local_idx: usize },
     SetWeights(Arc<PolicyWeights>),
-    Collect { steps: usize },
+    SetOpponents(Arc<Vec<PolicyWeights>>),
+    // `assignment` is the FULL (global, length num_arenas) opponent assignment;
+    // each worker slices its own `[global_base..global_base+count)` range out of
+    // it (see the Cmd::Collect arm). Legacy calls (Python `arena_opponents=None`)
+    // are materialized by lib.rs into `vec![-1; num_arenas]` before this is ever
+    // constructed — there is no separate "no assignment" variant, so the legacy
+    // path and the opponent path run through literally the same code (byte-
+    // identity regression test pins this).
+    Collect { steps: usize, assignment: Arc<Vec<i32>> },
     Shutdown,
 }
 
@@ -39,6 +47,12 @@ pub struct CollectOut {
     pub truncated: Vec<bool>,
     pub final_values: Vec<f32>,
     pub last_values: Vec<f32>,
+    // Number of LEARNER rows (`agents` param to `zeros` below) — every buffer
+    // above is shaped by this count, not by the raw agent count. Legacy (all
+    // self-play) calls have `learner_agents == total agents`; opponent arenas
+    // shrink it (self-play arenas contribute all agents, opponent arenas
+    // contribute only their blue agents — see Cmd::Collect's `learner_idx`).
+    pub learner_agents: usize,
 }
 
 impl CollectOut {
@@ -53,6 +67,7 @@ impl CollectOut {
             truncated: vec![false; steps * agents],
             final_values: vec![0.0; steps * agents],
             last_values: vec![0.0; agents],
+            learner_agents: agents,
         }
     }
 }
@@ -225,11 +240,20 @@ struct Worker {
 pub struct MultiEngine {
     workers: Vec<Worker>,
     pub num_agents: usize,
+    pub num_arenas: usize,
     pub obs_size: usize,
     pub action_count: usize,
     // Debug-forward policy copy — see `set_weights`/`debug_policy_forward` doc comments
     // for why this lives here instead of routing through a worker.
     debug_policy: Option<MlpPolicy>,
+    // `sizes[arena] = (blue, orange)`, kept (in addition to being consumed per-worker
+    // at construction) so `collect`'s entry validation can compute the exact
+    // learner-row count for an assignment (self-play arenas contribute all agents,
+    // opponent arenas contribute only their blue agents) without a worker round-trip.
+    sizes: Vec<(usize, usize)>,
+    // Number of currently-set opponent slots (`Cmd::SetOpponents` payload length);
+    // 0 until `set_opponents` is first called. Bounds-checks `Collect`'s assignment.
+    opponent_slots: usize,
 }
 
 impl MultiEngine {
@@ -314,6 +338,11 @@ impl MultiEngine {
                 // Cmd::Collect for on-worker rollout. `debug_policy_forward` (Task 3)
                 // does not route through here — see MultiEngine::debug_policy_forward.
                 let mut policy: Option<MlpPolicy> = None;
+                // Opponent-policy slots (indexed by the `k >= 0` values in a
+                // Collect assignment), rebuilt wholesale on every SetOpponents.
+                // Empty until set_opponents is called — legacy (all-self-play)
+                // collects never index into this.
+                let mut opponents: Vec<MlpPolicy> = Vec::new();
                 while let Ok(cmd) = crx.recv() {
                     match cmd {
                         Cmd::Shutdown => break,
@@ -394,68 +423,192 @@ impl MultiEngine {
                                 }
                             }
                         }
-                        Cmd::Collect { steps } => {
+                        Cmd::SetOpponents(ws) => {
+                            let mut built = Vec::with_capacity(ws.len());
+                            let mut build_err: Option<String> = None;
+                            for w in ws.iter() {
+                                match MlpPolicy::new(w) {
+                                    Ok(p) => built.push(p),
+                                    Err(e) => { build_err = Some(e); break; }
+                                }
+                            }
+                            match build_err {
+                                Some(e) => { let _ = otx.send(WorkerOut::err(e)); }
+                                None => {
+                                    opponents = built;
+                                    let _ = otx.send(WorkerOut::ack());
+                                }
+                            }
+                        }
+                        Cmd::Collect { steps, assignment } => {
                             let Some(pol) = policy.as_ref() else {
                                 let _ = otx.send(WorkerOut::err("collect before set_weights".into()));
                                 continue;
                             };
                             let d = OBS_SIZE;
                             let action_count = actions::TABLE_SIZE;
-                            let mut out = CollectOut::zeros(steps, agents, d);
+
+                            // This worker's slice of the global (length num_arenas)
+                            // assignment — arena `li` here is global arena
+                            // `global_base + li`. MultiEngine::collect validates the
+                            // whole vector (length, slot range, learner_count > 0)
+                            // before sending any Cmd, so every value here is
+                            // already known-good.
+                            let my_assignment = &assignment[global_base..global_base + count];
+
+                            // Build index lists ONCE per collect (not per round):
+                            // learner_idx is every agent of a self-play arena
+                            // (k == -1) plus the BLUE agents of an opponent arena
+                            // (k >= 0, orange driven by opponents[k]); opp_idx[slot]
+                            // is the ORANGE agents of arenas assigned to that slot.
+                            // Both follow the existing arena-major, blue-then-orange
+                            // agent order — for the legacy all-(-1) assignment this
+                            // makes learner_idx == 0..agents and learner_col the
+                            // identity map, so that path is byte-identical to the
+                            // pre-league full-width layout below.
+                            let mut learner_idx: Vec<usize> = Vec::with_capacity(agents);
+                            let mut opp_idx: Vec<Vec<usize>> = vec![Vec::new(); opponents.len()];
+                            let mut learner_col: Vec<Option<usize>> = vec![None; agents];
+                            {
+                                let mut a_off = 0usize;
+                                for (li, &(b, o)) in arena_sizes.iter().enumerate() {
+                                    let k = my_assignment[li];
+                                    if k < 0 {
+                                        for i in 0..(b + o) {
+                                            learner_idx.push(a_off + i);
+                                        }
+                                    } else {
+                                        let slot = k as usize;
+                                        for i in 0..b {
+                                            learner_idx.push(a_off + i);
+                                        }
+                                        for i in b..(b + o) {
+                                            opp_idx[slot].push(a_off + i);
+                                        }
+                                    }
+                                    a_off += b + o;
+                                }
+                                for (col, &a) in learner_idx.iter().enumerate() {
+                                    learner_col[a] = Some(col);
+                                }
+                            }
+                            let n_learner = learner_idx.len();
+
+                            let mut out = CollectOut::zeros(steps, n_learner, d);
                             let mut obs_buf = vec![0f32; agents * d];
                             let mut rew_buf = vec![0f32; max_arena_agents];
                             let mut flag_buf = vec![StepFlags::default(); max_arena_agents];
                             let mut fin_buf = vec![0f32; agents * d];
+                            // Full-agent-width scratch that steps 2/3 scatter every
+                            // agent's logits into (learner forward + per-slot
+                            // opponent forwards both write here) so step 3 can
+                            // sample every agent uniformly.
+                            let mut logits_all = vec![0f32; agents * action_count];
+                            let mut learner_obs = vec![0f32; n_learner * d];
+                            let mut opp_obs_bufs: Vec<Vec<f32>> =
+                                opp_idx.iter().map(|idxs| vec![0f32; idxs.len() * d]).collect();
+                            let mut acts = vec![0i64; agents];
 
                             let mut worker_err: Option<String> = None;
                             'rounds: for t in 0..steps {
-                                // 1. obs for all my arenas
+                                // 1. obs for all my arenas (every agent needs an obs
+                                // this round, learner or opponent-driven, to act).
                                 let mut off = 0;
                                 for ar in arenas.iter_mut() {
                                     let n = ar.num_agents() * d;
                                     ar.write_obs(&mut obs_buf[off..off + n]);
                                     off += n;
                                 }
-                                out.obs[t * agents * d..(t + 1) * agents * d].copy_from_slice(&obs_buf);
-
-                                // 2. ONE batched forward for the whole worker (all agents of
-                                // all this worker's arenas). NOTE: this makes float outputs
-                                // (values/logits) depend on the worker's batch size, which
-                                // depends on how arenas are split across threads — candle's
-                                // CPU gemm rounds the *same* input row differently at
-                                // different batch sizes (~1e-7 in the logits, verified
-                                // empirically). Cross-thread-count determinism is therefore
-                                // NOT provided: those ~1e-7 logit differences occasionally
-                                // flip which CDF bucket a sample lands in, actions diverge,
-                                // and trajectories separate entirely — so no useful
-                                // cross-thread-count guarantee exists at any tolerance.
-                                // The determinism contract is exact reproducibility for a
-                                // fixed (seed, num_arenas, num_threads) config only. A
-                                // per-arena-forward variant that WAS thread-count exact was
-                                // tried and reverted: batch=per_agent gemm calls are
-                                // overhead-dominated (18k env-steps/s vs the Python path's
-                                // ~45k at 96 arenas).
-                                let (logits, values) = match pol.forward(&obs_buf, agents, d) {
-                                    Ok(x) => x,
-                                    Err(e) => { worker_err = Some(e); break 'rounds; }
-                                };
-                                out.values[t * agents..(t + 1) * agents].copy_from_slice(&values);
-
-                                // 3. sample per agent — agent a belongs to arena a_to_arena[a]
-                                // (arenas may hold different agent counts now, in worker
-                                // order); each arena's agents draw from that arena's own rng
-                                // in blue-then-orange order, never shared across arenas.
-                                let mut acts = vec![0i64; agents];
-                                for a in 0..agents {
-                                    let row = &logits[a * action_count..(a + 1) * action_count];
-                                    let (idx, lp) = sample_categorical(row, &mut rngs[a_to_arena[a]]);
-                                    acts[a] = idx as i64;
-                                    out.actions[t * agents + a] = idx as i64;
-                                    out.logprobs[t * agents + a] = lp;
+                                // Record obs for LEARNER rows only.
+                                for (j, &a) in learner_idx.iter().enumerate() {
+                                    out.obs[t * n_learner * d + j * d..t * n_learner * d + (j + 1) * d]
+                                        .copy_from_slice(&obs_buf[a * d..(a + 1) * d]);
                                 }
 
-                                // 4. step arenas, collect rewards/flags/final_obs
+                                // 2. Forwards: ONE batched learner forward over
+                                // learner_idx rows, plus one batched forward per
+                                // USED opponent slot over that slot's opp_idx rows —
+                                // no per-agent forwards. Results are scattered into
+                                // logits_all (full agent width). For the legacy
+                                // all-(-1) assignment this is exactly the old single
+                                // whole-worker forward (learner_idx == 0..agents),
+                                // so the batch-size-dependent gemm rounding noted
+                                // below is unchanged for that path. NOTE: this makes
+                                // float outputs (values/logits) depend on the
+                                // worker's batch size, which depends on how arenas
+                                // are split across threads — candle's CPU gemm
+                                // rounds the *same* input row differently at
+                                // different batch sizes (~1e-7 in the logits,
+                                // verified empirically). Cross-thread-count
+                                // determinism is therefore NOT provided: those
+                                // ~1e-7 logit differences occasionally flip which
+                                // CDF bucket a sample lands in, actions diverge,
+                                // and trajectories separate entirely — so no useful
+                                // cross-thread-count guarantee exists at any
+                                // tolerance. The determinism contract is exact
+                                // reproducibility for a fixed (seed, num_arenas,
+                                // num_threads) config only. A per-arena-forward
+                                // variant that WAS thread-count exact was tried and
+                                // reverted: batch=per_agent gemm calls are
+                                // overhead-dominated (18k env-steps/s vs the Python
+                                // path's ~45k at 96 arenas).
+                                if n_learner > 0 {
+                                    for (j, &a) in learner_idx.iter().enumerate() {
+                                        learner_obs[j * d..(j + 1) * d].copy_from_slice(&obs_buf[a * d..(a + 1) * d]);
+                                    }
+                                    let (l_logits, l_values) = match pol.forward(&learner_obs, n_learner, d) {
+                                        Ok(x) => x,
+                                        Err(e) => { worker_err = Some(e); break 'rounds; }
+                                    };
+                                    for (j, &a) in learner_idx.iter().enumerate() {
+                                        logits_all[a * action_count..(a + 1) * action_count]
+                                            .copy_from_slice(&l_logits[j * action_count..(j + 1) * action_count]);
+                                    }
+                                    out.values[t * n_learner..(t + 1) * n_learner].copy_from_slice(&l_values);
+                                }
+                                for (slot, idxs) in opp_idx.iter().enumerate() {
+                                    if idxs.is_empty() {
+                                        continue;
+                                    }
+                                    {
+                                        let buf = &mut opp_obs_bufs[slot];
+                                        for (j, &a) in idxs.iter().enumerate() {
+                                            buf[j * d..(j + 1) * d].copy_from_slice(&obs_buf[a * d..(a + 1) * d]);
+                                        }
+                                    }
+                                    let (o_logits, _) = match opponents[slot].forward(&opp_obs_bufs[slot], idxs.len(), d) {
+                                        Ok(x) => x,
+                                        Err(e) => { worker_err = Some(e); break 'rounds; }
+                                    };
+                                    for (j, &a) in idxs.iter().enumerate() {
+                                        logits_all[a * action_count..(a + 1) * action_count]
+                                            .copy_from_slice(&o_logits[j * action_count..(j + 1) * action_count]);
+                                    }
+                                }
+
+                                // 3. sample for EVERY agent — agent a belongs to arena
+                                // a_to_arena[a]; each arena's agents draw from that
+                                // arena's own rng in blue-then-orange order, never
+                                // shared across arenas. This runs unfiltered
+                                // (learner AND opponent rows alike, same order as
+                                // always) — only recording below is filtered — which
+                                // is what keeps the rng stream, and therefore
+                                // determinism and the byte-identity gate, intact.
+                                for a in 0..agents {
+                                    let row = &logits_all[a * action_count..(a + 1) * action_count];
+                                    let (idx, lp) = sample_categorical(row, &mut rngs[a_to_arena[a]]);
+                                    acts[a] = idx as i64;
+                                    if let Some(col) = learner_col[a] {
+                                        out.actions[t * n_learner + col] = idx as i64;
+                                        out.logprobs[t * n_learner + col] = lp;
+                                    }
+                                }
+
+                                // 4. step arenas (every agent, unfiltered — physics
+                                // doesn't know about learner/opponent), record
+                                // rewards/flags for LEARNER rows only.
                                 let mut aoff = 0;
+                                let mut done: Vec<usize> = Vec::new();
                                 for ar in arenas.iter_mut() {
                                     let n = ar.num_agents();
                                     ar.step(
@@ -465,18 +618,24 @@ impl MultiEngine {
                                         &mut fin_buf[aoff * d..(aoff + n) * d],
                                     );
                                     for i in 0..n {
-                                        out.rewards[t * agents + aoff + i] = rew_buf[i];
-                                        out.terminated[t * agents + aoff + i] = flag_buf[i].terminated;
-                                        out.truncated[t * agents + aoff + i] = flag_buf[i].truncated;
+                                        let a = aoff + i;
+                                        if let Some(col) = learner_col[a] {
+                                            out.rewards[t * n_learner + col] = rew_buf[i];
+                                            out.terminated[t * n_learner + col] = flag_buf[i].terminated;
+                                            out.truncated[t * n_learner + col] = flag_buf[i].truncated;
+                                            if flag_buf[i].terminated || flag_buf[i].truncated {
+                                                done.push(a);
+                                            }
+                                        }
                                     }
                                     aoff += n;
                                 }
 
-                                // 5. final values for done rows (single batched forward over
-                                // just the done subset, worker-wide)
-                                let done: Vec<usize> = (0..agents)
-                                    .filter(|&a| out.terminated[t * agents + a] || out.truncated[t * agents + a])
-                                    .collect();
+                                // 5. final values for done rows — LEARNER rows only
+                                // (single batched forward over just the done subset,
+                                // worker-wide; `done` above is already learner-only
+                                // by construction, so opponent rows never reach the
+                                // learner policy here).
                                 if !done.is_empty() {
                                     let mut fobs = vec![0f32; done.len() * d];
                                     for (j, &a) in done.iter().enumerate() {
@@ -485,7 +644,9 @@ impl MultiEngine {
                                     match pol.forward(&fobs, done.len(), d) {
                                         Ok((_, fv)) => {
                                             for (j, &a) in done.iter().enumerate() {
-                                                out.final_values[t * agents + a] = fv[j];
+                                                let col = learner_col[a]
+                                                    .expect("done rows are learner rows by construction");
+                                                out.final_values[t * n_learner + col] = fv[j];
                                             }
                                         }
                                         Err(e) => { worker_err = Some(e); break 'rounds; }
@@ -498,18 +659,24 @@ impl MultiEngine {
                                 continue;
                             }
 
-                            // 6. bootstrap values of the post-rollout obs (one batched forward)
+                            // 6. bootstrap values of the post-rollout obs, LEARNER
+                            // rows only (one batched forward).
                             let mut off = 0;
                             for ar in arenas.iter_mut() {
                                 let n = ar.num_agents() * d;
                                 ar.write_obs(&mut obs_buf[off..off + n]);
                                 off += n;
                             }
-                            match pol.forward(&obs_buf, agents, d) {
-                                Ok((_, lv)) => out.last_values.copy_from_slice(&lv),
-                                Err(e) => {
-                                    let _ = otx.send(WorkerOut::err(e));
-                                    continue;
+                            if n_learner > 0 {
+                                for (j, &a) in learner_idx.iter().enumerate() {
+                                    learner_obs[j * d..(j + 1) * d].copy_from_slice(&obs_buf[a * d..(a + 1) * d]);
+                                }
+                                match pol.forward(&learner_obs, n_learner, d) {
+                                    Ok((_, lv)) => out.last_values.copy_from_slice(&lv),
+                                    Err(e) => {
+                                        let _ = otx.send(WorkerOut::err(e));
+                                        continue;
+                                    }
                                 }
                             }
                             let _ = otx.send(WorkerOut::collect(out));
@@ -528,10 +695,13 @@ impl MultiEngine {
 
         MultiEngine {
             num_agents: sizes.iter().map(|&(b, o)| b + o).sum(),
+            num_arenas,
             obs_size: OBS_SIZE,
             action_count: crate::actions::TABLE_SIZE,
             workers,
             debug_policy: None,
+            sizes,
+            opponent_slots: 0,
         }
     }
 
@@ -617,15 +787,73 @@ impl MultiEngine {
         Ok(())
     }
 
-    /// Fans `Cmd::Collect { steps }` to every worker (drain-all: send to all, then
-    /// recv from all — same pattern as `set_weights`) and interleaves the per-worker
-    /// `CollectOut`s into global `(T, N, ...)` buffers. Worker `w`'s agents occupy
-    /// contiguous columns `[w_base .. w_base + w_agents)`, same column order
-    /// `reset_into`/`step_into` use. Errors (e.g. collect before set_weights) from
-    /// any worker are surfaced as `Err`.
-    pub fn collect(&mut self, steps: usize) -> Result<CollectOut, String> {
+    /// Broadcasts `Cmd::SetOpponents` to every worker (each rebuilds its own
+    /// `opponents: Vec<MlpPolicy>` from `weights`, indexed by slot) using the same
+    /// drain-all discipline as `set_weights` (send to all, then recv from all — a
+    /// worker error must not desync a sibling's reply channel). `weights.len()` (0..=8;
+    /// the `> 8` check lives in lib.rs, matching the brief's division of labor) becomes
+    /// the new `opponent_slots` bound that `collect`'s assignment validation checks
+    /// against. An empty `weights` (Python's `set_opponents([])`) clears every worker's
+    /// slots and resets `opponent_slots` to 0.
+    pub fn set_opponents(&mut self, weights: Vec<PolicyWeights>) -> Result<(), String> {
+        let n = weights.len();
+        let arc = Arc::new(weights);
         for w in &self.workers {
-            w.tx.send(Cmd::Collect { steps }).map_err(|e| e.to_string())?;
+            w.tx.send(Cmd::SetOpponents(arc.clone())).map_err(|e| e.to_string())?;
+        }
+        let mut first_err: Option<String> = None;
+        for w in &self.workers {
+            let out = w.rx.recv().map_err(|e| e.to_string())?;
+            if let Some(e) = out.error {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        self.opponent_slots = n;
+        Ok(())
+    }
+
+    /// Fans `Cmd::Collect { steps, assignment }` to every worker (drain-all: send to
+    /// all, then recv from all — same pattern as `set_weights`) and interleaves the
+    /// per-worker `CollectOut`s (already learner-row-only, see the worker's
+    /// `Cmd::Collect` arm) into global `(T, N_learner, ...)` buffers. Worker order
+    /// (and, within a worker, learner-row order) matches `reset_into`/`step_into`'s
+    /// full agent order minus the filtered-out opponent-orange rows.
+    ///
+    /// `assignment` is validated here, once, before any Cmd is sent: length must
+    /// match `num_arenas`, every value must be `-1` or a currently-set opponent slot
+    /// `[0, opponent_slots)`, and the resulting learner-row count must be nonzero
+    /// (an all-opponent config where every arena's blue side is also opponent-driven
+    /// would otherwise silently produce empty buffers downstream). `None` from Python
+    /// is materialized by lib.rs into `vec![-1; num_arenas]` before this ever sees
+    /// it — the legacy path and this path are the same code, not a branch.
+    pub fn collect(&mut self, steps: usize, assignment: Arc<Vec<i32>>) -> Result<CollectOut, String> {
+        if assignment.len() != self.num_arenas {
+            return Err(format!(
+                "arena_opponents length {} != num_arenas {}", assignment.len(), self.num_arenas
+            ));
+        }
+        for &k in assignment.iter() {
+            if k < -1 || (k >= 0 && k as usize >= self.opponent_slots) {
+                return Err(format!(
+                    "arena_opponents value {k} out of range: expected -1 or an opponent slot in [0, {})",
+                    self.opponent_slots
+                ));
+            }
+        }
+        let learner_count: usize = self.sizes.iter().zip(assignment.iter())
+            .map(|(&(b, o), &k)| if k < 0 { b + o } else { b })
+            .sum();
+        if learner_count == 0 {
+            return Err("arena_opponents assignment yields no learner agents".into());
+        }
+
+        for w in &self.workers {
+            w.tx.send(Cmd::Collect { steps, assignment: assignment.clone() }).map_err(|e| e.to_string())?;
         }
         let mut worker_outs = Vec::with_capacity(self.workers.len());
         for w in &self.workers {
@@ -636,19 +864,18 @@ impl MultiEngine {
         }
 
         let d = self.obs_size;
-        let agents = self.num_agents;
-        let mut merged = CollectOut::zeros(steps, agents, d);
+        let mut merged = CollectOut::zeros(steps, learner_count, d);
         let mut off = 0usize;
-        for (w, out) in self.workers.iter().zip(worker_outs.into_iter()) {
-            let n = w.num_agents;
+        for out in worker_outs.into_iter() {
             let co = out.collect.expect("collect payload missing on worker success");
+            let n = co.learner_agents;
             for t in 0..steps {
                 let o_src = t * n * d..(t + 1) * n * d;
-                let o_dst = t * agents * d + off * d;
+                let o_dst = t * learner_count * d + off * d;
                 merged.obs[o_dst..o_dst + n * d].copy_from_slice(&co.obs[o_src]);
 
                 let s_src = t * n..(t + 1) * n;
-                let s_dst = t * agents + off;
+                let s_dst = t * learner_count + off;
                 merged.actions[s_dst..s_dst + n].copy_from_slice(&co.actions[s_src.clone()]);
                 merged.logprobs[s_dst..s_dst + n].copy_from_slice(&co.logprobs[s_src.clone()]);
                 merged.values[s_dst..s_dst + n].copy_from_slice(&co.values[s_src.clone()]);
