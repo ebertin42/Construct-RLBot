@@ -3,6 +3,12 @@
 //! documenting every column, so downstream IDM/BC loaders can validate shape
 //! and schema without guessing.
 //!
+//! `write_shard`'s `stride` param subsamples the 120 Hz stream before
+//! storing it (indices `0, stride, 2*stride, ...`) — see its doc. `T` below
+//! is the STORED tick count after subsampling, not necessarily the full
+//! 120 Hz count; the sidecar's `stride`/`effective_hz` record the rate
+//! actually used.
+//!
 //! ## Array layout
 //! - `ball` `[T, 13]`: pos3, vel3, ang_vel3, quat4 (`[x,y,z,w]`).
 //! - `cars_state` `[T, P, 16]`: pos3, vel3, ang_vel3, quat4, boost (0..1),
@@ -13,9 +19,10 @@
 //!   `CarControls` for that tick's 30 Hz interval (see `Tick::actions`).
 //! - `player_teams` `[P]` (`i64`, 0=blue/1=orange).
 //! - `tick_index` `[T]` (`i64`): global monotonic 120 Hz tick position in the
-//!   ORIGINAL undropped sub-step sequence (see `reconstruct`'s module doc).
-//!   A gap `>1` between consecutive entries means one or more ticks were
-//!   dropped between them for insanity.
+//!   ORIGINAL undropped sub-step sequence (see `reconstruct`'s module doc),
+//!   NOT renumbered by subsampling. A gap `>1` between consecutive entries
+//!   means one or more ticks were dropped between them for insanity (or, at
+//!   `stride>1`, were simply not stored — see `write_shard`).
 //! - `is_boundary` `[T]` (`i64`, 0/1): 1 iff this tick is the first
 //!   simulated sub-step right after an authoritative snap to the replay's
 //!   frame data (a 30 Hz interval boundary), 0 otherwise. Consumers building
@@ -42,7 +49,10 @@ use ndarray::{Array1, Array2, Array3};
 use ndarray_npy::NpzWriter;
 use serde::Serialize;
 
-use crate::{meta::ReplayMeta, reconstruct::Reconstructed};
+use crate::{
+    meta::ReplayMeta,
+    reconstruct::{Reconstructed, Tick},
+};
 
 /// Bump whenever the array layout or column semantics below change.
 /// Downstream loaders should fail loud on a version they don't recognize.
@@ -50,7 +60,13 @@ use crate::{meta::ReplayMeta, reconstruct::Reconstructed};
 /// v2: added `tick_index` `[T]` i64 and `is_boundary` `[T]` i64 (0/1) arrays
 /// (see module doc) so a downstream IDM can detect dropped-tick gaps and
 /// 30 Hz snap boundaries instead of silently mispairing across them.
-pub const SHARD_SCHEMA_VERSION: u32 = 2;
+///
+/// v3: added `write_shard`'s `stride` param (see its doc) — the stored array
+/// columns are unchanged, but the tick rate they're sampled at now varies
+/// per shard instead of being a fixed 120 Hz, so the sidecar records `stride`
+/// + `effective_hz` and downstream loaders must read those rather than
+/// assuming 120 Hz.
+pub const SHARD_SCHEMA_VERSION: u32 = 3;
 
 pub const BALL_COLUMNS: [&str; 13] = [
     "pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z", "ang_vel_x", "ang_vel_y", "ang_vel_z",
@@ -72,9 +88,14 @@ struct ShardSidecar {
     num_players: usize,
     team_size: u8,
     /// Source replay frame rate the reconstruction was built from (i.e. the
-    /// `--fps` the CLI passed to `extract_frames`), not the 120 Hz tick rate
-    /// of the arrays themselves.
+    /// `--fps` the CLI passed to `extract_frames`), not the tick rate of the
+    /// stored arrays themselves (see `effective_hz`).
     fps: u32,
+    /// Every `stride`-th reconstructed 120 Hz tick was kept (1 = all ticks,
+    /// i.e. 120 Hz; 8 = 15 Hz). See `write_shard`'s doc.
+    stride: usize,
+    /// The stored arrays' actual tick rate: `120.0 / stride`.
+    effective_hz: f64,
     playlist: String,
     ball_columns: Vec<String>,
     cars_state_columns: Vec<String>,
@@ -84,15 +105,36 @@ struct ShardSidecar {
 /// Writes `rec` to `<out_dir>/<replay_id>.npz` (+ `<replay_id>.json`
 /// sidecar). Returns the `.npz` path.
 ///
-/// Errors (and writes nothing) if `rec` has zero ticks or zero players —
-/// callers should treat that as a failed replay, not an empty shard.
+/// `stride` subsamples the reconstructed 120 Hz tick stream before writing:
+/// only indices `0, stride, 2*stride, ...` of `rec.ticks` (the surviving,
+/// already-undropped tick array) are stored. `stride=1` stores every tick
+/// (120 Hz, the pre-stride behavior); `stride=8` stores every 8th tick, i.e.
+/// 120/8 = 15 Hz — matching the bot's `tick_skip=8` decision rate, since
+/// there's no value storing physics states finer than the rate the policy
+/// actually acts at. `ball`/`cars_state`/`cars_action`/`tick_index`/
+/// `is_boundary` are all subsampled at the same indices, so they stay
+/// mutually aligned. Critically, `tick_index` values are NOT renumbered —
+/// they stay the original 120 Hz indices from `Tick::tick_index`, so gaps
+/// from dropped ticks remain visible (just coarser) at the subsampled rate,
+/// and any 30 Hz boundary tick (`is_boundary==1`) that happens to land on a
+/// kept index is preserved as-is.
+///
+/// Errors (and writes nothing) if `rec` has zero ticks, zero players, or
+/// `stride == 0` — callers should treat that as a failed replay, not an
+/// empty shard.
 pub fn write_shard(
     out_dir: &Path,
     replay_id: &str,
     meta: &ReplayMeta,
     rec: &Reconstructed,
+    stride: usize,
 ) -> Result<PathBuf, String> {
-    let num_ticks = rec.ticks.len();
+    if stride == 0 {
+        return Err(format!("stride must be >= 1, got {stride}"));
+    }
+
+    let selected: Vec<&Tick> = rec.ticks.iter().step_by(stride).collect();
+    let num_ticks = selected.len();
     let num_players = rec.player_teams.len();
 
     if num_ticks == 0 || num_players == 0 {
@@ -110,7 +152,7 @@ pub fn write_shard(
     let mut tick_index = Array1::<i64>::zeros(num_ticks);
     let mut is_boundary = Array1::<i64>::zeros(num_ticks);
 
-    for (t, tick) in rec.ticks.iter().enumerate() {
+    for (t, tick) in selected.iter().enumerate() {
         if tick.cars.len() != num_players || tick.actions.len() != num_players {
             return Err(format!(
                 "tick {t}: expected {num_players} cars, got {} cars / {} actions",
@@ -186,6 +228,8 @@ pub fn write_shard(
         num_players,
         team_size: meta.team_size,
         fps: rec.fps,
+        stride,
+        effective_hz: 120.0 / stride as f64,
         playlist: meta.playlist.clone(),
         ball_columns: BALL_COLUMNS.iter().map(|s| s.to_string()).collect(),
         cars_state_columns: CARS_STATE_COLUMNS.iter().map(|s| s.to_string()).collect(),

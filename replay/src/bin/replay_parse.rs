@@ -80,6 +80,14 @@ struct Args {
     /// `0` (default) disables reset-pool sampling entirely.
     #[arg(long, default_value_t = 0)]
     reset_samples_per_replay: usize,
+
+    /// Storage stride over the reconstructed 120 Hz tick stream: only every
+    /// `stride`-th tick is written to the shard (see `shard::write_shard`).
+    /// Default 8 matches the bot's `tick_skip=8` decision rate, i.e.
+    /// 120/8 = 15 Hz storage instead of the full 120 Hz. Use `1` to store
+    /// every tick (the old, pre-stride behavior).
+    #[arg(long, default_value_t = 8)]
+    stride: usize,
 }
 
 /// Deterministic per-replay seed for reset-state sampling, derived from the
@@ -107,6 +115,7 @@ fn parse_one(
     fps: u32,
     min_team_size: u8,
     reset_samples_per_replay: usize,
+    stride: usize,
 ) -> (Outcome, Vec<ResetState>) {
     let replay_id = match path.file_stem().and_then(|s| s.to_str()) {
         Some(s) => s.to_string(),
@@ -124,7 +133,7 @@ fn parse_one(
         }
         let frames = extract_frames(&bytes, fps)?;
         let rec = reconstruct_120hz(&frames)?;
-        write_shard(output_dir, &replay_id, &meta, &rec)?;
+        write_shard(output_dir, &replay_id, &meta, &rec, stride)?;
         let states = if reset_samples_per_replay > 0 {
             sample_reset_states(&rec, reset_samples_per_replay, seed_for_replay(&replay_id))
         } else {
@@ -178,7 +187,14 @@ fn main() {
     let results: Vec<(Outcome, Vec<ResetState>)> = entries
         .par_iter()
         .map(|path| {
-            parse_one(path, &args.output_dir, args.fps, args.min_team_size, args.reset_samples_per_replay)
+            parse_one(
+                path,
+                &args.output_dir,
+                args.fps,
+                args.min_team_size,
+                args.reset_samples_per_replay,
+                args.stride,
+            )
         })
         .collect();
 
