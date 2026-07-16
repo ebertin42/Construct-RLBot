@@ -47,6 +47,18 @@ impl Tracker {
     /// each step. Returns snapshots at +60/120/180/240 ticks == +0.5/1/1.5/2s.
     /// Allocation-free: `set_ball`/`step`/`get_ball` all operate on the
     /// already-owned `UniquePtr<Arena>` and return/take `Copy` structs.
+    ///
+    /// NaN containment (same philosophy as `EpisodeArena`'s `state_is_finite`
+    /// guard, see the physics-NaN playbook): Bullet's solver output for a
+    /// freshly constructed arena is sensitive to heap-allocation history —
+    /// observed 2026-07-16, a fresh tracker's *first* predict returned all-NaN
+    /// snapshots in one binary layout and ~0.01uu-perturbed (finite) ones in
+    /// another, self-healing on the next `set_ball`. Nonfinite snapshots must
+    /// never reach the obs tensor (they'd flow straight into the candle net),
+    /// so they collapse to the "no prediction" fallback: the input ball state
+    /// at every horizon. If the *input* ball is itself nonfinite the arena's
+    /// own containment (episode.rs) owns that case — the real ball entity row
+    /// would carry the same NaN regardless of what we return here.
     pub fn predict(&mut self, ball: &BallState) -> [BallSnap; 4] {
         self.arena.pin_mut().set_ball(*ball);
         let mut out = [BallSnap::default(); 4];
@@ -55,7 +67,23 @@ impl Tracker {
             let b = self.arena.pin_mut().get_ball();
             *snap = BallSnap { pos: b.pos, vel: b.vel };
         }
+        contain_nonfinite(out, ball)
+    }
+}
+
+fn vec3_finite(v: &Vec3) -> bool {
+    v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
+}
+
+/// If any snapshot went nonfinite, replace the whole prediction with the
+/// input ball state repeated at every horizon ("ball keeps doing what it's
+/// doing now" — finite whenever the input is, which episode.rs guarantees).
+fn contain_nonfinite(out: [BallSnap; 4], ball: &BallState) -> [BallSnap; 4] {
+    let ok = out.iter().all(|s| vec3_finite(&s.pos) && vec3_finite(&s.vel));
+    if ok {
         out
+    } else {
+        [BallSnap { pos: ball.pos, vel: ball.vel }; 4]
     }
 }
 
@@ -104,6 +132,27 @@ mod tests {
             assert!(w[1].pos.y > w[0].pos.y, "y must strictly increase: {:?}", snaps);
         }
         assert!(snaps[0].pos.y > 0.0);
+    }
+
+    #[test]
+    fn nonfinite_snapshots_collapse_to_input_fallback() {
+        let ball = {
+            let mut b = stationary_ball([100.0, -200.0, 300.0]);
+            b.vel = Vec3::new(1.0, 2.0, 3.0);
+            b
+        };
+        let good = [BallSnap { pos: Vec3::new(1.0, 2.0, 3.0), vel: Vec3::new(4.0, 5.0, 6.0) }; 4];
+        assert_eq!(contain_nonfinite(good, &ball), good, "finite snaps pass through untouched");
+
+        let mut bad = good;
+        bad[2].pos.y = f32::NAN;
+        let contained = contain_nonfinite(bad, &ball);
+        let fb = BallSnap { pos: ball.pos, vel: ball.vel };
+        assert_eq!(contained, [fb; 4], "any NaN collapses all horizons to the input ball");
+
+        let mut inf = good;
+        inf[0].vel.z = f32::INFINITY;
+        assert_eq!(contain_nonfinite(inf, &ball), [fb; 4]);
     }
 
     #[test]
