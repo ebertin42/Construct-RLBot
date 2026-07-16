@@ -11,12 +11,23 @@ def ppo_update(
     epochs: int = 3,
     minibatch_size: int = 4096,
     max_grad_norm: float = 0.5,
+    # Optional hook: idx (LongTensor of minibatch indices into `batch`) ->
+    # (extra_loss: 0-d Tensor, info: dict[str, float]). Added to the PPO loss
+    # before the backward pass, and `info` is mean-accumulated into the
+    # returned stats dict alongside policy_loss/value_loss/etc. This is the
+    # kickstart-distillation seam (see train.py's `extra_loss_fn` closure and
+    # kickstart.py) -- chosen over e.g. having evaluate() also return logits
+    # so ppo_update/model.py/model_v1.py's public signatures stay untouched
+    # when the hook is unused (`None` here is a complete no-op, byte-identical
+    # to pre-hook behavior).
+    extra_loss_fn=None,
 ) -> dict:
     n = batch["obs"].shape[0]
     adv = batch["advantages"]
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0,
              "updates": 0, "skipped": 0}
+    extra_keys: set[str] = set()
     for _ in range(epochs):
         perm = torch.randperm(n, device=batch["obs"].device)
         for s in range(0, n, minibatch_size):
@@ -39,6 +50,10 @@ def ppo_update(
             policy_loss = -torch.min(unclipped, clipped).mean()
             value_loss = torch.nn.functional.mse_loss(values, batch["returns"][idx])
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
+            extra_info: dict[str, float] = {}
+            if extra_loss_fn is not None:
+                extra_loss, extra_info = extra_loss_fn(idx)
+                loss = loss + extra_loss
             if not torch.isfinite(loss):
                 # never let a nonfinite loss reach backward(): one NaN gradient
                 # poisons the whole net through the shared grad-norm clip
@@ -53,7 +68,10 @@ def ppo_update(
             stats["value_loss"] += value_loss.item()
             stats["entropy"] += entropy.mean().item()
             stats["clip_frac"] += ((ratio - 1).abs() > clip).float().mean().item()
+            for k, v in extra_info.items():
+                stats[k] = stats.get(k, 0.0) + v
+                extra_keys.add(k)
             stats["updates"] += 1
-    for k in ("policy_loss", "value_loss", "entropy", "clip_frac"):
+    for k in ("policy_loss", "value_loss", "entropy", "clip_frac", *extra_keys):
         stats[k] /= max(stats["updates"], 1)
     return stats

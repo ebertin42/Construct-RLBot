@@ -29,6 +29,13 @@ p.add_argument("--reset-optimizer", action="store_true",
 p.add_argument("--league", action="store_true",
                help="enable opponent-pool sampling with config-file/default "
                     "league settings (registry/opponent_frac/refresh_iters/slots)")
+p.add_argument("--kickstart-teacher", default=None,
+               help="path to a frozen v0 MLP checkpoint; enables kickstart "
+                    "distillation (annealed KL + value regression to this "
+                    "teacher). Only takes effect on a v1-schema run.")
+p.add_argument("--kickstart-steps", type=int, default=None,
+               help="steps over which the kickstart KL weight anneals to 0 "
+                    "(default 500_000_000; only used with --kickstart-teacher)")
 args = p.parse_args()
 
 state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -54,6 +61,10 @@ if args.reset_optimizer:
     state["optimizer"] = None
 if args.league:
     cfg.league = {**cfg.league, "enabled": True}
+if args.kickstart_teacher:
+    cfg.kickstart = {**cfg.kickstart, "teacher": args.kickstart_teacher}
+    if args.kickstart_steps is not None:
+        cfg.kickstart["steps"] = args.kickstart_steps
 
 t = Trainer(cfg, _state=state)
 print(f"resumed at {t.total_steps:,} steps | arenas={cfg.env['num_arenas']} "

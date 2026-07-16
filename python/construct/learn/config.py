@@ -15,6 +15,11 @@ class TrainConfig:
     # refresh_iters (int, default 200), slots (int <= 8, default 4). See
     # Trainer._refresh_opponents / Trainer.collect for how these are consumed.
     league: dict = field(default_factory=dict)
+    # kickstart distillation (v1-schema runs only; see kickstart.py + Trainer.__init__).
+    # keys: teacher (v0 checkpoint path, required to activate), steps (anneal
+    # horizon, default 500_000_000), lambda_k (initial KL weight, default 1.0),
+    # lambda_v (value-regression weight, default 0.5).
+    kickstart: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str) -> "TrainConfig":

@@ -8,6 +8,12 @@ import torch
 from construct._engine import Engine, schema_dict
 from construct.learn.config import TrainConfig
 from construct.learn.gae import compute_gae
+from construct.learn.kickstart import (
+    TEACHER_OBS_SIZE,
+    KickstartSchedule,
+    KickstartTeacher,
+    kickstart_losses,
+)
 from construct.learn.model import PolicyValueNet
 from construct.learn.ppo import ppo_update
 
@@ -16,13 +22,30 @@ class Trainer:
     def __init__(self, cfg: TrainConfig, _state: dict | None = None):
         self.cfg = cfg
         self.schema = schema_dict(cfg.schema_path)
-        self.engine = Engine(
+        # Kickstart distillation (T7): only meaningful for a v1-schema run
+        # with a non-empty [kickstart] block. `emit_v0_obs` asks the engine
+        # to also record the legacy 94-float obs per collected step (T6),
+        # which the frozen v0 MLP teacher needs. For v0-schema runs -- the
+        # entire production path today -- this is always False, so the
+        # Engine constructor call, collect() output, and run() loop below
+        # are byte-identical to pre-T7 behavior.
+        #
+        # `emit_v0_obs` is only passed when actually needed (kickstart_active):
+        # the locally-built `_engine` extension in this checkout predates
+        # T6's `emit_v0_obs`/`net_heads` kwargs (rebuilding it is out of
+        # scope here -- no maturin/pip installs per repo hard rules), so
+        # passing it unconditionally would break every v0 Trainer today.
+        kickstart_active = bool(cfg.kickstart) and self.schema["version"] == 1
+        engine_kwargs = dict(
             num_arenas=cfg.env["num_arenas"], blue=cfg.env["blue"], orange=cfg.env["orange"],
             schema_path=cfg.schema_path, reward_config_path=cfg.reward_config_path,
             seed=cfg.env["seed"],
             team_size_weights=cfg.env.get("team_size_weights"),
             curriculum_config_path=cfg.curriculum_config_path or None,
         )
+        if kickstart_active:
+            engine_kwargs["emit_v0_obs"] = True
+        self.engine = Engine(**engine_kwargs)
         dev = cfg.run.get("device", "cuda")
         self.device = torch.device(dev if (dev != "cuda" or torch.cuda.is_available()) else "cpu")
         self.net = PolicyValueNet(
@@ -30,6 +53,23 @@ class Trainer:
         ).to(self.device)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.ppo["lr"])
         self.total_steps = 0
+
+        # NOTE: self.net above is still the v0 PolicyValueNet even when
+        # kickstart_active -- constructing the v1 EntityPolicyNet and
+        # reshaping collect()'s ents/mask/query/prev output into PPO
+        # minibatches is T8's job (v1 batch plumbing). Until T8 lands,
+        # collect() raises on a v1 schema before this hook ever fires, so
+        # the block below is a hook POINT, not a working v1 training path.
+        self.kickstart: dict | None = None
+        if kickstart_active:
+            self.kickstart = {
+                "teacher": KickstartTeacher(cfg.kickstart["teacher"], device=str(self.device)),
+                "schedule": KickstartSchedule(
+                    lambda_k0=float(cfg.kickstart.get("lambda_k", 1.0)),
+                    kickstart_steps=int(cfg.kickstart.get("steps", 500_000_000)),
+                    lambda_v=float(cfg.kickstart.get("lambda_v", 0.5)),
+                ),
+            }
 
         # Opponent-pool ("league") integration. Disabled by default (cfg.league == {}
         # or {"enabled": False}) -> self._assignment stays None -> engine.collect's
@@ -149,9 +189,16 @@ class Trainer:
             self.cfg.ppo["gamma"], self.cfg.ppo["lam"],
         )
         dev = self.device
+        # NOTE (T7/T8 seam): this reshape assumes a v0-shaped `out["obs"]` --
+        # a v1 schema returns ents/mask/query/prev instead (see engine.rs),
+        # and reshaping THOSE into PPO minibatches is T8's "v1 batch
+        # plumbing" scope, not this task's. `obs_v0` below is the one v1
+        # addition T7 needs (kickstart teacher input) and is a no-op for v0
+        # (the engine never sets the "obs_v0" key unless emit_v0_obs=True,
+        # which requires a v1 schema -- see lib.rs).
         flat_obs = torch.as_tensor(out["obs"].reshape(T * N, D), device=dev)
         done_frac = (out["terminated"] | out["truncated"]).sum()
-        return {
+        result = {
             "obs": flat_obs,
             "actions": torch.as_tensor(out["actions"].reshape(-1), device=dev),
             "logprobs": torch.as_tensor(out["logprobs"].reshape(-1), device=dev),
@@ -161,6 +208,11 @@ class Trainer:
             "ep_reward_mean": float(out["rewards"].sum() / max(1, done_frac)),
             "n_agents": N,
         }
+        if "obs_v0" in out:
+            result["obs_v0"] = torch.as_tensor(
+                out["obs_v0"].reshape(T * N, TEACHER_OBS_SIZE), device=dev
+            )
+        return result
 
     def run(self, max_iterations: int | None = None):
         it = 0
@@ -170,9 +222,49 @@ class Trainer:
             if self._league and it % self._league["refresh"] == 0:
                 self._refresh_opponents(it)
             batch = self.collect(p["rollout_steps"])
+
+            # --- kickstart distillation hook (T7) -------------------------------
+            # Guarded on self.kickstart (None for every v0 run, and for any v1
+            # run without a [kickstart] config) AND on "obs_v0" actually being
+            # in the batch -- collect() only puts it there when the engine was
+            # built with emit_v0_obs=True, i.e. exactly the kickstart_active
+            # case from __init__. `extra_loss_fn` stays None otherwise, which
+            # makes ppo_update's new hook parameter a complete no-op: v0 runs
+            # are byte-identical to pre-T7 behavior.
+            extra_loss_fn = None
+            lambda_k = lambda_v = 0.0
+            if self.kickstart is not None and "obs_v0" in batch:
+                lambda_k, lambda_v = self.kickstart["schedule"].coef(self.total_steps)
+                if lambda_k > 0.0 or lambda_v > 0.0:
+                    with torch.no_grad():
+                        t_logits, t_values = self.kickstart["teacher"].logits_values(batch["obs_v0"])
+
+                    def extra_loss_fn(idx, _lk=lambda_k, _lv=lambda_v, _tl=t_logits, _tv=t_values):
+                        # Re-runs the student net's forward directly (rather than
+                        # threading logits out through evaluate()/Categorical) to
+                        # get the full [B,92] distribution KL needs -- evaluate()
+                        # only returns the sampled action's logprob. This costs a
+                        # second forward pass per minibatch versus changing
+                        # model.py/model_v1.py's evaluate() signature to also
+                        # return logits; traded deliberately for keeping those
+                        # files (and ppo.py's default no-hook path) untouched.
+                        # NOTE: self.net is still the v0 PolicyValueNet until T8
+                        # builds the v1 EntityPolicyNet + batch reshaping --
+                        # this closure's `batch["ents"/"mask"/"query"/"prev"]`
+                        # keys don't exist yet either, so it is unreachable
+                        # until T8 lands (collect() raises on a v1 schema
+                        # before returning, see the NOTE in collect()).
+                        s_logits, s_value = self.net(
+                            batch["ents"][idx], batch["mask"][idx],
+                            batch["query"][idx], batch["prev"][idx],
+                        )
+                        kl, v_mse = kickstart_losses(s_logits, s_value.squeeze(-1), _tl[idx], _tv[idx])
+                        return _lk * kl + _lv * v_mse, {"kick_kl": kl.item()}
+
             stats = ppo_update(
                 self.net, self.opt, batch, clip=p["clip"], entropy_coef=p["entropy_coef"],
                 value_coef=p["value_coef"], epochs=p["epochs"], minibatch_size=p["minibatch_size"],
+                extra_loss_fn=extra_loss_fn,
             )
             # Steps count LEARNER transitions (batch["n_agents"] == out["learner_agents"]
             # from collect()), not the raw engine agent count -- opponent arenas
@@ -182,13 +274,15 @@ class Trainer:
             it += 1
             if it % self.cfg.run.get("log_every_iters", 1) == 0:
                 sps = n / (time.perf_counter() - t0)
-                print(
+                msg = (
                     f"iter {it} steps {self.total_steps:,} sps {sps:,.0f} "
                     f"ep_rew {batch['ep_reward_mean']:.3f} "
                     f"pi_loss {stats['policy_loss']:.4f} v_loss {stats['value_loss']:.4f} "
-                    f"ent {stats['entropy']:.3f} clip {stats['clip_frac']:.3f}",
-                    flush=True,
+                    f"ent {stats['entropy']:.3f} clip {stats['clip_frac']:.3f}"
                 )
+                if extra_loss_fn is not None:
+                    msg += f" kick_kl {stats.get('kick_kl', 0.0):.4f} lambda_k {lambda_k:.3f}"
+                print(msg, flush=True)
             if it % self.cfg.run.get("save_every_iters", 20) == 0:
                 os.makedirs(self.cfg.run["checkpoint_dir"], exist_ok=True)
                 self.save_checkpoint(
