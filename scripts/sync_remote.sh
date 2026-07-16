@@ -7,8 +7,12 @@ cd "$(dirname "$0")/.."
 HOST="${1:-elliot@192.168.86.117}"
 RDIR="${2:-construct}"
 
+mkdir -p checkpoints checkpoints_entity
 while true; do
     rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints/" checkpoints/ 2>/dev/null
     rsync -az "$HOST:$RDIR/checkpoints/train_v0.log" checkpoints/train_remote.log 2>/dev/null
+    # entity-transformer lineage (kickstart run) — separate dir, own log
+    rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_entity/" checkpoints_entity/ 2>/dev/null
+    rsync -az "$HOST:$RDIR/checkpoints_entity/train_v1.log" checkpoints_entity/train_remote.log 2>/dev/null
     sleep 60
 done
