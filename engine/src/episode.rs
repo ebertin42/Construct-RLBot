@@ -245,7 +245,9 @@ impl EpisodeArena {
     fn rebuild_arena(&mut self) {
         let orange = self.car_ids.len() - self.blue_count;
         let (arena, car_ids) = Self::build_arena(self.blue_count, orange);
-        debug_assert_eq!(
+        // hard assert: cold path (once per contained blowup), and a silent id
+        // remap in release would desync agent→car mapping for the whole run
+        assert_eq!(
             car_ids, self.car_ids,
             "rebuilt arena must re-issue identical car ids (per-arena counter, same add order)"
         );
