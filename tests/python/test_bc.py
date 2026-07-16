@@ -71,8 +71,8 @@ def test_config_toml_parses():
     cfg = BCConfig.load("configs/bc_v1.toml")
     assert cfg.data_dir == "data/bc"
     assert cfg.net == {"d_model": 128, "layers": 2, "heads": 4, "ff": 512}
-    for key in ("seed", "lr", "batch_size", "epochs", "val_fraction",
-                "weight_clamp", "grad_clip"):
+    for key in ("seed", "lr", "weight_decay", "batch_size", "epochs",
+                "val_fraction", "weight_clamp", "grad_clip"):
         assert key in cfg.train, key
     assert "device" in cfg.run
 
@@ -121,6 +121,12 @@ def test_class_weights_cached_and_reused(tmp_path):
     _write_shard(extra, 160, np.random.default_rng(9))
     out2 = class_counts(paths + [extra], NUM_ACTIONS, cache)
     assert np.asarray(out2["counts"]).sum() == 4 * 160
+
+    # re-export that keeps a FILENAME but changes contents: byte size differs,
+    # so the cache reads as stale and is recomputed (no silent stale counts)
+    _write_shard(paths[0], 200, np.random.default_rng(10))
+    out3 = class_counts(paths + [extra], NUM_ACTIONS, cache)
+    assert np.asarray(out3["counts"]).sum() == 200 + 3 * 160
 
 
 def test_fixed_seed_gives_identical_batches(tmp_path):

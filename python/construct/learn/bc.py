@@ -21,8 +21,9 @@ files, and machine moves.
 
 Class weights: one first pass over every shard's `action` array counts the
 92 classes; counts are cached to json next to the data and recomputed only
-if the cache is missing or its shard set no longer matches the directory.
-Weights are total/(A*count), clamped to [0.1, 10] (config).
+if the cache is missing or its shard set (filenames AND byte sizes) no
+longer matches the directory. Weights are total/(A*count), clamped to
+[0.1, 10] (config).
 
 Checkpoints mirror learn/train.py's Trainer.save_checkpoint schema exactly
 (schema_version: 1, model/optimizer/total_steps/config.net/...) so
@@ -58,7 +59,8 @@ BC_KEYS = ("ents", "mask", "query", "prev", "action")
 class BCConfig:
     data_dir: str
     net: dict = field(default_factory=dict)     # d_model/layers/heads/ff
-    # seed, lr, batch_size, epochs, val_fraction, weight_clamp [lo, hi], grad_clip
+    # seed, lr, weight_decay, batch_size, epochs, val_fraction,
+    # weight_clamp [lo, hi], grad_clip
     train: dict = field(default_factory=dict)
     run: dict = field(default_factory=dict)     # device, checkpoint_dir, log_every_batches
 
@@ -96,28 +98,33 @@ def split_shards(paths: list[str], val_fraction: float) -> tuple[list[str], list
 def class_counts(paths: list[str], num_actions: int, cache_path: str) -> dict:
     """First pass over every shard's `action` array -> per-class counts,
     cached as json next to the data. Recomputed only when the cache is
-    missing, was built for a different action count, or its shard set no
-    longer matches `paths` (stale cache after a re-export must not skew the
-    weights silently)."""
-    names = sorted(os.path.basename(p) for p in paths)
+    missing, was built for a different action count, or its shard set --
+    filenames AND byte sizes -- no longer matches `paths` (a stale cache
+    after a re-export, even one keeping the same filenames, must not skew
+    the weights silently)."""
+    sizes = {os.path.basename(p): os.path.getsize(p) for p in paths}
     if os.path.exists(cache_path):
         with open(cache_path) as f:
             cached = json.load(f)
-        if (cached.get("num_actions") == num_actions
-                and sorted(cached.get("shards", {})) == names):
+        # older caches stored a bare sample count per shard -- no size to
+        # compare, so they read as stale and recompute once
+        cached_sizes = {k: v.get("bytes") if isinstance(v, dict) else None
+                        for k, v in cached.get("shards", {}).items()}
+        if cached.get("num_actions") == num_actions and cached_sizes == sizes:
             return cached
         print(f"bc: class-count cache {cache_path} is stale, recomputing", flush=True)
 
     counts = np.zeros(num_actions, dtype=np.int64)
-    shards: dict[str, int] = {}
+    shards: dict[str, dict] = {}
     for p in paths:
+        name = os.path.basename(p)
         with np.load(p) as z:
             a = z["action"]
         assert a.min() >= 0 and a.max() < num_actions, (
             f"{p}: action indices outside [0, {num_actions})"
         )
         counts += np.bincount(a, minlength=num_actions)
-        shards[os.path.basename(p)] = int(a.shape[0])
+        shards[name] = {"samples": int(a.shape[0]), "bytes": sizes[name]}
     out = {"num_actions": num_actions, "counts": counts.tolist(), "shards": shards}
     tmp = cache_path + ".tmp"
     with open(tmp, "w") as f:
@@ -216,12 +223,14 @@ class BCTrainer:
                   "val metrics will be skipped", flush=True)
 
         num_actions = int(np.asarray(action_table).shape[0])
+        # Counts run over train+val shards INTENTIONALLY: class weights are
+        # corpus statistics, and the cache stays valid when val_fraction moves.
         cache = class_counts(
             self.shards, num_actions,
             os.path.join(cfg.data_dir, "bc_class_counts.json"),
         )
         self.counts = np.asarray(cache["counts"], dtype=np.int64)
-        self.shard_samples = cache["shards"]
+        self.shard_samples = {k: v["samples"] for k, v in cache["shards"].items()}
         weights = class_weights(self.counts, clamp)
 
         dev = cfg.run.get("device", "cuda")
@@ -233,7 +242,10 @@ class BCTrainer:
             action_table=action_table,
         ).to(self.device)
         self.weights = torch.as_tensor(weights, device=self.device)
-        self.opt = torch.optim.AdamW(self.net.parameters(), lr=float(t.get("lr", 3e-4)))
+        self.opt = torch.optim.AdamW(
+            self.net.parameters(), lr=float(t.get("lr", 3e-4)),
+            weight_decay=float(t.get("weight_decay", 0.01)),
+        )
         # Cosine anneal over the whole planned run. Batches per epoch is exact:
         # the carry buffer in iter_batches makes it ceil(train samples / batch).
         train_samples = sum(self.shard_samples[os.path.basename(p)] for p in self.train_shards)
@@ -263,6 +275,9 @@ class BCTrainer:
             self.opt.step()
             self.sched.step()
             n = batch["action"].shape[0]
+            # weighted CE normalizes each batch by its weight sum; aggregating
+            # by sample count is a known approximation (logging only -- the
+            # same holds for evaluate()'s val_loss; gradients are unaffected)
             loss_sum += loss.item() * n
             n_sum += n
             self.total_steps += n
