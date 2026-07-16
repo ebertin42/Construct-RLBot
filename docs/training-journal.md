@@ -60,3 +60,11 @@ two consecutive <1.35 readings = real dip. Corpus: 55,935 shards / 77G (the
 "shards: 0" in the build log is an ARG_MAX ls bug at >50k files — cosmetic,
 fix `ls | wc` → `find | wc` in build_gc2_corpus.sh line 30 after sweep ends).
 Batch_0011 pulling. All loops UP, remote proc alive, disk 666G.
+
+### 2026-07-17 ~13:15 (monitor)
+| steps | sps | kick_kl | lambda_k | ent | goals/min |
+|---|---|---|---|---|---|
+| 199.1M | 5,453 | 0.375 | 0.602 | 3.21 | (skipped — ck only +7M since 1.81 reading) |
+Trend: KL settled ~0.375 (productive disagreement — student outscores teacher),
+anneal 40%, all steady. Corpus top-up: batch_0000 topped up, on 0001; 61.5k
+shards. All loops UP. No flags.
