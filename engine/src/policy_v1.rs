@@ -41,6 +41,7 @@ use candle_core::{Device, Tensor};
 use candle_nn::{LayerNorm, Linear, Module};
 use std::collections::HashMap;
 
+use crate::actions::TABLE_SIZE_V1;
 use crate::policy::ensure_single_thread_gemm;
 
 const ACT_FEAT: usize = 8;
@@ -213,8 +214,15 @@ impl EntityPolicy {
         let prev_actions = prev_w_shape[0];
 
         let (_, act_table_shape) = weights.get("action_table").ok_or("missing action_table")?;
-        if act_table_shape.len() != 2 || act_table_shape[1] != ACT_FEAT {
-            return Err(format!("action_table must be [N,{ACT_FEAT}], got {act_table_shape:?}"));
+        // Hard guard: the v1 action table is exactly the compiled 92-row v1.1
+        // table (see actions::TABLE_SIZE_V1 / make_lookup_table_v1) -- a
+        // stale/mismatched buffer (e.g. a v0 90-row table on a v1 checkpoint)
+        // must fail construction loudly rather than silently index_select-ing
+        // out of bounds or producing wrong prev-action / policy-head rows.
+        if act_table_shape.len() != 2 || act_table_shape[0] != TABLE_SIZE_V1 || act_table_shape[1] != ACT_FEAT {
+            return Err(format!(
+                "action_table must be [{TABLE_SIZE_V1},{ACT_FEAT}], got {act_table_shape:?}"
+            ));
         }
         let table_size = act_table_shape[0];
 
@@ -364,5 +372,64 @@ impl EntityPolicy {
 
         let _ = self.table_size; // reserved for future validation hooks
         Ok((logits, value))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `EntityPolicy` has no `Debug` impl (candle's `Tensor`/`Device` don't
+    /// derive it), so `Result::unwrap_err` (which requires `T: Debug`) can't
+    /// be used directly on `Result<EntityPolicy, String>` -- this pulls the
+    /// `Err` string out by hand instead.
+    fn expect_err(r: Result<EntityPolicy, String>) -> String {
+        match r {
+            Err(e) => e,
+            Ok(_) => panic!("expected EntityPolicy::new to fail, but it succeeded"),
+        }
+    }
+
+    /// Minimal weights map with just enough keys for `EntityPolicy::new` to
+    /// reach the `action_table` shape guard (embed/query_embed/prev_embed_w
+    /// present) but no transformer blocks -- irrelevant here since a bad
+    /// action_table must error out before the block scan ever runs.
+    fn minimal_weights_with_table(rows: usize, feat: usize) -> RawTensors {
+        let mut w: RawTensors = HashMap::new();
+        w.insert("embed.weight".into(), (vec![0.0; 4 * 26], vec![4, 26]));
+        w.insert("embed.bias".into(), (vec![0.0; 4], vec![4]));
+        w.insert("query_embed.weight".into(), (vec![0.0; 4 * 64], vec![4, 64]));
+        w.insert("query_embed.bias".into(), (vec![0.0; 4], vec![4]));
+        w.insert("prev_embed_w".into(), (vec![0.0; 5], vec![5]));
+        w.insert("action_table".into(), (vec![0.0; rows * feat], vec![rows, feat]));
+        w
+    }
+
+    #[test]
+    fn rejects_action_table_with_wrong_row_count() {
+        // 90 rows is the v0 table size, not v1's 92 -- must be rejected even
+        // though the feature width (8) is correct.
+        let w = minimal_weights_with_table(90, ACT_FEAT);
+        let err = expect_err(EntityPolicy::new(&w, 4));
+        assert!(err.contains("action_table"), "unexpected error: {err}");
+        assert!(err.contains("92"), "error should name the required row count: {err}");
+    }
+
+    #[test]
+    fn rejects_action_table_with_wrong_feature_count() {
+        let w = minimal_weights_with_table(TABLE_SIZE_V1, 7);
+        let err = expect_err(EntityPolicy::new(&w, 4));
+        assert!(err.contains("action_table"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn accepts_action_table_with_correct_shape() {
+        // Shape guard passes; construction still fails afterward (no
+        // transformer blocks in this minimal fixture) -- proves the guard
+        // itself isn't what's rejecting a correctly-shaped table.
+        let w = minimal_weights_with_table(TABLE_SIZE_V1, ACT_FEAT);
+        let err = expect_err(EntityPolicy::new(&w, 4));
+        assert!(!err.contains("action_table"), "unexpected action_table error: {err}");
+        assert!(err.contains("blocks"), "expected the no-blocks error, got: {err}");
     }
 }

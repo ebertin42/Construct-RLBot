@@ -155,7 +155,11 @@ class Trainer:
         run at a refresh boundary: each pick is loaded independently, bad
         ones are skipped with a warning, and if every pick fails the
         previous assignment (and opponent weights already in the engine)
-        is left in place rather than falling back to an empty pool.
+        is left in place rather than falling back to an empty pool. The same
+        holds if every pick loads fine but `engine.set_opponents` itself
+        raises (e.g. an opponent state dict that's incompatible with the
+        engine's current obs mode) -- that's also caught and logged, leaving
+        the previous assignment and in-engine opponent weights untouched.
         """
         L = self._league
         from construct.league.registry import Registry
@@ -180,7 +184,15 @@ class Trainer:
         if not sds:
             print("league: all picks failed to load, keeping previous assignment", flush=True)
             return
-        self.engine.set_opponents(sds)
+        try:
+            self.engine.set_opponents(sds)
+        except Exception as e:
+            # A misconfigured/incompatible opponent pool (e.g. a future
+            # league-on-v1 obs/schema mismatch) must degrade to "keep
+            # whatever assignment and engine-side opponent weights were
+            # already in place" rather than take down the whole run.
+            print(f"league: set_opponents failed ({e}), keeping previous assignment", flush=True)
+            return
         n = self.num_arenas
         n_opp = round(L["frac"] * n)
         a = [-1] * n

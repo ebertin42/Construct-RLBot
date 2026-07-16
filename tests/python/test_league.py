@@ -277,3 +277,27 @@ def test_league_slots_upper_bound_validated():
     cfg.league = {"enabled": True, "slots": 9}
     with pytest.raises(AssertionError, match="slots"):
         Trainer(cfg)
+
+
+def test_refresh_set_opponents_failure_keeps_previous_assignment(tmp_path, capsys):
+    # A future league-on-v1 misconfig (or any other set_opponents-time
+    # failure, e.g. an opponent state dict incompatible with the engine's
+    # obs mode) must degrade to "keep the prior assignment" like the other
+    # refresh failure modes, not propagate and kill the run.
+    reg_path = str(tmp_path / "reg.jsonl")
+    reg = Registry(path=reg_path)
+    reg.add(_save_tiny_ck(tmp_path, "opp1.pt"), steps=1, run="main", reward_config="x")
+
+    cfg = _league_cfg(tmp_path, reg_path, slots=1)
+    t = Trainer(cfg)
+    t._assignment = [-1, -1, 0, 0]  # simulate a prior good assignment
+
+    class _FailingEngine:
+        def set_opponents(self, *_args, **_kwargs):
+            raise RuntimeError("boom")
+
+    t.engine = _FailingEngine()
+    t._refresh_opponents()  # must not raise
+    assert t._assignment == [-1, -1, 0, 0]  # unchanged
+    out = capsys.readouterr().out
+    assert "league" in out and "set_opponents" in out and "boom" in out
