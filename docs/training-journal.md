@@ -68,3 +68,24 @@ Batch_0011 pulling. All loops UP, remote proc alive, disk 666G.
 Trend: KL settled ~0.375 (productive disagreement — student outscores teacher),
 anneal 40%, all steady. Corpus top-up: batch_0000 topped up, on 0001; 61.5k
 shards. All loops UP. No flags.
+
+### 2026-07-17 ~19:15 — DEAD-BALL CONTAINMENT FIX SHIPPED (both boxes)
+Root-caused the rlviser "frozen ball after sudden kickoff": physics-blowup
+containment reset a Bullet-poisoned arena in place; NaN AABB latches
+DISABLE_SIMULATION on the ball (one-way; RocketSim never force-clears it), so
+post-containment the ball is dead for the arena's lifetime — ghost-ball viewer
+sessions AND silent zero-touch training arenas (37/310 watch sessions affected;
+same defect live in every collect arena). Fix a1c33e0+8527a5e: rebuild arena in
+the containment branch (car ids re-issue identically — hard-asserted). Reviewed
+APPROVE (field-by-field sweep, vendored-source verification). Shipped with
+Elliot's OK: local .so atomic-swap, run-B resumed ck 3,506.1M (lost ~7.8M
+ck-granularity); remote resumed ck 313.79M (lost ~1.5M), lambda_k 0.372
+continuity confirmed. Validation: containment fired on remote iter 1 → log
+shows "arena rebuilt" — fix live. Kickstart run at 314.1M, sps 5,568, kick_kl
+0.39, ent 3.25 — all on trend.
+BC-pretrain (task #44): B3 bc-export landed (ac77c17+7a9aa1e, reviewed) and B5
+BC trainer landed (4533747+208ec36, reviewed; ckpt-compat proven through
+eval_metrics live). v4 re-parse was STALLED (≥10k batch gate vs completed pull;
+fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6:
+kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
+kl_prior seam, not KickstartTeacher.
