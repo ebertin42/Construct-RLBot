@@ -48,3 +48,15 @@ the 1.56 teacher, 8.6% into the anneal. Kickstart transfer working better than
 projected. Improvement notes: none needed yet; next checks — KL should keep
 falling toward <0.2 as lambda anneals; watch for post-anneal hacking signature.
 Corpus: batch_0006 pulling, 34.1k shards, 712G free. All local loops UP.
+
+### 2026-07-17 ~09:00 (monitor)
+| steps | sps | kick_kl | lambda_k | ent | goals/min |
+|---|---|---|---|---|---|
+| 120.8M | 5,416 | 0.40 | 0.759 | 3.24 | 1.40 (ck 120M) |
+Trend: KL still converging (0.48→0.40), entropy easing, sps steady. Eval dipped
+1.71→1.40 — single-sample metric with historical ±0.2 noise band (v3 oscillated
+1.34-1.73); within teacher range, NOT flagging regression yet. Watch next tick:
+two consecutive <1.35 readings = real dip. Corpus: 55,935 shards / 77G (the
+"shards: 0" in the build log is an ARG_MAX ls bug at >50k files — cosmetic,
+fix `ls | wc` → `find | wc` in build_gc2_corpus.sh line 30 after sweep ends).
+Batch_0011 pulling. All loops UP, remote proc alive, disk 666G.
