@@ -11,7 +11,7 @@ use ndarray_npy::NpzReader;
 fn writes_loadable_shard_with_schema() {
     let bytes = std::fs::read("tests/fixtures/sample.replay").unwrap();
     let meta = parse_meta(&bytes).unwrap();
-    let rec = reconstruct_120hz(&extract_frames(&bytes, 30).unwrap()).unwrap();
+    let rec = reconstruct_120hz(&extract_frames(&bytes, 30).unwrap(), 1).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let p = write_shard(dir.path(), "sample", &meta, &rec, 1).unwrap();
     assert!(p.exists());
@@ -19,20 +19,26 @@ fn writes_loadable_shard_with_schema() {
     let sidecar: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(dir.path().join("sample.json")).unwrap()).unwrap();
     assert_eq!(sidecar["schema_version"], SHARD_SCHEMA_VERSION);
+    assert_eq!(SHARD_SCHEMA_VERSION, 4, "schema must be bumped for pads/has_flip/ball_pred");
     assert!(sidecar["num_ticks"].as_u64().unwrap() > 100);
 
     let num_players = sidecar["num_players"].as_u64().unwrap() as usize;
     let cars_state_columns = sidecar["cars_state_columns"].as_array().unwrap();
     let cars_action_columns = sidecar["cars_action_columns"].as_array().unwrap();
     let ball_columns = sidecar["ball_columns"].as_array().unwrap();
+    let pad_columns = sidecar["pad_columns"].as_array().unwrap();
+    let ball_pred_columns = sidecar["ball_pred_columns"].as_array().unwrap();
     assert_eq!(ball_columns.len(), 13);
     assert_eq!(cars_action_columns.len(), 8, "cars_action last-dim must be 8 (throttle..handbrake)");
-    // pos3+vel3+ang_vel3+quat4 (13) + boost + on_ground + demoed = 16 columns.
-    // (An earlier plan sketch guessed 15; the explicit column list the task
-    // requires — including both on_ground and demoed as separate channels —
-    // sums to 16, and the sidecar's column arrays are the schema's source of
-    // truth, so the .npz array widths are asserted against them directly.)
-    assert_eq!(cars_state_columns.len(), 16, "cars_state last-dim must match its documented column list");
+    // pos3+vel3+ang_vel3+quat4 (13) + boost + on_ground + demoed + has_flip = 17
+    // columns (v4 adds has_flip to the v3 16-column layout).
+    assert_eq!(cars_state_columns.len(), 17, "cars_state last-dim must match its documented column list");
+    assert!(
+        cars_state_columns.iter().any(|c| c == "has_flip"),
+        "cars_state_columns must document the new has_flip column"
+    );
+    assert_eq!(pad_columns.len(), 2, "pad columns: timer, is_active");
+    assert_eq!(ball_pred_columns.len(), 6, "ball_pred columns: pos3+vel3");
 
     // The .npz must actually load, and its array shapes must match the
     // sidecar-documented column counts exactly.
@@ -43,7 +49,14 @@ fn writes_loadable_shard_with_schema() {
     let cars_state: Array3<f32> = npz.by_name("cars_state.npy").unwrap();
     assert_eq!(cars_state.shape()[1], num_players);
     assert_eq!(cars_state.shape()[2], cars_state_columns.len());
-    assert_eq!(cars_state.shape()[2], 15 + 1, "cars_state last-dim has 16 columns, not the plan sketch's 15");
+    assert_eq!(cars_state.shape()[2], 17, "cars_state last-dim has 17 columns in schema v4");
+    let has_flip_idx = cars_state_columns.iter().position(|c| c == "has_flip").unwrap();
+    for p in 0..num_players {
+        for t in 0..cars_state.shape()[0] {
+            let v = cars_state[[t, p, has_flip_idx]];
+            assert!(v == 0.0 || v == 1.0, "has_flip must be 0/1-valued, got {v}");
+        }
+    }
 
     let cars_action: Array3<f32> = npz.by_name("cars_action.npy").unwrap();
     assert_eq!(cars_action.shape()[1], num_players);
@@ -63,6 +76,37 @@ fn writes_loadable_shard_with_schema() {
         is_boundary.iter().all(|&v| v == 0 || v == 1),
         "is_boundary must be 0/1-valued"
     );
+
+    // --- pads [T, 34, 2]: timer in [0,1], is_active in {0,1} ---
+    let pads: Array3<f32> = npz.by_name("pads.npy").unwrap();
+    assert_eq!(pads.shape(), &[num_ticks, 34, 2], "pads must be [T, 34, 2]");
+    for t in 0..num_ticks {
+        for pad in 0..34 {
+            let timer = pads[[t, pad, 0]];
+            let active = pads[[t, pad, 1]];
+            assert!((0.0..=1.0).contains(&timer), "pad timer must be in [0,1], got {timer}");
+            assert!(active == 0.0 || active == 1.0, "pad is_active must be 0/1-valued, got {active}");
+        }
+    }
+
+    // --- ball_pred [T, 4, 6]: finite, and evolving across horizons for a moving ball ---
+    let ball_pred: Array3<f32> = npz.by_name("ball_pred.npy").unwrap();
+    assert_eq!(ball_pred.shape(), &[num_ticks, 4, 6], "ball_pred must be [T, 4, 6]");
+    assert!(ball_pred.iter().all(|x| x.is_finite()), "ball_pred must be all finite");
+    // The fixture's ball is in motion for at least some ticks; on those ticks
+    // the +2s horizon prediction must differ from the ball's current position
+    // (otherwise ball-pred is a no-op copy, not an actual roll-forward).
+    let mut any_diverged = false;
+    for t in 0..num_ticks {
+        let cur = [ball[[t, 0]], ball[[t, 1]], ball[[t, 2]]];
+        let far = [ball_pred[[t, 3, 0]], ball_pred[[t, 3, 1]], ball_pred[[t, 3, 2]]];
+        let dist = ((cur[0] - far[0]).powi(2) + (cur[1] - far[1]).powi(2) + (cur[2] - far[2]).powi(2)).sqrt();
+        if dist > 5.0 {
+            any_diverged = true;
+            break;
+        }
+    }
+    assert!(any_diverged, "expected at least one tick where the +2s ball prediction diverges from current position");
 }
 
 #[test]
@@ -81,7 +125,10 @@ fn empty_reconstruction_is_an_error_not_an_empty_shard() {
 fn stride_subsamples_ticks_and_preserves_tick_index_semantics() {
     let bytes = std::fs::read("tests/fixtures/sample.replay").unwrap();
     let meta = parse_meta(&bytes).unwrap();
-    let rec = reconstruct_120hz(&extract_frames(&bytes, 30).unwrap()).unwrap();
+    // stride=1 at reconstruct time so every tick gets a real (non-fallback)
+    // ball-pred, regardless of which write_shard stride is exercised below
+    // (write_shard's selection is always a subset of a stride=1 reconstruct's).
+    let rec = reconstruct_120hz(&extract_frames(&bytes, 30).unwrap(), 1).unwrap();
 
     // stride=1 baseline: current (pre-stride) behavior, full 120 Hz.
     let dir1 = tempfile::tempdir().unwrap();
@@ -98,7 +145,7 @@ fn stride_subsamples_ticks_and_preserves_tick_index_semantics() {
     let num_ticks_8 = sidecar8["num_ticks"].as_u64().unwrap() as usize;
 
     assert_eq!(sidecar8["schema_version"], SHARD_SCHEMA_VERSION);
-    assert_eq!(SHARD_SCHEMA_VERSION, 3, "schema must be bumped for variable sampling rate");
+    assert_eq!(SHARD_SCHEMA_VERSION, 4, "schema must be bumped for pads/has_flip/ball_pred");
     assert_eq!(sidecar8["stride"], 8);
     assert_eq!(sidecar8["effective_hz"], 15.0);
 

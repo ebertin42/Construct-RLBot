@@ -445,6 +445,7 @@ version = "0.1.0"
 dependencies = [
  "boxcars",
  "clap",
+ "construct-engine",
  "ndarray 0.16.1",
  "ndarray-npy",
  "rayon",

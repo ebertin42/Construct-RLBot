@@ -132,7 +132,7 @@ fn parse_one(
             return Ok((Outcome::Skipped, Vec::new()));
         }
         let frames = extract_frames(&bytes, fps)?;
-        let rec = reconstruct_120hz(&frames)?;
+        let rec = reconstruct_120hz(&frames, stride)?;
         write_shard(output_dir, &replay_id, &meta, &rec, stride)?;
         let states = if reset_samples_per_replay > 0 {
             sample_reset_states(&rec, reset_samples_per_replay, seed_for_replay(&replay_id))
