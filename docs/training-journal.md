@@ -90,6 +90,20 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~01:30 — B4 CORPUS EXPORT COMPLETE (+ disk crash postmortem)
+v4 re-parse: 67,568 replays, 0 failures, 233G, manifest 381.7M ticks all-1v1.
+bc-export: 67,568/67,568 shards → 163G COMPRESSED npz (plan's 180 B/sample
+estimate was 11x low — real 2,089 B/sample f32 = 1.6TB; deflate 9x on masked
+entity slots saved it, commit 61ea406), 704,498,136 samples, 0 export failures.
+OPS: WSL crashed mid-export — vhdx filled the Windows host disk (WSL df lies;
+real host free ~180G). Cleanup freed ~105G (v3 shards 85G superseded, uv/HF
+caches 20G); host-disk guard monitor added (kills export <100G); run-B lost two
+0-byte cks to the crash (quarantined, resumed from 3.5747B intact). Crash also
+proved the bc-export fsync gap: truncated-but-renamed bc npz in the pre-crash
+cohort — scanned/deleted/re-exported. vhdx compaction recommended to Elliot
+(wsl --set-sparse) at next downtime. BC TRAINING (B5 run) starting: 4 epochs,
+batch 4096, weighted CE, RTX 4060 (sharing with run-B learner).
+
 ### 2026-07-17 ~19:45 (monitor)
 | steps | sps | kick_kl | lambda_k | ent | goals/min |
 |---|---|---|---|---|---|
