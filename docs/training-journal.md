@@ -37,3 +37,14 @@ in-train (learner+teacher overhead). Anneal 500M steps ≈ ~25h at this rate.
 iter 10: kick_kl 1.05-1.15 flattish (0.3% of anneal — early), ent 4.24→3.89,
 ep_rew already teacher-range 2-6. Watch: KL must fall by ~50M steps.
 Rollback: relaunch v3 from checkpoints/ (intact, not archived — dir untouched).
+
+### 2026-07-17 ~05:00 (monitor)
+| steps | sps | kick_kl | lambda_k | ent | goals/min |
+|---|---|---|---|---|---|
+| 43.1M | 5,415 | 0.48 | 0.914 | 3.35 | **1.71** (ck 40M) |
+Trend: KL converging cleanly (1.1→0.48 by 43M — no flag); entropy 3.9→3.3;
+ep_rew 6-7 (above teacher's 4-5). Eval at 40M: 1.71 goals/min — ALREADY ABOVE
+the 1.56 teacher, 8.6% into the anneal. Kickstart transfer working better than
+projected. Improvement notes: none needed yet; next checks — KL should keep
+falling toward <0.2 as lambda anneals; watch for post-anneal hacking signature.
+Corpus: batch_0006 pulling, 34.1k shards, 712G free. All local loops UP.
