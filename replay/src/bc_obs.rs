@@ -52,6 +52,13 @@
 //! continuous; a drop-adjacent boundary is already covered by its
 //! tick_index gap.
 //!
+//! Known accepted gap: goal→kickoff resets leave NO tick_index gap — the
+//! stored counter stays contiguous across re-snaps — so the first ~5 stored
+//! rows after a goal carry pre-goal prev actions, whereas the live engine
+//! zeroes its ring at episode reset. Accepted as-is: it affects <1% of rows,
+//! and the kickoff countdown mostly flushes the ring before play resumes. A
+//! proper goal/kickoff marker is deferred to a future shard schema v5.
+//!
 //! ## Working directory requirement
 //! `pad_template` builds one `Arena::default_standard()`, which needs
 //! RocketSim's collision meshes to resolve from the current working
@@ -155,8 +162,16 @@ pub fn load_shard_v4(npz_path: &Path) -> Result<ShardV4, String> {
         .map_err(|e| format!("open {}: {e}", npz_path.display()))?;
     let mut npz = NpzReader::new(file).map_err(|e| format!("{}: {e}", npz_path.display()))?;
     let arr = |e: ndarray_npy::ReadNpzError| format!("{}: {e}", npz_path.display());
+    let ball: Array2<f32> = npz.by_name("ball.npy").map_err(arr)?;
+    if ball.shape()[1] != 13 {
+        return Err(format!(
+            "{}: expected 13 ball columns (v4, see shard::BALL_COLUMNS), got {}",
+            npz_path.display(),
+            ball.shape()[1]
+        ));
+    }
     Ok(ShardV4 {
-        ball: npz.by_name("ball.npy").map_err(arr)?,
+        ball,
         cars_state: npz.by_name("cars_state.npy").map_err(arr)?,
         cars_action_idx: npz.by_name("cars_action_idx.npy").map_err(arr)?,
         pads: npz.by_name("pads.npy").map_err(arr)?,
@@ -245,7 +260,9 @@ pub fn build_tensors(
 
     for t in 0..t_count {
         // Discontinuity check BEFORE emitting tick t's samples: a gap between
-        // t-1 and t means t must start from a fresh (zero) history.
+        // t-1 and t means t must start from a fresh (zero) history. Note
+        // goal→kickoff resets are tick-contiguous and deliberately NOT caught
+        // here — see the module doc's "prev-5 window" for why that's accepted.
         if t > 0 && shard.tick_index[t] - shard.tick_index[t - 1] != shard.stride as i64 {
             for ring in rings.iter_mut() {
                 *ring = [0; PREV_ACTIONS];

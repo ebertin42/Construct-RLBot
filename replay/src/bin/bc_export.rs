@@ -131,4 +131,10 @@ fn main() {
     }
 
     println!("exported={exported} skipped_existing={skipped} failed={failed} samples={samples}");
+
+    // Non-zero exit whenever any shard failed, so scripted callers (Task B4)
+    // can't miss failures — the per-shard errors are already on stderr.
+    if failed > 0 {
+        std::process::exit(1);
+    }
 }

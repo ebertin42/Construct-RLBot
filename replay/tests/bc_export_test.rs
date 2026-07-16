@@ -96,6 +96,55 @@ fn all_values_finite() {
 }
 
 #[test]
+fn orange_pov_query_pos_is_mirrored_blue_is_not() {
+    // Guards the player_teams -> Team mapping in bc_obs.rs: an inverted
+    // mapping (0 -> Orange) would mirror the wrong POVs yet pass every other
+    // test in this file. query[0..26] is the self entity row (obs_v1::build /
+    // EntityRow::write), whose pos slice is [5..8) = mir(raw_pos) * pos_norm,
+    // with mir negating x,y exactly when the car's team is Orange.
+    let (bc, shard) = fixture_tensors();
+    let pk = norm().pos_norm as f32;
+    let t_count = shard.tick_index.len();
+    let p_count = shard.player_teams.len();
+    assert!(shard.player_teams.iter().any(|&t| t == 0), "fixture must have a blue car");
+    assert!(shard.player_teams.iter().any(|&t| t == 1), "fixture must have an orange car");
+
+    let mut checked = [0usize; 2]; // [blue, orange] rows actually asserted
+    for t in 0..t_count {
+        for p in 0..p_count {
+            let (x, y, z) = (
+                shard.cars_state[[t, p, 0]],
+                shard.cars_state[[t, p, 1]],
+                shard.cars_state[[t, p, 2]],
+            );
+            // Mirroring only observably changes x/y — skip rows where either
+            // is near zero and the assertion would be vacuous.
+            if x.abs() < 100.0 || y.abs() < 100.0 {
+                continue;
+            }
+            let team = shard.player_teams[p];
+            let expect = if team == 1 {
+                [-x * pk, -y * pk, z * pk] // orange: play-as-blue mirror
+            } else {
+                [x * pk, y * pk, z * pk] // blue: unmirrored
+            };
+            let s = t * p_count + p;
+            for (k, &e) in expect.iter().enumerate() {
+                let got = bc.query[[s, 5 + k]];
+                assert!(
+                    (got - e).abs() < 1e-5,
+                    "t={t} p={p} team={team}: query[{}] = {got}, expected {e}",
+                    5 + k
+                );
+            }
+            checked[team as usize] += 1;
+        }
+    }
+    assert!(checked[0] > 0, "no blue row with |x|,|y| > 100 was asserted");
+    assert!(checked[1] > 0, "no orange row with |x|,|y| > 100 was asserted");
+}
+
+#[test]
 fn action_indices_in_92_table_range() {
     let (bc, shard) = fixture_tensors();
     assert_eq!(shard.action_table_size, 92);
