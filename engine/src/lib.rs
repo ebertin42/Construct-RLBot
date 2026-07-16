@@ -35,6 +35,16 @@ fn action_table<'py>(py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
     numpy::ndarray::Array2::from_shape_vec((t.len(), 8), flat).unwrap().into_pyarray(py)
 }
 
+/// The v1.1 action table (92 rows: v0's 90 + 2 stall rows) as an [N,8] f32
+/// array. The Python `EntityPolicyNet` consumes this as its non-trainable
+/// `action_table` buffer (prev-action embedding + dot action head).
+#[pyfunction]
+fn action_table_v1<'py>(py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
+    let t = actions::make_lookup_table_v1();
+    let flat: Vec<f32> = t.iter().flatten().copied().collect();
+    numpy::ndarray::Array2::from_shape_vec((t.len(), 8), flat).unwrap().into_pyarray(py)
+}
+
 #[pyfunction]
 fn schema_dict<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
     let s = crate::schema::Schema::load(path)
@@ -621,6 +631,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(schema_dict, m)?)?;
     m.add_function(wrap_pyfunction!(action_table, m)?)?;
+    m.add_function(wrap_pyfunction!(action_table_v1, m)?)?;
     m.add_class::<Engine>()?;
     m.add_class::<RenderSession>()?;
     Ok(())

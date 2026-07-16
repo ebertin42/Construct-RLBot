@@ -5,7 +5,7 @@ import time
 import numpy as np
 import torch
 
-from construct._engine import Engine, schema_dict
+from construct._engine import Engine, action_table_v1, schema_dict
 from construct.learn.config import TrainConfig
 from construct.learn.gae import compute_gae
 from construct.learn.kickstart import (
@@ -15,6 +15,7 @@ from construct.learn.kickstart import (
     kickstart_losses,
 )
 from construct.learn.model import PolicyValueNet
+from construct.learn.model_v1 import EntityPolicyNet
 from construct.learn.ppo import ppo_update
 
 
@@ -22,20 +23,33 @@ class Trainer:
     def __init__(self, cfg: TrainConfig, _state: dict | None = None):
         self.cfg = cfg
         self.schema = schema_dict(cfg.schema_path)
+        self.is_v1 = self.schema["version"] == 1
+        # Checkpoint/config schema guard: a checkpoint only makes sense with
+        # the net family it was trained as. In particular a v0 MLP state dict
+        # can NOT seed a v1 EntityPolicyNet (different obs, different net) --
+        # the sanctioned v0->v1 bridge is kickstart distillation, where the
+        # v0 checkpoint is the frozen TEACHER ([kickstart].teacher in the
+        # config / resume_train.py --kickstart-teacher), not the resume state.
+        if _state is not None:
+            ck_ver = int(_state.get("schema_version", 0))
+            if ck_ver != self.schema["version"]:
+                raise ValueError(
+                    f"checkpoint schema_version={ck_ver} does not match config "
+                    f"schema version={self.schema['version']} ({cfg.schema_path}). "
+                    "A v0 MLP checkpoint cannot seed a v1 entity net directly; "
+                    "start a fresh v1 run and pass the v0 checkpoint as the "
+                    "kickstart teacher ([kickstart].teacher / "
+                    "resume_train.py --kickstart-teacher) instead."
+                )
         # Kickstart distillation (T7): only meaningful for a v1-schema run
-        # with a non-empty [kickstart] block. `emit_v0_obs` asks the engine
-        # to also record the legacy 94-float obs per collected step (T6),
-        # which the frozen v0 MLP teacher needs. For v0-schema runs -- the
-        # entire production path today -- this is always False, so the
+        # with a [kickstart] block that names a teacher (the config template
+        # ships with `teacher` commented out, so a bare `steps=` block stays
+        # inactive). `emit_v0_obs` asks the engine to also record the legacy
+        # 94-float obs per collected step (T6), which the frozen v0 MLP
+        # teacher needs. For v0-schema runs this is always False, so the
         # Engine constructor call, collect() output, and run() loop below
         # are byte-identical to pre-T7 behavior.
-        #
-        # `emit_v0_obs` is only passed when actually needed (kickstart_active):
-        # the locally-built `_engine` extension in this checkout predates
-        # T6's `emit_v0_obs`/`net_heads` kwargs (rebuilding it is out of
-        # scope here -- no maturin/pip installs per repo hard rules), so
-        # passing it unconditionally would break every v0 Trainer today.
-        kickstart_active = bool(cfg.kickstart) and self.schema["version"] == 1
+        kickstart_active = bool(cfg.kickstart.get("teacher")) and self.is_v1
         engine_kwargs = dict(
             num_arenas=cfg.env["num_arenas"], blue=cfg.env["blue"], orange=cfg.env["orange"],
             schema_path=cfg.schema_path, reward_config_path=cfg.reward_config_path,
@@ -43,23 +57,32 @@ class Trainer:
             team_size_weights=cfg.env.get("team_size_weights"),
             curriculum_config_path=cfg.curriculum_config_path or None,
         )
+        if self.is_v1:
+            # candle rebuilds attention from the state dict; the head count is
+            # not recoverable from tensor shapes, so it rides along explicitly.
+            engine_kwargs["net_heads"] = int(cfg.net["heads"])
         if kickstart_active:
             engine_kwargs["emit_v0_obs"] = True
         self.engine = Engine(**engine_kwargs)
         dev = cfg.run.get("device", "cuda")
         self.device = torch.device(dev if (dev != "cuda" or torch.cuda.is_available()) else "cpu")
-        self.net = PolicyValueNet(
-            self.engine.obs_size, self.engine.action_count, tuple(cfg.net["hidden"])
-        ).to(self.device)
+        if self.is_v1:
+            # Net dims come from [net] (T1 gate: 128/2/4/512 launch config);
+            # the 92-row v1.1 action table is compiled into the engine and is
+            # carried by the net as a non-trainable buffer (set_weights hands
+            # it back to candle with the rest of the state dict).
+            self.net = EntityPolicyNet(
+                d_model=int(cfg.net["d_model"]), layers=int(cfg.net["layers"]),
+                heads=int(cfg.net["heads"]), ff=int(cfg.net["ff"]),
+                action_table=action_table_v1(),
+            ).to(self.device)
+        else:
+            self.net = PolicyValueNet(
+                self.engine.obs_size, self.engine.action_count, tuple(cfg.net["hidden"])
+            ).to(self.device)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.ppo["lr"])
         self.total_steps = 0
 
-        # NOTE: self.net above is still the v0 PolicyValueNet even when
-        # kickstart_active -- constructing the v1 EntityPolicyNet and
-        # reshaping collect()'s ents/mask/query/prev output into PPO
-        # minibatches is T8's job (v1 batch plumbing). Until T8 lands,
-        # collect() raises on a v1 schema before this hook ever fires, so
-        # the block below is a hook POINT, not a working v1 training path.
         self.kickstart: dict | None = None
         if kickstart_active:
             self.kickstart = {
@@ -168,7 +191,8 @@ class Trainer:
         print(f"league: opponents {names}", flush=True)
 
     def collect(self, T: int) -> dict:
-        D = self.engine.obs_size
+        # state_dict() includes non-trainable buffers (v1's `action_table`)
+        # by design -- the engine's candle net consumes them too.
         self.engine.set_weights(
             {k: v.detach().cpu().numpy().astype(np.float32)
              for k, v in self.net.state_dict().items()}
@@ -189,17 +213,28 @@ class Trainer:
             self.cfg.ppo["gamma"], self.cfg.ppo["lam"],
         )
         dev = self.device
-        # NOTE (T7/T8 seam): this reshape assumes a v0-shaped `out["obs"]` --
-        # a v1 schema returns ents/mask/query/prev instead (see engine.rs),
-        # and reshaping THOSE into PPO minibatches is T8's "v1 batch
-        # plumbing" scope, not this task's. `obs_v0` below is the one v1
-        # addition T7 needs (kickstart teacher input) and is a no-op for v0
-        # (the engine never sets the "obs_v0" key unless emit_v0_obs=True,
-        # which requires a v1 schema -- see lib.rs).
-        flat_obs = torch.as_tensor(out["obs"].reshape(T * N, D), device=dev)
+        # Obs plumbing dispatch. v0: the flat (T,N,94) tensor, exactly as
+        # always. v1: the engine returns entity tensors instead of a flat obs
+        # (see lib.rs collect) -- flatten each over (T,N) and pack them as a
+        # dict whose KEYS MATCH EntityPolicyNet.evaluate/forward's keyword
+        # parameters (ents/mask/query/prev); ppo_update indexes each tensor
+        # by the same minibatch permutation and splats the dict into
+        # net.evaluate. Everything GAE needs (rewards/values/final_values/
+        # flags) is obs-layout-independent, and the engine computes value
+        # bootstraps (final_values for truncations, last_values) in-engine
+        # for both modes, so nothing else changes shape.
+        if self.is_v1:
+            obs = {
+                "ents": torch.as_tensor(out["ents"].reshape(T * N, *out["ents"].shape[2:]), device=dev),
+                "mask": torch.as_tensor(out["mask"].reshape(T * N, out["mask"].shape[2]), device=dev),
+                "query": torch.as_tensor(out["query"].reshape(T * N, out["query"].shape[2]), device=dev),
+                "prev": torch.as_tensor(out["prev"].reshape(T * N, out["prev"].shape[2]), device=dev),
+            }
+        else:
+            obs = torch.as_tensor(out["obs"].reshape(T * N, self.engine.obs_size), device=dev)
         done_frac = (out["terminated"] | out["truncated"]).sum()
         result = {
-            "obs": flat_obs,
+            "obs": obs,
             "actions": torch.as_tensor(out["actions"].reshape(-1), device=dev),
             "logprobs": torch.as_tensor(out["logprobs"].reshape(-1), device=dev),
             "advantages": torch.as_tensor(adv, device=dev).reshape(-1),
@@ -248,15 +283,10 @@ class Trainer:
                         # model.py/model_v1.py's evaluate() signature to also
                         # return logits; traded deliberately for keeping those
                         # files (and ppo.py's default no-hook path) untouched.
-                        # NOTE: self.net is still the v0 PolicyValueNet until T8
-                        # builds the v1 EntityPolicyNet + batch reshaping --
-                        # this closure's `batch["ents"/"mask"/"query"/"prev"]`
-                        # keys don't exist yet either, so it is unreachable
-                        # until T8 lands (collect() raises on a v1 schema
-                        # before returning, see the NOTE in collect()).
+                        # Kickstart implies v1, so batch["obs"] is the entity
+                        # dict (keys match EntityPolicyNet.forward's params).
                         s_logits, s_value = self.net(
-                            batch["ents"][idx], batch["mask"][idx],
-                            batch["query"][idx], batch["prev"][idx],
+                            **{k: v[idx] for k, v in batch["obs"].items()}
                         )
                         kl, v_mse = kickstart_losses(s_logits, s_value.squeeze(-1), _tl[idx], _tv[idx])
                         return _lk * kl + _lv * v_mse, {"kick_kl": kl.item()}
