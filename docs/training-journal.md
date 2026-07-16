@@ -89,3 +89,15 @@ eval_metrics live). v4 re-parse was STALLED (≥10k batch gate vs completed pull
 fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6:
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
+
+### 2026-07-17 ~19:45 (monitor)
+| steps | sps | kick_kl | lambda_k | ent | goals/min |
+|---|---|---|---|---|---|
+| 321.8M | 5,467 | 0.40 | 0.357 | 3.26 | **1.79** (ck 320M) |
+Trend: back above teacher (1.56) after the 1.40 dip; KL 0.37→0.40 post-restart
+wobble, inside noise. NOTE: this eval logged 4 contained blowups, all "arena
+rebuilt" — pre-fix, those arenas ran dead-ball for the rest of the tape,
+meaning EARLIER EVAL READINGS (1.71 / 1.40 / 1.81) carried dead-ball
+depression noise; the 1.40 "dip" was likely artifact. Expect eval variance to
+tighten from here. Run-B resumed on fixed engine, 3.528B (sps depressed by
+parse sweep, recovers ~21:00). Re-parse batch_0008/12, ETA ~21:00 → B4.
