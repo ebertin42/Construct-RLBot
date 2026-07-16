@@ -169,7 +169,15 @@ class Trainer:
             print(f"league: failed to reload registry from disk ({e}), "
                   "keeping previous snapshot", flush=True)
         rng = random.Random(hash((self.cfg.env["seed"], it)))
-        picks = L["choose"](L["registry"], k=L["slots"], rng=rng)
+        # Belt: only ever consider opponents tagged with this trainer's own
+        # schema_version (self.schema["version"], derived from cfg.schema_path)
+        # -- v0 and v1 policies can never play each other (different obs). The
+        # try/except below (skipping bad loads, degrading set_opponents
+        # failures to "keep previous assignment") is the suspenders: it still
+        # catches anything that slips past this filter (e.g. a hand-edited
+        # registry, or a future schema_version this filter doesn't know about).
+        picks = L["choose"](L["registry"], k=L["slots"], rng=rng,
+                             schema_version=self.schema["version"])
         if not picks:
             self._assignment = None
             print("league: no opponents available (pure self-play)", flush=True)
