@@ -3,7 +3,13 @@
 The engine's reward stream is used purely as a scoring tape: with reward_v0
 (goal=10, bias 0, shaping << 9.4) a learner-row reward >= 9.4 means A scored,
 <= -9.4 means B scored. Matches always use reward_v0 regardless of what the
-policies were trained on.
+policies were trained on -- reward is computed by reward::compute() from raw
+game state (engine/src/episode.rs step_impl), never from the obs encoding, so
+the tape trick is schema-independent and holds unchanged for a v1 engine.
+
+v0 and v1 policies can NEVER play each other (different obs contracts): each
+MatchRunner is built for exactly one schema_version, and play_entries() below
+is the hard guard against feeding it a cross-schema pair.
 """
 import numpy as np
 import torch
@@ -16,23 +22,43 @@ from construct._engine import Engine
 # inside the [0.55, 9.45] gap on both sides.
 GOAL_THRESHOLD = 9.4
 
+_SCHEMA_PATHS = {0: "schema/v0.toml", 1: "schema/v1.toml"}
+
 
 def load_sd(ck_path):
     ck = torch.load(ck_path, map_location="cpu", weights_only=False)
+    # Generic tensor->numpy conversion: works unchanged for both v0
+    # (PolicyValueNet) and v1 (EntityPolicyNet, whose state_dict also carries
+    # the non-trainable `action_table` buffer -- the engine's v1 EntityPolicy
+    # requires and consumes that key, see engine/src/policy_v1.rs).
     return {k: v.numpy().astype(np.float32) for k, v in ck["model"].items()}
 
 
 class MatchRunner:
-    def __init__(self, num_arenas=8, seed=0, reward_config="configs/reward_v0.toml", mode=1):
+    def __init__(self, num_arenas=8, seed=0, reward_config="configs/reward_v0.toml", mode=1,
+                 schema_version=0, net_heads=4):
         # Goal events pay every learner agent on the scoring team in that arena.
         # At mode=1 (1v1) each opponent arena has exactly one learner row (blue),
         # so the GOAL_THRESHOLD count below is exact. 2v2+ would multi-count (both
         # teammates get paid the same goal reward) -- divide by team size when that
         # arrives. YAGNI today: assert mode==1 until then.
         assert mode == 1, "MatchRunner only supports 1v1 (mode=1); 2v2+ would multi-count goals"
-        self.eng = Engine(num_arenas=num_arenas, blue=mode, orange=mode,
-                          schema_path="schema/v0.toml", reward_config_path=reward_config,
-                          seed=seed)
+        assert schema_version in _SCHEMA_PATHS, (
+            f"MatchRunner schema_version must be one of {sorted(_SCHEMA_PATHS)}, "
+            f"got {schema_version}"
+        )
+        self.schema_version = schema_version
+        engine_kwargs = dict(
+            num_arenas=num_arenas, blue=mode, orange=mode,
+            schema_path=_SCHEMA_PATHS[schema_version], reward_config_path=reward_config,
+            seed=seed,
+        )
+        if schema_version == 1:
+            # candle rebuilds attention from the raw state dict; head count is
+            # not recoverable from tensor shapes alone (same reason Trainer
+            # passes it -- see train.py's engine_kwargs["net_heads"]).
+            engine_kwargs["net_heads"] = net_heads
+        self.eng = Engine(**engine_kwargs)
         self.assignment = [0] * num_arenas
 
     def play(self, sd_a, sd_b, steps=2700):
@@ -50,3 +76,29 @@ class MatchRunner:
         goals_a = int((rew >= GOAL_THRESHOLD).sum())
         goals_b = int((rew <= -GOAL_THRESHOLD).sum())
         return goals_a, goals_b
+
+
+def play_entries(mr: "MatchRunner", entry_a: dict, entry_b: dict, steps: int = 2700):
+    """Run a match between two registry entries via `mr`, refusing to pit
+    different schema_version checkpoints against each other.
+
+    v0 and v1 obs are structurally different (flat 94-float vector vs entity
+    tensors) -- a cross-schema match would either crash deep in the engine
+    boundary (missing/extra state_dict keys) or, worse, silently misbehave.
+    This checks entry metadata *before* touching disk or the engine, so the
+    refusal is immediate and doesn't depend on `mr` being usable at all
+    (checked first, ahead of the mr.schema_version comparison below).
+    """
+    va = entry_a.get("schema_version", 0)
+    vb = entry_b.get("schema_version", 0)
+    if va != vb:
+        raise ValueError(
+            f"cross-schema match refused: {entry_a['ck']!r} is schema_version={va}, "
+            f"{entry_b['ck']!r} is schema_version={vb}"
+        )
+    if va != mr.schema_version:
+        raise ValueError(
+            f"entry schema_version={va} does not match MatchRunner schema_version="
+            f"{mr.schema_version}"
+        )
+    return mr.play(load_sd(entry_a["ck"]), load_sd(entry_b["ck"]), steps=steps)
