@@ -63,6 +63,20 @@ fn writes_loadable_shard_with_schema() {
     assert_eq!(cars_action.shape()[2], 8);
     assert_eq!(cars_action.shape()[2], cars_action_columns.len());
 
+    // --- cars_action_idx [T, P] i64: projected 92-table action index (Task B2) ---
+    let action_table_size = sidecar["action_table_size"].as_u64().unwrap() as usize;
+    assert_eq!(action_table_size, 92, "v1 action table has 92 rows");
+    let cars_action_idx: ndarray::Array2<i64> = npz.by_name("cars_action_idx.npy").unwrap();
+    assert_eq!(
+        cars_action_idx.shape(),
+        &[cars_action.shape()[0], num_players],
+        "cars_action_idx must be [T, P]"
+    );
+    assert!(
+        cars_action_idx.iter().all(|&v| (0..action_table_size as i64).contains(&v)),
+        "every cars_action_idx value must be in [0, {action_table_size})"
+    );
+
     let player_teams: ndarray::Array1<i64> = npz.by_name("player_teams.npy").unwrap();
     assert_eq!(player_teams.len(), num_players);
 
@@ -177,6 +191,8 @@ fn stride_subsamples_ticks_and_preserves_tick_index_semantics() {
     assert_eq!(cars_state.shape()[0], num_ticks_8);
     let cars_action: Array3<f32> = npz.by_name("cars_action.npy").unwrap();
     assert_eq!(cars_action.shape()[0], num_ticks_8);
+    let cars_action_idx: ndarray::Array2<i64> = npz.by_name("cars_action_idx.npy").unwrap();
+    assert_eq!(cars_action_idx.shape()[0], num_ticks_8);
     let is_boundary: ndarray::Array1<i64> = npz.by_name("is_boundary.npy").unwrap();
     assert_eq!(is_boundary.len(), num_ticks_8);
 }

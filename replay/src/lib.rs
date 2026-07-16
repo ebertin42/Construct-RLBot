@@ -1,5 +1,6 @@
 pub mod frames;
 pub mod meta;
+pub mod project;
 pub mod pyr;
 pub mod reconstruct;
 pub mod reset_pool;
