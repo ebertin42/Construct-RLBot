@@ -5,10 +5,17 @@ import time
 import numpy as np
 import torch
 
-from construct._engine import Engine, schema_dict
+from construct._engine import Engine, action_table_v1, schema_dict
 from construct.learn.config import TrainConfig
 from construct.learn.gae import compute_gae
+from construct.learn.kickstart import (
+    TEACHER_OBS_SIZE,
+    KickstartSchedule,
+    KickstartTeacher,
+    kickstart_losses,
+)
 from construct.learn.model import PolicyValueNet
+from construct.learn.model_v1 import EntityPolicyNet
 from construct.learn.ppo import ppo_update
 
 
@@ -16,20 +23,76 @@ class Trainer:
     def __init__(self, cfg: TrainConfig, _state: dict | None = None):
         self.cfg = cfg
         self.schema = schema_dict(cfg.schema_path)
-        self.engine = Engine(
+        self.is_v1 = self.schema["version"] == 1
+        # Checkpoint/config schema guard: a checkpoint only makes sense with
+        # the net family it was trained as. In particular a v0 MLP state dict
+        # can NOT seed a v1 EntityPolicyNet (different obs, different net) --
+        # the sanctioned v0->v1 bridge is kickstart distillation, where the
+        # v0 checkpoint is the frozen TEACHER ([kickstart].teacher in the
+        # config / resume_train.py --kickstart-teacher), not the resume state.
+        if _state is not None:
+            ck_ver = int(_state.get("schema_version", 0))
+            if ck_ver != self.schema["version"]:
+                raise ValueError(
+                    f"checkpoint schema_version={ck_ver} does not match config "
+                    f"schema version={self.schema['version']} ({cfg.schema_path}). "
+                    "A v0 MLP checkpoint cannot seed a v1 entity net directly; "
+                    "start a fresh v1 run and pass the v0 checkpoint as the "
+                    "kickstart teacher ([kickstart].teacher / "
+                    "resume_train.py --kickstart-teacher) instead."
+                )
+        # Kickstart distillation (T7): only meaningful for a v1-schema run
+        # with a [kickstart] block that names a teacher (the config template
+        # ships with `teacher` commented out, so a bare `steps=` block stays
+        # inactive). `emit_v0_obs` asks the engine to also record the legacy
+        # 94-float obs per collected step (T6), which the frozen v0 MLP
+        # teacher needs. For v0-schema runs this is always False, so the
+        # Engine constructor call, collect() output, and run() loop below
+        # are byte-identical to pre-T7 behavior.
+        kickstart_active = bool(cfg.kickstart.get("teacher")) and self.is_v1
+        engine_kwargs = dict(
             num_arenas=cfg.env["num_arenas"], blue=cfg.env["blue"], orange=cfg.env["orange"],
             schema_path=cfg.schema_path, reward_config_path=cfg.reward_config_path,
             seed=cfg.env["seed"],
             team_size_weights=cfg.env.get("team_size_weights"),
             curriculum_config_path=cfg.curriculum_config_path or None,
         )
+        if self.is_v1:
+            # candle rebuilds attention from the state dict; the head count is
+            # not recoverable from tensor shapes, so it rides along explicitly.
+            engine_kwargs["net_heads"] = int(cfg.net["heads"])
+        if kickstart_active:
+            engine_kwargs["emit_v0_obs"] = True
+        self.engine = Engine(**engine_kwargs)
         dev = cfg.run.get("device", "cuda")
         self.device = torch.device(dev if (dev != "cuda" or torch.cuda.is_available()) else "cpu")
-        self.net = PolicyValueNet(
-            self.engine.obs_size, self.engine.action_count, tuple(cfg.net["hidden"])
-        ).to(self.device)
+        if self.is_v1:
+            # Net dims come from [net] (T1 gate: 128/2/4/512 launch config);
+            # the 92-row v1.1 action table is compiled into the engine and is
+            # carried by the net as a non-trainable buffer (set_weights hands
+            # it back to candle with the rest of the state dict).
+            self.net = EntityPolicyNet(
+                d_model=int(cfg.net["d_model"]), layers=int(cfg.net["layers"]),
+                heads=int(cfg.net["heads"]), ff=int(cfg.net["ff"]),
+                action_table=action_table_v1(),
+            ).to(self.device)
+        else:
+            self.net = PolicyValueNet(
+                self.engine.obs_size, self.engine.action_count, tuple(cfg.net["hidden"])
+            ).to(self.device)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.ppo["lr"])
         self.total_steps = 0
+
+        self.kickstart: dict | None = None
+        if kickstart_active:
+            self.kickstart = {
+                "teacher": KickstartTeacher(cfg.kickstart["teacher"], device=str(self.device)),
+                "schedule": KickstartSchedule(
+                    lambda_k0=float(cfg.kickstart.get("lambda_k", 1.0)),
+                    kickstart_steps=int(cfg.kickstart.get("steps", 500_000_000)),
+                    lambda_v=float(cfg.kickstart.get("lambda_v", 0.5)),
+                ),
+            }
 
         # Opponent-pool ("league") integration. Disabled by default (cfg.league == {}
         # or {"enabled": False}) -> self._assignment stays None -> engine.collect's
@@ -92,7 +155,11 @@ class Trainer:
         run at a refresh boundary: each pick is loaded independently, bad
         ones are skipped with a warning, and if every pick fails the
         previous assignment (and opponent weights already in the engine)
-        is left in place rather than falling back to an empty pool.
+        is left in place rather than falling back to an empty pool. The same
+        holds if every pick loads fine but `engine.set_opponents` itself
+        raises (e.g. an opponent state dict that's incompatible with the
+        engine's current obs mode) -- that's also caught and logged, leaving
+        the previous assignment and in-engine opponent weights untouched.
         """
         L = self._league
         from construct.league.registry import Registry
@@ -117,7 +184,15 @@ class Trainer:
         if not sds:
             print("league: all picks failed to load, keeping previous assignment", flush=True)
             return
-        self.engine.set_opponents(sds)
+        try:
+            self.engine.set_opponents(sds)
+        except Exception as e:
+            # A misconfigured/incompatible opponent pool (e.g. a future
+            # league-on-v1 obs/schema mismatch) must degrade to "keep
+            # whatever assignment and engine-side opponent weights were
+            # already in place" rather than take down the whole run.
+            print(f"league: set_opponents failed ({e}), keeping previous assignment", flush=True)
+            return
         n = self.num_arenas
         n_opp = round(L["frac"] * n)
         a = [-1] * n
@@ -128,7 +203,8 @@ class Trainer:
         print(f"league: opponents {names}", flush=True)
 
     def collect(self, T: int) -> dict:
-        D = self.engine.obs_size
+        # state_dict() includes non-trainable buffers (v1's `action_table`)
+        # by design -- the engine's candle net consumes them too.
         self.engine.set_weights(
             {k: v.detach().cpu().numpy().astype(np.float32)
              for k, v in self.net.state_dict().items()}
@@ -149,10 +225,28 @@ class Trainer:
             self.cfg.ppo["gamma"], self.cfg.ppo["lam"],
         )
         dev = self.device
-        flat_obs = torch.as_tensor(out["obs"].reshape(T * N, D), device=dev)
+        # Obs plumbing dispatch. v0: the flat (T,N,94) tensor, exactly as
+        # always. v1: the engine returns entity tensors instead of a flat obs
+        # (see lib.rs collect) -- flatten each over (T,N) and pack them as a
+        # dict whose KEYS MATCH EntityPolicyNet.evaluate/forward's keyword
+        # parameters (ents/mask/query/prev); ppo_update indexes each tensor
+        # by the same minibatch permutation and splats the dict into
+        # net.evaluate. Everything GAE needs (rewards/values/final_values/
+        # flags) is obs-layout-independent, and the engine computes value
+        # bootstraps (final_values for truncations, last_values) in-engine
+        # for both modes, so nothing else changes shape.
+        if self.is_v1:
+            obs = {
+                "ents": torch.as_tensor(out["ents"].reshape(T * N, *out["ents"].shape[2:]), device=dev),
+                "mask": torch.as_tensor(out["mask"].reshape(T * N, out["mask"].shape[2]), device=dev),
+                "query": torch.as_tensor(out["query"].reshape(T * N, out["query"].shape[2]), device=dev),
+                "prev": torch.as_tensor(out["prev"].reshape(T * N, out["prev"].shape[2]), device=dev),
+            }
+        else:
+            obs = torch.as_tensor(out["obs"].reshape(T * N, self.engine.obs_size), device=dev)
         done_frac = (out["terminated"] | out["truncated"]).sum()
-        return {
-            "obs": flat_obs,
+        result = {
+            "obs": obs,
             "actions": torch.as_tensor(out["actions"].reshape(-1), device=dev),
             "logprobs": torch.as_tensor(out["logprobs"].reshape(-1), device=dev),
             "advantages": torch.as_tensor(adv, device=dev).reshape(-1),
@@ -161,6 +255,11 @@ class Trainer:
             "ep_reward_mean": float(out["rewards"].sum() / max(1, done_frac)),
             "n_agents": N,
         }
+        if "obs_v0" in out:
+            result["obs_v0"] = torch.as_tensor(
+                out["obs_v0"].reshape(T * N, TEACHER_OBS_SIZE), device=dev
+            )
+        return result
 
     def run(self, max_iterations: int | None = None):
         it = 0
@@ -170,9 +269,44 @@ class Trainer:
             if self._league and it % self._league["refresh"] == 0:
                 self._refresh_opponents(it)
             batch = self.collect(p["rollout_steps"])
+
+            # --- kickstart distillation hook (T7) -------------------------------
+            # Guarded on self.kickstart (None for every v0 run, and for any v1
+            # run without a [kickstart] config) AND on "obs_v0" actually being
+            # in the batch -- collect() only puts it there when the engine was
+            # built with emit_v0_obs=True, i.e. exactly the kickstart_active
+            # case from __init__. `extra_loss_fn` stays None otherwise, which
+            # makes ppo_update's new hook parameter a complete no-op: v0 runs
+            # are byte-identical to pre-T7 behavior.
+            extra_loss_fn = None
+            lambda_k = lambda_v = 0.0
+            if self.kickstart is not None and "obs_v0" in batch:
+                lambda_k, lambda_v = self.kickstart["schedule"].coef(self.total_steps)
+                if lambda_k > 0.0 or lambda_v > 0.0:
+                    with torch.no_grad():
+                        t_logits, t_values = self.kickstart["teacher"].logits_values(batch["obs_v0"])
+
+                    def extra_loss_fn(idx, _lk=lambda_k, _lv=lambda_v, _tl=t_logits, _tv=t_values):
+                        # Re-runs the student net's forward directly (rather than
+                        # threading logits out through evaluate()/Categorical) to
+                        # get the full [B,92] distribution KL needs -- evaluate()
+                        # only returns the sampled action's logprob. This costs a
+                        # second forward pass per minibatch versus changing
+                        # model.py/model_v1.py's evaluate() signature to also
+                        # return logits; traded deliberately for keeping those
+                        # files (and ppo.py's default no-hook path) untouched.
+                        # Kickstart implies v1, so batch["obs"] is the entity
+                        # dict (keys match EntityPolicyNet.forward's params).
+                        s_logits, s_value = self.net(
+                            **{k: v[idx] for k, v in batch["obs"].items()}
+                        )
+                        kl, v_mse = kickstart_losses(s_logits, s_value.squeeze(-1), _tl[idx], _tv[idx])
+                        return _lk * kl + _lv * v_mse, {"kick_kl": kl.item()}
+
             stats = ppo_update(
                 self.net, self.opt, batch, clip=p["clip"], entropy_coef=p["entropy_coef"],
                 value_coef=p["value_coef"], epochs=p["epochs"], minibatch_size=p["minibatch_size"],
+                extra_loss_fn=extra_loss_fn,
             )
             # Steps count LEARNER transitions (batch["n_agents"] == out["learner_agents"]
             # from collect()), not the raw engine agent count -- opponent arenas
@@ -182,13 +316,15 @@ class Trainer:
             it += 1
             if it % self.cfg.run.get("log_every_iters", 1) == 0:
                 sps = n / (time.perf_counter() - t0)
-                print(
+                msg = (
                     f"iter {it} steps {self.total_steps:,} sps {sps:,.0f} "
                     f"ep_rew {batch['ep_reward_mean']:.3f} "
                     f"pi_loss {stats['policy_loss']:.4f} v_loss {stats['value_loss']:.4f} "
-                    f"ent {stats['entropy']:.3f} clip {stats['clip_frac']:.3f}",
-                    flush=True,
+                    f"ent {stats['entropy']:.3f} clip {stats['clip_frac']:.3f}"
                 )
+                if extra_loss_fn is not None:
+                    msg += f" kick_kl {stats.get('kick_kl', 0.0):.4f} lambda_k {lambda_k:.3f}"
+                print(msg, flush=True)
             if it % self.cfg.run.get("save_every_iters", 20) == 0:
                 os.makedirs(self.cfg.run["checkpoint_dir"], exist_ok=True)
                 self.save_checkpoint(

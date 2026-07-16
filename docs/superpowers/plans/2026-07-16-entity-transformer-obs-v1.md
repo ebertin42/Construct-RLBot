@@ -13,7 +13,7 @@
 - **Schema v1 is a separate file (`schema/v1.toml`)**; v0 checkpoints/paths never change meaning. Engine selects behavior by `schema.version` (0 = legacy MLP path, byte-identical; 1 = entity path). All v0 tests keep passing untouched.
 - **Fixed-config determinism contract** (seed, num_arenas, num_threads) applies to the v1 path exactly as v0.
 - **Action table v1.1 = the existing 90 rows APPENDED with 2 stall rows** `[0,0,0,1,-1,1,0,1]` and `[0,0,0,-1,1,1,0,1]` (rlgym-tools-verified stall inputs; dodgeDir = (-pitch, yaw+roll) ⇒ yaw=-roll ⇒ zero impulse) → **TABLE_SIZE_V1 = 92**. Append-only: indices 0-89 keep their v0 meaning (kickstart teacher logits map 1:1 onto the first 90 slots). Wavedash needs no entry (hb already auto-set on jump+torque rows); flip reset is a state event, not an input.
-- **Net dims are config, not constants** (`[net] d_model, layers, heads, ff` in the train config): bench task T1 picks the launch size; spec's 256/4/8 is the ceiling to grow into, Nexto-proven 128/2/4/ff512 is the floor.
+- **Net dims are config, not constants** (`[net] d_model, layers, heads, ff`). **T1 GATE RESULT (2026-07-16): launch config = 128/2/4/512** — 93.4 ms/forward B=192 single-thread => ~25-33k projected sps at 16 threads (marginal pass); 192/3 and 256/4 fail hard (~10k / ~4k). T8's real 16-thread collect bench validates before deploy; fallback if it misses: GPU inference server on the remote 3060 or accept reduced sps through the kickstart phase. 256/4/8 remains the growth ceiling (needs GPU rollouts).
 - **No deploy**: build/test/commit only; trainer swaps are a separate user-gated decision.
 - `uv pip` (no pip binary); niced builds/benches; never touch training procs, checkpoints*/, league/registry.jsonl, remote.
 
@@ -39,7 +39,7 @@ All positions/velocities normalized as v0 (pos·1/2300, vel·1/2300, ang_vel·1/
 
 **Entity count: `MAX_ENT = 17`** = 1 ball + 6 cars + 6 big pads + 4 ball-pred. Absent cars → zero row + mask=1 (ignored). Order: self, mates (≤2), opps (≤3), ball, pads (fixed arena order), ball-pred (ascending τ).
 
-**Query/self row: 64 floats** (`Q_FEAT = 64`): self entity's 26 + 34 small-pad timers (0..1, fixed arena order, mirrored pairing) + prev-action index history is NOT here — prev actions enter as **4 floats**: bias… — no: exact split = 26 (self entity) + 34 (pad timers) + 3 (scoreboard: score_diff/5 clamped, time_frac, overtime) + 1 (reserved) = 64. **Prev-5 actions** are appended to the *pooled* embedding, not the query row (5 × one-hot-92 is too wide): they enter as 5 embedded action vectors via the same action-embedding MLP as the head, summed with learned position weights — implemented inside the net, fed as `prev_actions [B,5] int64`.
+**Query/self row: 64 floats** (`Q_FEAT = 64`): exact split = 26 (self entity row) + 34 (small-pad timers, 0..1, fixed arena order, mirrored pairing) + 3 (scoreboard: score_diff/5 clamped, time_frac, overtime) + 1 (reserved) = 64. **Prev-5 actions** are appended to the *pooled* embedding, not the query row (5 × one-hot-92 is too wide): they enter as 5 embedded action vectors via the same action-embedding MLP as the head, summed with learned position weights — implemented inside the net, fed as `prev_actions [B,5] int64`.
 
 **Net I/O contract (both Rust and Python):**
 `forward(entities [B,17,26], mask [B,17] bool, query [B,64], prev_actions [B,5]) -> (logits [B,92], value [B,1])`

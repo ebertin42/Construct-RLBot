@@ -1,0 +1,16 @@
+version = 1
+obs_size = 0
+action_table = "construct_92_v1"
+action_count = 92
+tick_skip = 8
+
+[obs_v1]
+max_ent = 17
+ent_feat = 26
+q_feat = 64
+prev_actions = 5
+
+[normalization]
+pos_norm = 0.00043478260869565216      # 1/2300
+vel_norm = 0.00043478260869565216      # 1/2300
+ang_vel_norm = 0.18181818181818182     # 1/5.5
