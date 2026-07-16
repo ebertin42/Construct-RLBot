@@ -10,8 +10,10 @@ for pass in $(seq 1 40); do
         b=$(basename "$d")
         [ -f "data/shards_v4/.${b}.parsed_v4" ] && continue
         n=$(ls "$d" 2>/dev/null | wc -l)
-        if [ "$n" -ge 10000 ]; then
-            echo "$(date +%H:%M:%S) [$b] complete ($n) — v4 parsing..."
+        # pull-only top-up finished 2026-07-16 (GC2 CORPUS COMPLETE): every batch is
+        # final, so parse any non-empty unmarked batch (was: -ge 10000 while pulling)
+        if [ "$n" -gt 0 ]; then
+            echo "$(date +%H:%M:%S) [$b] final ($n) — v4 parsing..."
             nice -n 10 ./target/release/replay-parse --input-dir "$d" --output-dir data/shards_v4 \
                 --reset-pool-out data/reset_pool_v4.jsonl --reset-samples-per-replay 16 \
                 --min-team-size 1 --stride 8 && touch "data/shards_v4/.${b}.parsed_v4"
