@@ -10,6 +10,10 @@ name = "construct_replay"
 name = "replay-parse"
 path = "src/bin/replay_parse.rs"
 
+[[bin]]
+name = "bc-export"
+path = "src/bin/bc_export.rs"
+
 [dependencies]
 boxcars = "0.11.5"
 subtr-actor = "1.2.0"

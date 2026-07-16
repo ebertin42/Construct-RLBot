@@ -199,8 +199,12 @@ fn rotate_vector(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
 }
 
 /// Build a RocketSim `RotMat` (forward/right/up, in world space) from a
-/// `[x, y, z, w]` quaternion.
-fn quat_to_rotmat(q: [f32; 4]) -> RotMat {
+/// `[x, y, z, w]` quaternion. `pub(crate)` (not private like its
+/// `rotate_vector` helper) because `bc_obs` must invert shard-stored
+/// quaternions with EXACTLY the construction that `rotmat_to_quat` below is
+/// the inverse of — a re-derived copy drifting out of sync would silently
+/// skew every exported obs rotation.
+pub(crate) fn quat_to_rotmat(q: [f32; 4]) -> RotMat {
     let f = rotate_vector(q, [1.0, 0.0, 0.0]);
     let r = rotate_vector(q, [0.0, 1.0, 0.0]);
     let u = rotate_vector(q, [0.0, 0.0, 1.0]);
