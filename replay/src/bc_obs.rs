@@ -399,7 +399,9 @@ pub fn export_shard_file(
     let tmp_path = out_dir.join(format!("bc_{stem}.npz.tmp"));
     let file = std::fs::File::create(&tmp_path)
         .map_err(|e| format!("create {}: {e}", tmp_path.display()))?;
-    let mut npz = NpzWriter::new(file);
+    // compressed: obs tensors are ~9x deflate-redundant (masked entity slots),
+    // and full-corpus f32 would be ~1.6 TB uncompressed vs ~415 GB free
+    let mut npz = NpzWriter::new_compressed(file);
     npz.add_array("ents", &bc.ents).map_err(|e| e.to_string())?;
     npz.add_array("mask", &bc.mask).map_err(|e| e.to_string())?;
     npz.add_array("query", &bc.query).map_err(|e| e.to_string())?;
