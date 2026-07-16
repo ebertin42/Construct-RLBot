@@ -1,0 +1,26 @@
+# BC pretrain on the bc-export corpus (Task B5, docs/superpowers/plans/
+# 2026-07-17-bc-pretrain.md). Net dims match train_v1.toml's launch config
+# (128/2/4/512, ~488k params) so the resulting checkpoint drops into every
+# v1 tool (eval_metrics.py, watch.py, league) unchanged.
+data_dir = "data/bc"
+
+[net]
+d_model = 128
+layers = 2
+heads = 4
+ff = 512
+
+[train]
+seed = 0
+lr = 3e-4                # AdamW, cosine-annealed to 0 over epochs * batches
+batch_size = 4096
+epochs = 4
+val_fraction = 0.05      # 95/5 split by stable shard-name hash
+weight_clamp = [0.1, 10.0]  # inverse-action-frequency CE weights, clamped
+grad_clip = 1.0
+
+[run]
+device = "cuda"          # falls back to cpu if unavailable; GPU may be busy
+                         # with the live run -- override with --device cpu
+checkpoint_dir = "checkpoints_bc"
+log_every_batches = 50
