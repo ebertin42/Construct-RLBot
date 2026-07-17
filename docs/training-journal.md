@@ -90,6 +90,21 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~17:00 — UNATTENDED EVENING: 3 workstreams landed + v5 re-parse live
+Elliot away, full autonomy granted. Landed (all agent-built + reviewed):
+(1) shard schema v5 (9b67c67+ce103ca, review APPROVED): is_demoed (col 17,
+absent-heuristic; demo-window garbage ang_vel bug found+fixed — pre-v5 those
+ticks were silently DROPPED, corrupting live-player coverage too), episode_
+marker (dead-ball-run detection), ball_pred divergence assertion restored
+(99.95% healthy on fixture post-tracker-fix). In-place v5 re-parse RUNNING
+(logs/parse_v5.log, ~7-8h, mixed-schema dir by design). (2) league-tick v1
+all-mode (cefaf22, APPROVED) DEPLOYED to remote: first tick rated the v1
+pool — avoidance-era frontier ck ranked LAST (-1.96), good-era seeds on top;
+PFSP now has real signal. Cutover killed old v0-only loop first. (3) SSL
+corpus pull LIVE (0994cc6): ~180/h, 122 replays in, disk-guarded, resumable.
+Also: rlviser stopped (nobody watching, was costing BC 12x), BC retrain back
+to 17.4k samples/s, loss 2.45@12k batches. Viewer relaunch cmd in memory.
+
 ### 2026-07-18 ~16:40 — B6: NO-GO (copycat), prev-dropout retrain launched
 Epoch-1 BC ck: val top-1 66.9% / top-3 84.3% (way above Seer 35-50% band —
 red flag, not a win) but closed-loop eval near-random: 0.26 touches/min,
