@@ -90,6 +90,20 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~03:50 — GPU MYSTERY SOLVED: rlviser renders on the training GPU
+BC train hit a cliff at 02:41 (20k→2k samples/s; GPU "100%", clocks/temps
+normal, zero IO pressure — looked like a loader problem, wasn't). Proven by
+kill-test: stopping rlviser.exe instantly restored 21k samples/s. rlviser
+renders on the same RTX 4060 WSL CUDA uses; an active-play scene costs ~10x
+trainer throughput (cliff = rotation to active segment). Viewer stack paused
+overnight (relay stays up); memory updated with the diagnostic signature.
+Side finding: scripts/bc_train.py lacks a __main__ guard — an import executed
+a second full training run during diagnosis (killed; add guard = todo).
+Overnight state: BC 18.9k samples/s (epoch 1 ends ~13:00), run-B restarted
+and at 50k sps (best since morning — rlviser was throttling it too), remote
+kickstart anneal ends ~04:30. loader prefetch fix 72e38f5 (10x on its own:
+0.47→5 batch/s).
+
 ### 2026-07-18 ~01:30 — B4 CORPUS EXPORT COMPLETE (+ disk crash postmortem)
 v4 re-parse: 67,568 replays, 0 failures, 233G, manifest 381.7M ticks all-1v1.
 bc-export: 67,568/67,568 shards → 163G COMPRESSED npz (plan's 180 B/sample
