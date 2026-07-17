@@ -306,11 +306,12 @@ fn export_file_writes_npz_and_resumes_by_skipping_existing() {
     let pads = pad_template();
     let nrm = norm();
 
-    let first = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm).unwrap();
-    let (out_path, samples) = first.expect("first export must write");
+    let first = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm, false).unwrap();
+    let (out_path, samples, existed) = first.expect("first export must write");
     assert_eq!(out_path, out_dir.path().join("bc_sample.npz"));
     assert!(out_path.exists());
     assert!(samples > 0);
+    assert!(!existed, "first export must not report a pre-existing output");
 
     // Written npz round-trips with the documented names, dtypes, and shapes.
     let mut npz = NpzReader::new(std::fs::File::open(&out_path).unwrap()).unwrap();
@@ -327,12 +328,76 @@ fn export_file_writes_npz_and_resumes_by_skipping_existing() {
 
     // Resume: an existing output is skipped, not rewritten.
     let mtime = std::fs::metadata(&out_path).unwrap().modified().unwrap();
-    let second = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm).unwrap();
+    let second = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm, false).unwrap();
     assert!(second.is_none(), "existing output must be skipped (resumable)");
     assert_eq!(
         std::fs::metadata(&out_path).unwrap().modified().unwrap(),
         mtime,
         "skipped output must not be touched"
+    );
+}
+
+#[test]
+fn force_overwrites_existing_output_instead_of_skipping() {
+    // Tomorrow's in-place corpus re-export (v5 re-parse writing back into
+    // the same `data/bc` dir) depends on `--force` actually replacing every
+    // existing `bc_*.npz`, not silently trusting the skip-existing resume
+    // check. Guard: without force, an existing output is left untouched
+    // (mtime + content); with force, it's rewritten (mtime advances, the
+    // `existed` flag comes back true) and the decoded tensor content matches
+    // a fresh export, i.e. the overwrite is a faithful re-export, not a
+    // truncated or stale write.
+    let out_dir = tempfile::tempdir().unwrap();
+    let pads = pad_template();
+    let nrm = norm();
+
+    let first = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm, false).unwrap();
+    let (out_path, samples, existed) = first.expect("first export must write");
+    assert!(!existed, "first export must not report a pre-existing output");
+    let read_action = |p: &std::path::Path| -> ndarray::Array1<i64> {
+        let mut npz = NpzReader::new(std::fs::File::open(p).unwrap()).unwrap();
+        npz.by_name("action.npy").unwrap()
+    };
+    let original_action = read_action(&out_path);
+    let mtime_before = std::fs::metadata(&out_path).unwrap().modified().unwrap();
+
+    // Corrupt the existing output in place (as a truncated/stale prior
+    // export might be) so a genuine overwrite is unambiguous: a skip would
+    // leave the corruption; a real overwrite replaces it with valid data.
+    std::fs::write(&out_path, b"stale corpus data from before the re-parse").unwrap();
+
+    // Without --force: still skipped, corruption survives untouched.
+    let no_force = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm, false).unwrap();
+    assert!(no_force.is_none(), "existing output must still be skipped without --force");
+    assert_eq!(
+        std::fs::read(&out_path).unwrap(),
+        b"stale corpus data from before the re-parse",
+        "without --force the corrupted existing output must not be touched"
+    );
+
+    // Ensure the filesystem mtime clock can actually distinguish the two
+    // writes (some filesystems have coarse mtime resolution).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // With --force: the corrupted output is overwritten, reported as such.
+    let forced = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm, true).unwrap();
+    let (forced_path, forced_samples, forced_existed) = forced.expect("--force must write, not skip");
+    assert_eq!(forced_path, out_path);
+    assert_eq!(forced_samples, samples, "re-export of the same shard must produce the same sample count");
+    assert!(forced_existed, "--force overwrite must report existed=true");
+
+    let mtime_after = std::fs::metadata(&out_path).unwrap().modified().unwrap();
+    assert!(mtime_after > mtime_before, "--force must actually rewrite the file (mtime must advance)");
+
+    // The rewritten file must be a valid, correct npz again (not the
+    // corrupted stand-in) — decode it, since the npz container embeds a
+    // wall-clock timestamp and so isn't byte-identical run to run even for
+    // identical tensor content (see `export_is_deterministic`, which checks
+    // decoded arrays for the same reason).
+    let rewritten_action = read_action(&out_path);
+    assert_eq!(
+        rewritten_action, original_action,
+        "--force re-export of the same shard must produce identical tensor content"
     );
 }
 
@@ -352,8 +417,9 @@ fn foreign_leftover_tmp_file_does_not_break_export() {
     let foreign_tmp = out_dir.path().join("bc_sample.npz.tmp.999999999");
     std::fs::write(&foreign_tmp, b"stale partial data from a dead process").unwrap();
 
-    let result = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm).unwrap();
-    let (out_path, samples) = result.expect("export must succeed despite a foreign leftover tmp file");
+    let result = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm, false).unwrap();
+    let (out_path, samples, existed) = result.expect("export must succeed despite a foreign leftover tmp file");
+    assert!(!existed, "no real output existed yet — only a foreign tmp file");
     assert_eq!(out_path, out_dir.path().join("bc_sample.npz"));
     assert!(out_path.exists());
     assert!(samples > 0);

@@ -12,6 +12,14 @@
 //! shard's contents, so sample order is identical across runs regardless of
 //! `--jobs`.
 //!
+//! `--force` bypasses the skip-existing check and overwrites every matching
+//! output via the same tmp+fsync+rename path (already atomic — see
+//! `bc_obs::export_shard_file`'s doc comment), for in-place corpus
+//! re-exports (e.g. after a shard re-parse) where every existing `bc_*.npz`
+//! must be replaced, not skipped. The summary line reports overwrites
+//! (`overwritten=`) separately from fresh exports (`exported=`) so a re-run
+//! can be checked at a glance.
+//!
 //! ## Working directory requirement
 //! The one-time pad template builds a RocketSim `Arena`, whose collision
 //! meshes resolve relative to the current working directory (same
@@ -39,9 +47,17 @@ struct Args {
     shards: PathBuf,
 
     /// Directory to write `bc_<id>.npz` tensor files into (created if it
-    /// doesn't exist). Existing outputs are skipped (resume).
+    /// doesn't exist). Existing outputs are skipped (resume), unless
+    /// `--force` is given.
     #[arg(long)]
     out: PathBuf,
+
+    /// Overwrite outputs that already exist in `--out` instead of skipping
+    /// them. Overwrite uses the same tmp+fsync+rename path as a fresh
+    /// export, so it's atomic either way. For an in-place corpus re-export
+    /// into the same `--out` dir.
+    #[arg(long)]
+    force: bool,
 
     /// Rayon thread-pool size. Omit to use rayon's default (one worker per
     /// logical CPU).
@@ -56,6 +72,10 @@ struct Args {
 
 enum Outcome {
     Exported(usize),
+    /// Written via `--force`, replacing a pre-existing output (reported
+    /// separately from `Exported` in the summary so a re-export run can
+    /// confirm it actually replaced everything).
+    Overwritten(usize),
     Skipped,
     Failed,
 }
@@ -105,8 +125,14 @@ fn main() {
 
     let results: Vec<Outcome> = entries
         .par_iter()
-        .map(|path| match export_shard_file(path, &args.out, &pads, &norm) {
-            Ok(Some((_, samples))) => Outcome::Exported(samples),
+        .map(|path| match export_shard_file(path, &args.out, &pads, &norm, args.force) {
+            Ok(Some((_, samples, existed))) => {
+                if existed {
+                    Outcome::Overwritten(samples)
+                } else {
+                    Outcome::Exported(samples)
+                }
+            }
             Ok(None) => Outcome::Skipped,
             Err(e) => {
                 eprintln!("failed {}: {e}", path.display());
@@ -116,6 +142,7 @@ fn main() {
         .collect();
 
     let mut exported = 0usize;
+    let mut overwritten = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
     let mut samples = 0usize;
@@ -125,12 +152,22 @@ fn main() {
                 exported += 1;
                 samples += n;
             }
+            Outcome::Overwritten(n) => {
+                overwritten += 1;
+                samples += n;
+            }
             Outcome::Skipped => skipped += 1,
             Outcome::Failed => failed += 1,
         }
     }
 
-    println!("exported={exported} skipped_existing={skipped} failed={failed} samples={samples}");
+    if args.force {
+        println!(
+            "exported={exported} overwritten={overwritten} skipped_existing={skipped} failed={failed} samples={samples}"
+        );
+    } else {
+        println!("exported={exported} skipped_existing={skipped} failed={failed} samples={samples}");
+    }
 
     // Non-zero exit whenever any shard failed, so scripted callers (Task B4)
     // can't miss failures — the per-shard errors are already on stderr.

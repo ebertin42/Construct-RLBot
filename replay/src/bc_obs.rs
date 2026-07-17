@@ -486,8 +486,18 @@ pub fn build_tensors(
 }
 
 /// Exports one shard file to `<out_dir>/bc_<stem>.npz`. Returns
-/// `Ok(None)` without touching anything if the output already exists
-/// (resumability), else `Ok(Some((path, num_samples)))`.
+/// `Ok(None)` without touching anything if the output already exists and
+/// `force` is `false` (resumability), else `Ok(Some((path, num_samples,
+/// existed)))` where `existed` says whether `out_path` was already present
+/// before this call (always `false` unless `force` overrode a skip — the
+/// caller uses it to tell a fresh export from an overwrite in its summary).
+///
+/// `force`: ignore the skip-existing resume check and overwrite via the same
+/// tmp+fsync+rename path below (already crash-safe/atomic — see next
+/// paragraph — so forcing an overwrite is exactly as safe as a fresh write).
+/// For a whole-corpus in-place re-export (e.g. after a shard re-parse),
+/// pass `force: true` for every call so every existing `bc_*.npz` is
+/// replaced rather than skipped.
 ///
 /// Crash safety (task #45 follow-up, prompted by a 2026-07-18 WSL hard-crash
 /// that left 478 truncated-but-renamed `bc_*.npz` files which the
@@ -505,19 +515,25 @@ pub fn build_tensors(
 /// retried/parallel corpus run) never write-then-rename over each other's
 /// same-named tmp file mid-flight; any *foreign* leftover `.tmp.<pid>` from
 /// a dead process is simply ignored (never matched by `out_path.exists()`,
-/// and no other code path reads `.tmp` files back in).
+/// and no other code path reads `.tmp` files back in). `rename` overwrites
+/// an existing `out_path` atomically on both platforms this runs on
+/// (POSIX rename(2); Windows via Rust's `MoveFileExW` +
+/// `MOVEFILE_REPLACE_EXISTING`), so the force-overwrite path never leaves a
+/// window where `out_path` is missing or half-written.
 pub fn export_shard_file(
     shard_npz: &Path,
     out_dir: &Path,
     pad_template: &[BoostPad],
     norm: &Normalization,
-) -> Result<Option<(PathBuf, usize)>, String> {
+    force: bool,
+) -> Result<Option<(PathBuf, usize, bool)>, String> {
     let stem = shard_npz
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or_else(|| format!("unreadable file stem: {}", shard_npz.display()))?;
     let out_path = out_dir.join(format!("bc_{stem}.npz"));
-    if out_path.exists() {
+    let existed = out_path.exists();
+    if existed && !force {
         return Ok(None);
     }
 
@@ -546,5 +562,5 @@ pub fn export_shard_file(
     std::fs::rename(&tmp_path, &out_path)
         .map_err(|e| format!("rename {} -> {}: {e}", tmp_path.display(), out_path.display()))?;
 
-    Ok(Some((out_path, samples)))
+    Ok(Some((out_path, samples, existed)))
 }
