@@ -4,7 +4,7 @@ import torch
 
 torch.set_num_threads(1)  # live trainers on this box
 
-from construct.learn.kl_prior import KLPrior, kl_student_prior
+from construct.learn.kl_prior import KL_PRIOR_CHUNK, KLPrior, kl_student_prior
 from construct.learn.model_v1 import EntityPolicyNet
 
 NET = dict(d_model=128, layers=2, heads=4, ff=512)
@@ -68,6 +68,22 @@ def test_kl_positive_and_grads_reach_student_only(tmp_path):
     assert any(p.grad is not None and p.grad.abs().sum() > 0
                for p in student.parameters() if p.requires_grad)
     assert all(not p.requires_grad for p in prior.net.parameters())
+
+
+def test_logits_chunked_matches_full_forward(tmp_path):
+    """B=6 obs, chunk=4 (so two unequal chunks: 4+2) must produce logits
+    bit-identical (within fp tolerance) to the default one-slice (chunk >= B)
+    path. All of EntityPolicyNet's ops are row-independent (LayerNorm normalizes
+    per-row, attention/ff operate per-sample), so chunking the batch dim is a
+    pure memory/throughput knob -- not a numerics change."""
+    net = EntityPolicyNet(**NET, action_table=_table())
+    ck = _save_ck(tmp_path, net)
+    prior = KLPrior(ck, device="cpu")
+    obs = _obs(b=6)
+    full = prior.logits(obs, _chunk=KL_PRIOR_CHUNK)
+    chunked = prior.logits(obs, _chunk=4)
+    assert chunked.shape == full.shape
+    assert torch.allclose(chunked, full, atol=1e-6, rtol=1e-5)
 
 
 def test_dim_mismatch_raises(tmp_path):

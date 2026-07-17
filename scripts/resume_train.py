@@ -71,8 +71,8 @@ if args.kickstart_teacher:
         cfg.kickstart["steps"] = args.kickstart_steps
 if args.kl_prior:
     cfg.kl_prior = {**cfg.kl_prior, "ck": args.kl_prior}
-    if args.kl_prior_lambda is not None:
-        cfg.kl_prior["lambda"] = args.kl_prior_lambda
+if args.kl_prior_lambda is not None:
+    cfg.kl_prior = {**cfg.kl_prior, "lambda": args.kl_prior_lambda}
 
 t = Trainer(cfg, _state=state)
 print(f"resumed at {t.total_steps:,} steps | arenas={cfg.env['num_arenas']} "
