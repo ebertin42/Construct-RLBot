@@ -90,6 +90,17 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~05:00 (monitor)
+| steps | sps | kick_kl | lambda_k | ent | goals/min |
+|---|---|---|---|---|---|
+| 495.7M | 5,465 | 0.74-0.78 | 0.009 | 3.58-3.63 | 1.44 (ck 494M) |
+Anneal effectively done. kick_kl rising into the end (0.40→0.77) + ent up
+3.26→3.63 — teacher pull gone, student exploring; expected, KL now vestigial.
+Eval 1.44: down from 1.79@320M but inside the ±0.2 noise band and above the
+1.35 regression line — single reading, not flagged. Post-anneal watch armed:
+two consecutive <1.35 = rollback proposal. BC epoch 0: batch 23.7k/177k,
+loss 2.00, 19.2k samples/s. run-B 45k sps. Disk 191.6G host-free. All UP.
+
 ### 2026-07-18 ~03:50 — GPU MYSTERY SOLVED: rlviser renders on the training GPU
 BC train hit a cliff at 02:41 (20k→2k samples/s; GPU "100%", clocks/temps
 normal, zero IO pressure — looked like a loader problem, wasn't). Proven by
