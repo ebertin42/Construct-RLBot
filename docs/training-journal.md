@@ -90,6 +90,19 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~08:45 — ⚠ REGRESSION CONFIRMED, awaiting approval for fix
+Second consecutive sub-1.35: ck 584M → 1.21 goals/min (1.90→1.80→1.29→1.21),
+touches ~4.8, ep_rew rising — self-play camping degeneracy post-anneal.
+PREPARED FIX (blocked on Elliot approval — permission layer would not let the
+overnight session mutate the remote box): (1) seed remote league/registry.jsonl
+with v1 entries ck 320M/520M/550M (schema_version=1), (2) restart remote from
+ck_000520765440 (the 1.90 peak) with `resume_train.py
+checkpoints_entity/ck_000520765440.pt --config configs/train_v1.toml --league`
+(v1-native league; opponent_frac 0.2 default; entropy unchanged — one variable
+at a time; entropy_coef 0.01→0.005 remains the fallback if league alone
+doesn't hold). Drifted steps 520→590M+ get discarded by rollback; cost of
+waiting = GPU-hours only. Monitoring continues hourly, documentation-only.
+
 ### 2026-07-18 ~07:45 (monitor) — ⚠ POST-ANNEAL DRIFT WARNING
 | steps | sps | ent | ep_rew | goals/min |
 |---|---|---|---|---|
