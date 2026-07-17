@@ -118,6 +118,46 @@ def test_kickstart_e2e_one_iter_kick_kl_finite(tmp_path, capsys):
     assert math.isfinite(float(m.group(1))), out
 
 
+def _synthetic_v1_prior_checkpoint(path, net_dims, seed=2):
+    """A tiny v1 EntityPolicyNet checkpoint, dims matching net_dims exactly
+    (KLPrior's expect_net assert requires this against the student's cfg.net),
+    saved with schema_version=1 as kl_prior.py's KLPrior expects."""
+    torch.manual_seed(seed)
+    net = EntityPolicyNet(**net_dims, action_table=action_table_v1())
+    torch.save({
+        "model": net.state_dict(),
+        "schema_version": 1,
+        "config": {"net": dict(net_dims)},
+        "total_steps": 0,
+    }, path)
+    return str(path)
+
+
+def test_kl_prior_e2e_one_iter_gate_and_log(tmp_path, capsys):
+    """K3 e2e: [kl_prior] config block gates Trainer.kl_prior on, prints the
+    init anchor line, and one run() iteration logs a finite kl_pri stat +
+    lambda_p. Mirrors test_kickstart_e2e_one_iter_kick_kl_finite's harness
+    (real engine, tiny net, cpu) since compose_extra_loss's prior_on path
+    needs a genuine v1 collect() batch (obs dict) exactly like kickstart's
+    obs_v0 path does."""
+    cfg = v1_cfg(tmp_path, arenas=2, rollout=32)
+    prior_ck = _synthetic_v1_prior_checkpoint(tmp_path / "prior.pt", cfg.net)
+    cfg.kl_prior = {"ck": prior_ck, "lambda": 0.25}
+
+    t = Trainer(cfg)
+    assert t.kl_prior is not None
+    init_out = capsys.readouterr().out
+    assert f"kl_prior: anchored to {prior_ck}" in init_out
+    assert "lambda_p=0.25" in init_out
+
+    t.run(max_iterations=1)
+    out = capsys.readouterr().out
+    m = re.search(r"kl_pri (\S+)", out)
+    assert m, f"kl_pri missing from training log: {out!r}"
+    assert math.isfinite(float(m.group(1))), out
+    assert "lambda_p" in out
+
+
 def test_v0_checkpoint_with_v1_config_errors_clearly(tmp_path):
     ck = _synthetic_v0_checkpoint(tmp_path / "v0.pt")
     with pytest.raises(ValueError, match="schema"):

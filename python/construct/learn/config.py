@@ -20,6 +20,9 @@ class TrainConfig:
     # horizon, default 500_000_000), lambda_k (initial KL weight, default 1.0),
     # lambda_v (value-regression weight, default 0.5).
     kickstart: dict = field(default_factory=dict)
+    # KL-prior anchor (v1-schema runs only; frozen BC net, see kl_prior.py +
+    # Trainer.__init__). Keys: ck (checkpoint path), lambda (float, default 0.05).
+    kl_prior: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str) -> "TrainConfig":

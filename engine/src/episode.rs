@@ -170,14 +170,7 @@ impl EpisodeArena {
         curriculum: Option<CurriculumConfig>,
         obs_mode: ObsMode,
     ) -> Self {
-        let mut arena = Arena::default_standard();
-        let mut car_ids = Vec::with_capacity(blue + orange);
-        for _ in 0..blue {
-            car_ids.push(arena.pin_mut().add_car(Team::Blue, CarConfig::octane()));
-        }
-        for _ in 0..orange {
-            car_ids.push(arena.pin_mut().add_car(Team::Orange, CarConfig::octane()));
-        }
+        let (mut arena, car_ids) = Self::build_arena(blue, orange);
         // Placeholder state — immediately overwritten by reset_episode() below,
         // which performs the actual (possibly curriculum-driven) reset.
         let prev_state = arena.pin_mut().get_game_state();
@@ -209,6 +202,57 @@ impl EpisodeArena {
         };
         this.reset_episode();
         this
+    }
+
+    /// Builds the standard arena and its cars exactly the way `new_full` does:
+    /// `Arena::default_standard()`, blue cars first (ascending), then orange —
+    /// all Octane. Car ids are a per-arena counter starting at 1, so any arena
+    /// built through this path with the same (blue, orange) re-issues the SAME
+    /// ids 1..N in the same agent order, and `default_standard` construction is
+    /// deterministic (identical boost-pad order). Both invariants are what lets
+    /// `rebuild_arena` swap a poisoned arena for a fresh one without breaking
+    /// the agent->car mapping, viewer identity, or pad indexing.
+    fn build_arena(blue: usize, orange: usize) -> (UniquePtr<Arena>, Vec<u32>) {
+        let mut arena = Arena::default_standard();
+        let mut car_ids = Vec::with_capacity(blue + orange);
+        for _ in 0..blue {
+            car_ids.push(arena.pin_mut().add_car(Team::Blue, CarConfig::octane()));
+        }
+        for _ in 0..orange {
+            car_ids.push(arena.pin_mut().add_car(Team::Orange, CarConfig::octane()));
+        }
+        (arena, car_ids)
+    }
+
+    /// Discards the current arena and replaces it with a freshly built one
+    /// (same construction path as `new_full`). Needed by physics-blowup
+    /// containment: a blown-up arena is NOT recoverable in place, because
+    /// Bullet's `updateSingleAabb` latches `DISABLE_SIMULATION` on any body
+    /// whose AABB went nonfinite, and RocketSim never clears that state
+    /// (`Ball::SetState` only attempts activation when velocity != 0, and
+    /// plain `setActivationState` refuses to leave `DISABLE_SIMULATION`).
+    /// Resetting the poisoned arena therefore leaves the ball — or a car —
+    /// permanently frozen (observed live: ghost ball pinned at kickoff
+    /// center, arena degraded to zero-touch episodes).
+    ///
+    /// Everything else derived from the arena is either re-issued identically
+    /// (car ids — see `build_arena`), re-derived by the `reset_episode()` the
+    /// caller runs right after (`episode_start_tick`, `last_touch_tick`,
+    /// `prev_state`; the fresh arena's tick_count restarts at 0, which
+    /// reward.rs's `(prev.tick_count, cur.tick_count]` touch window already
+    /// tolerates), or independent of this arena (the v1 `Tracker` owns its own
+    /// car-less arena and containment never feeds it a poisoned state).
+    fn rebuild_arena(&mut self) {
+        let orange = self.car_ids.len() - self.blue_count;
+        let (arena, car_ids) = Self::build_arena(self.blue_count, orange);
+        // hard assert: cold path (once per contained blowup), and a silent id
+        // remap in release would desync agent→car mapping for the whole run
+        assert_eq!(
+            car_ids, self.car_ids,
+            "rebuilt arena must re-issue identical car ids (per-arena counter, same add order)"
+        );
+        self.arena = arena;
+        self.car_ids = car_ids;
     }
 
     /// Kickoff when curriculum is absent, or when the weighted coin says kickoff;
@@ -400,7 +444,7 @@ impl EpisodeArena {
         // a value estimate of garbage.
         if !state_is_sane(&cur) {
             eprintln!(
-                "[construct-engine] physics blowup contained (tick {}): episode terminated, arena reset",
+                "[construct-engine] physics blowup contained (tick {}): episode terminated, arena rebuilt (Bullet DISABLE_SIMULATION latch) + reset",
                 cur.tick_count
             );
             for a in 0..n {
@@ -419,6 +463,10 @@ impl EpisodeArena {
                     prev[..n * PREV_ACTIONS].fill(0);
                 }
             }
+            // Reset alone is NOT enough: the blowup latched DISABLE_SIMULATION
+            // on the poisoned body (see `rebuild_arena`) and a kickoff reset
+            // would leave it permanently frozen. Swap in a fresh arena first.
+            self.rebuild_arena();
             self.reset_episode();
             return;
         }

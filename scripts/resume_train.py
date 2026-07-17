@@ -36,6 +36,10 @@ p.add_argument("--kickstart-teacher", default=None,
 p.add_argument("--kickstart-steps", type=int, default=None,
                help="steps over which the kickstart KL weight anneals to 0 "
                     "(default 500_000_000; only used with --kickstart-teacher)")
+p.add_argument("--kl-prior", default=None,
+               help="v1 BC checkpoint to use as a frozen KL prior anchor")
+p.add_argument("--kl-prior-lambda", type=float, default=None,
+               help="KL(student‖prior) coefficient (default 0.05)")
 args = p.parse_args()
 
 state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -65,6 +69,10 @@ if args.kickstart_teacher:
     cfg.kickstart = {**cfg.kickstart, "teacher": args.kickstart_teacher}
     if args.kickstart_steps is not None:
         cfg.kickstart["steps"] = args.kickstart_steps
+if args.kl_prior:
+    cfg.kl_prior = {**cfg.kl_prior, "ck": args.kl_prior}
+if args.kl_prior_lambda is not None:
+    cfg.kl_prior = {**cfg.kl_prior, "lambda": args.kl_prior_lambda}
 
 t = Trainer(cfg, _state=state)
 print(f"resumed at {t.total_steps:,} steps | arenas={cfg.env['num_arenas']} "

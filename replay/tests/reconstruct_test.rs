@@ -4,7 +4,7 @@ use construct_replay::{frames::extract_frames, reconstruct::reconstruct_120hz};
 fn reconstructs_dense_120hz_finite() {
     let bytes = std::fs::read("tests/fixtures/sample.replay").unwrap();
     let f = extract_frames(&bytes, 30).unwrap();
-    let r = reconstruct_120hz(&f).unwrap();
+    let r = reconstruct_120hz(&f, 1).unwrap();
     // ~4 ticks per 30 Hz frame
     assert!(r.ticks.len() >= f.ball.len() * 3, "expected ~4x densification");
     assert!(r.ticks.iter().all(|t| t.ball.pos.iter().all(|x| x.is_finite())));
@@ -25,7 +25,7 @@ fn reconstructs_dense_120hz_finite() {
 fn tick_index_is_monotonic_with_gaps_on_drops_and_has_boundaries() {
     let bytes = std::fs::read("tests/fixtures/sample.replay").unwrap();
     let f = extract_frames(&bytes, 30).unwrap();
-    let r = reconstruct_120hz(&f).unwrap();
+    let r = reconstruct_120hz(&f, 1).unwrap();
 
     // tick_index must be strictly increasing across surviving ticks -- it's
     // the global monotonic 120 Hz sub-step counter in the ORIGINAL

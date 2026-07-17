@@ -50,10 +50,19 @@ use rocketsim_rs::{
     sim::{Arena, CarConfig, CarControls, Team},
 };
 
+use construct_engine::ballpred::Tracker;
+
 use crate::{
     frames::{CarFrame, ReplayFrames, RigidFrame},
     pyr::estimate_pyr,
 };
+
+/// Total boost pads in a standard soccar arena (6 big + 28 small) — mirrors
+/// `construct_engine::obs_v1::PAD_COUNT` (that constant is private to its
+/// module, so it's re-declared here rather than exposed cross-crate for one
+/// value; see `reconstruct.rs`'s existing precedent of duplicating small
+/// cross-module constants/helpers, e.g. `rotate_vector` above).
+pub const PAD_COUNT: usize = 34;
 
 /// One 120 Hz physics tick: ball + every player's car, reconstructed by
 /// stepping RocketSim between the replay's native frames.
@@ -85,6 +94,36 @@ pub struct Tick {
     /// action[i] IDM pairs must drop the pair when `is_boundary[i+1]` is
     /// true.
     pub is_boundary: bool,
+    /// Every boost pad's `(timer, is_active)` state, in the arena's fixed
+    /// construction order (see `construct_engine::obs_v1`'s module doc: 6
+    /// big pads then 28 small pads, `PAD_COUNT` == 34 total). `timer` is
+    /// `0.0` while the pad is active, else `cooldown / 10.0` (same
+    /// normalization `obs_v1::timer_norm` uses -- always by the big-pad
+    /// cooldown constant, even for small pads, per that module's brief).
+    /// Read straight off the reconstruction arena's `GameState.pads` for
+    /// this tick -- no extra simulation cost.
+    pub pads: Vec<(f32, bool)>,
+    /// Per-car "has flipped or jumped" flag, same order as `cars`/`actions`.
+    /// Sourced from `CarState::has_flip_or_jump()` (rocketsim_rs's own FFI
+    /// method) on the post-step sim car state -- the exact same call
+    /// `construct_engine::obs_v1::car_row` uses to derive its `f22` /
+    /// `has_flip` obs feature, so shard and live-obs semantics agree by
+    /// construction.
+    pub has_flip: Vec<bool>,
+    /// Ball-position/velocity prediction at +0.5/1.0/1.5/2.0s, each row
+    /// `[pos_x, pos_y, pos_z, vel_x, vel_y, vel_z]`. Computed via
+    /// `construct_engine::ballpred::Tracker::predict` on the ball state at
+    /// this tick, but ONLY for ticks that will actually be written to a
+    /// shard at the reconstruction's `stride` (see `reconstruct_120hz`'s
+    /// `stride` param) -- roll-forward prediction is the expensive part of
+    /// this whole module (~253us/call measured on this box), so ticks the
+    /// shard writer would discard anyway never pay for it. Ticks that don't
+    /// get a real prediction carry the fallback "ball keeps doing what it's
+    /// doing now" value (current tick's own ball pos/vel repeated across all
+    /// 4 horizons) -- finite, cheap, and never actually read downstream
+    /// since `write_shard`'s `stride` selection is index-identical to the
+    /// one used here (see `reconstruct_120hz`'s doc).
+    pub ball_pred: [[f32; 6]; 4],
 }
 
 pub struct Reconstructed {
@@ -160,8 +199,12 @@ fn rotate_vector(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
 }
 
 /// Build a RocketSim `RotMat` (forward/right/up, in world space) from a
-/// `[x, y, z, w]` quaternion.
-fn quat_to_rotmat(q: [f32; 4]) -> RotMat {
+/// `[x, y, z, w]` quaternion. `pub(crate)` (not private like its
+/// `rotate_vector` helper) because `bc_obs` must invert shard-stored
+/// quaternions with EXACTLY the construction that `rotmat_to_quat` below is
+/// the inverse of — a re-derived copy drifting out of sync would silently
+/// skew every exported obs rotation.
+pub(crate) fn quat_to_rotmat(q: [f32; 4]) -> RotMat {
     let f = rotate_vector(q, [1.0, 0.0, 0.0]);
     let r = rotate_vector(q, [0.0, 1.0, 0.0]);
     let u = rotate_vector(q, [0.0, 0.0, 1.0]);
@@ -227,11 +270,39 @@ fn set_car_state(arena: &mut cxx::UniquePtr<Arena>, car_id: u32, cf: &CarFrame) 
     arena.pin_mut().set_car(car_id, cs).map_err(|e: rocketsim_rs::NoCarFound| e.to_string())
 }
 
+/// `0.0` if the pad is active/available, else `cooldown / 10.0`. Mirrors
+/// `construct_engine::obs_v1::timer_norm` exactly (normalization is always by
+/// the big-pad cooldown constant, even for small pads, per that module's
+/// brief) — duplicated rather than imported since that function is private
+/// to its module (same precedent as this file's `rotate_vector`).
+fn pad_timer_norm(pad: &rocketsim_rs::BoostPad) -> f32 {
+    if pad.state.is_active { 0.0 } else { pad.state.cooldown / 10.0 }
+}
+
 /// Reconstructs a dense 120 Hz tick stream from `frames` (Task 2's typed,
 /// fixed-fps replay data) by stepping a fresh RocketSim `Arena` between each
 /// consecutive pair of frames and snapping back to the replay's authoritative
 /// state at every frame boundary.
-pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String> {
+///
+/// `stride` bounds the cost of `Tick::ball_pred`: a single
+/// `construct_engine::ballpred::Tracker` is created once for the whole call
+/// and reused, but its (expensive, ~253us measured) `predict` is only
+/// invoked for ticks that land on a `write_shard(..., stride)` selection
+/// index (i.e. tick `ticks.len()` — the index this tick will occupy if it
+/// survives the sanity check — divisible by `stride`); every other tick's
+/// `ball_pred` is the cheap "ball keeps doing what it's doing now" fallback.
+/// This exactly mirrors `shard::write_shard`'s own `rec.ticks.iter().
+/// step_by(stride)` selection, so pass the SAME `stride` you intend to write
+/// the shard with (a smaller `stride`, e.g. `1`, is always safe — it just
+/// predicts more ticks than strictly necessary). Does not otherwise change
+/// `stride`/`tick_index`/`is_boundary` semantics (those remain exactly the
+/// prior module doc's; `stride` here does not subsample the returned
+/// `Reconstructed.ticks`, it only gates ball-pred cost).
+pub fn reconstruct_120hz(frames: &ReplayFrames, stride: usize) -> Result<Reconstructed, String> {
+    if stride == 0 {
+        return Err("stride must be >= 1".to_string());
+    }
+
     let num_frames = frames.ball.len();
     let num_players = frames.player_teams.len();
 
@@ -262,8 +333,20 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
         return Err("frames.fps must be > 0".to_string());
     }
 
+    // `crate::sim_init::ensure_init` (this crate's OWN `Once` guard, not
+    // `construct_engine::sim_init`'s) is the only RocketSim global-init call
+    // this module ever makes. `rocketsim_rs::init` loads collision meshes
+    // into process-global (C++-side) state, not anything scoped per-crate,
+    // so a single call from here is sufficient for BOTH the `Arena` built
+    // below AND the `Tracker`'s own internal `Arena::default_standard()`
+    // (which requires init to have already run, per its doc, but never
+    // calls `ensure_init` itself). Deliberately never calling
+    // `construct_engine::sim_init::ensure_init` from this crate avoids the
+    // double-init hazard entirely rather than relying on both `Once` guards
+    // happening to be compatible.
     crate::sim_init::ensure_init(None);
     let mut arena = Arena::default_standard();
+    let mut ball_pred_tracker = Tracker::new();
     let car_ids: Vec<u32> = frames
         .player_teams
         .iter()
@@ -357,6 +440,7 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
             };
 
             let mut cars_out: Vec<CarFrame> = Vec::with_capacity(num_players);
+            let mut has_flip: Vec<bool> = Vec::with_capacity(num_players);
             for (p, &car_id) in car_ids.iter().enumerate() {
                 let ci = gs
                     .cars
@@ -382,7 +466,33 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
                     on_ground: cs.is_on_ground,
                     demoed: cs.is_demoed,
                 });
+                // Same call `construct_engine::obs_v1::car_row` uses to derive
+                // its has-flip obs feature — see `Tick::has_flip` doc.
+                has_flip.push(cs.has_flip_or_jump());
             }
+
+            // Pads: read straight off this tick's already-fetched GameState,
+            // in fixed arena order — no extra simulation cost (see
+            // `Tick::pads` doc).
+            let pads: Vec<(f32, bool)> =
+                gs.pads.iter().map(|p| (pad_timer_norm(p), p.state.is_active)).collect();
+
+            // Ball-pred: only actually roll-forward-simulate on ticks that
+            // will land on a `write_shard(..., stride)` selection index —
+            // `ticks.len()` here is exactly the index this tick will occupy
+            // if it survives the sanity check below (see `reconstruct_120hz`
+            // doc + `Tick::ball_pred` doc for why this equals write_shard's
+            // own `step_by(stride)` selection).
+            let ball_pred: [[f32; 6]; 4] = if ticks.len() % stride == 0 {
+                let snaps = ball_pred_tracker.predict(&gs.ball);
+                let mut rows = [[0.0f32; 6]; 4];
+                for (row, snap) in rows.iter_mut().zip(snaps.iter()) {
+                    *row = [snap.pos.x, snap.pos.y, snap.pos.z, snap.vel.x, snap.vel.y, snap.vel.z];
+                }
+                rows
+            } else {
+                [[ball.pos[0], ball.pos[1], ball.pos[2], ball.vel[0], ball.vel[1], ball.vel[2]]; 4]
+            };
 
             let tick = Tick {
                 ball,
@@ -390,6 +500,9 @@ pub fn reconstruct_120hz(frames: &ReplayFrames) -> Result<Reconstructed, String>
                 actions: actions.clone(),
                 tick_index: this_tick_index,
                 is_boundary,
+                pads,
+                has_flip,
+                ball_pred,
             };
             if tick_is_sane(&tick) {
                 ticks.push(tick);

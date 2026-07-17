@@ -68,3 +68,169 @@ Batch_0011 pulling. All loops UP, remote proc alive, disk 666G.
 Trend: KL settled ~0.375 (productive disagreement — student outscores teacher),
 anneal 40%, all steady. Corpus top-up: batch_0000 topped up, on 0001; 61.5k
 shards. All loops UP. No flags.
+
+### 2026-07-17 ~19:15 — DEAD-BALL CONTAINMENT FIX SHIPPED (both boxes)
+Root-caused the rlviser "frozen ball after sudden kickoff": physics-blowup
+containment reset a Bullet-poisoned arena in place; NaN AABB latches
+DISABLE_SIMULATION on the ball (one-way; RocketSim never force-clears it), so
+post-containment the ball is dead for the arena's lifetime — ghost-ball viewer
+sessions AND silent zero-touch training arenas (37/310 watch sessions affected;
+same defect live in every collect arena). Fix a1c33e0+8527a5e: rebuild arena in
+the containment branch (car ids re-issue identically — hard-asserted). Reviewed
+APPROVE (field-by-field sweep, vendored-source verification). Shipped with
+Elliot's OK: local .so atomic-swap, run-B resumed ck 3,506.1M (lost ~7.8M
+ck-granularity); remote resumed ck 313.79M (lost ~1.5M), lambda_k 0.372
+continuity confirmed. Validation: containment fired on remote iter 1 → log
+shows "arena rebuilt" — fix live. Kickstart run at 314.1M, sps 5,568, kick_kl
+0.39, ent 3.25 — all on trend.
+BC-pretrain (task #44): B3 bc-export landed (ac77c17+7a9aa1e, reviewed) and B5
+BC trainer landed (4533747+208ec36, reviewed; ckpt-compat proven through
+eval_metrics live). v4 re-parse was STALLED (≥10k batch gate vs completed pull;
+fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6:
+kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
+kl_prior seam, not KickstartTeacher.
+
+### 2026-07-18 ~15:00 — ⚠ SECOND DEGENERACY: MUTUAL AVOIDANCE (confirmed)
+Post-rollback oscillation resolved downward: 2.25@562 → 2.11@589 → 0.66@608 →
+0.61@611 (two consecutive <1.5), touches 2.8, dist 3651, live ep_rew -1.3.
+DIFFERENT signature than goal-trading (ep_rew down WITH goals): v3.1 made
+goal exchange negative-sum (-2/trade), and the self-play equilibrium of a
+negative-sum game is mutual avoidance; league counters in only ~20% of
+arenas. DECISION (with Elliot): no third reward surgery — deploy KL-prior
+(K4) immediately after B6: the human anchor is the structural anti-avoidance
+fix (λ_p tunable upward if 0.05 too gentle). BC at 90%, epoch-1 ck ~15:20.
+Day's tally of degeneracy modes on reward_v3.x self-play: trading (+10/-8),
+avoidance (+10/-12) — the exploit-free reward likely doesn't exist without a
+behavioral prior; that's the whole KL-PPO thesis, now empirically motivated.
+
+### 2026-07-18 ~12:30 (monitor) — RECOVERY CONFIRMED, NEW HIGH
+| steps | sps | ent | ep_rew | goals/min |
+|---|---|---|---|---|
+| 563.3M | 7,479 | 3.55 | 0.61 | **2.25** (ck 562M, all-time high) |
+Post-rollback trajectory: 1.19@548M (adaptation dip while critic re-learned
+v3.1 values) → 2.25@562M. Touches 4.4→8.3. Turtling refuted; league+v3.1
+outperforms the pre-exploit line (peak was 1.90). ep_rew ~0.6 is the honest
+scale now (negative-sum goal exchange). BC epoch 0 at 73%, epoch-1 ck ~14:30
+→ B6. KL-prior plan written (bccc2e9, task #49) — K1-K3 code next, K4 deploy
+after B6 + approval. Exploit-era cks ≥554M quarantined both boxes; viewer
+picks by mtime now (91f4472).
+
+### 2026-07-18 ~10:20 — FIX DEPLOYED (Elliot-approved): rollback + league + v3.1
+Elliot back, approved "League + reward v3.1". Executed: reward_v3_1.toml
+(aggression_bias -0.2 → concede -12 vs goal +10; any trade now net -2 — loop
+strictly unprofitable; commit 72b36b5) shipped to remote; league registry
+seeded with v1 cks 320M/520M/550M; remote restarted from ck_000520765440
+(the 1.90 peak). Verified: "resumed at 520,765,440", league opponents line
+lists all 3 seeds, ep_rew instantly 3.0-5.0 (trading income gone), sps ~7.6k
+warming. 520→659M exploit-era steps discarded (~4.7h GPU). Watch next: eval
+trend recovery toward 1.8-1.9, ep_rew staying in 3-6 band, ent decline;
+league_tick on remote still v0-loop — v1 ladder ratings TODO if PFSP weighting
+matters. Viewer stays off until BC done (Elliot-approved).
+
+### 2026-07-18 ~09:40 — ⚠⚠ MECHANISM IDENTIFIED: GOAL-TRADING LOOP
+ck 631M → 0.46 goals/min while live ep_rew EXPLODED to 14.3 (2.5x teacher).
+Arithmetic gives the exploit: reward_v3 goal +10 / concede -8 → alternating
+goals net +2 per agent per exchange. Self-play partners learned COOPERATIVE
+GOAL-TRADING (positive-sum loop); vs a non-cooperating eval opponent the
+policy looks like camping with 0.46 goals/min. Explains touches ~4 (kickoff
+exchanges only), v_loss 0.19 (very predictable income), ent oscillation.
+FIXES: (immediate, staged) league opponents break the loop — past selves
+don't cooperate; (structural, for Elliot) reward_v3.1 with |concede| ≥ goal
+(e.g. -10/-12) makes trading zero/negative-sum — recommend BOTH. Staged fix
+unchanged: rollback ck 520M + --league. Awaiting approval.
+
+### 2026-07-18 ~09:00 — ⚠⚠ COLLAPSE ACCELERATING
+ck 614M → **0.79 goals/min** (trend 1.90→1.80→1.29→1.21→1.45→0.79), touches
+3.2, dist 3123. The 1.45 bounce was noise. ent falling 3.82→3.51 = policy
+SHARPENING INTO the camping equilibrium (not recovery); ep_rew still 6.8 —
+reward/goal divergence total. Fix attempts still classifier-blocked (both the
+full fix and the additive registry-seed alone). Waiting on Elliot: reply "go"
+→ I execute journal-f2a89e2 fix (rollback 520M + league). Every hour ≈ 29M
+steps deeper into the degenerate equilibrium (discarded on rollback anyway).
+
+### 2026-07-18 ~08:45 — ⚠ REGRESSION CONFIRMED, awaiting approval for fix
+Second consecutive sub-1.35: ck 584M → 1.21 goals/min (1.90→1.80→1.29→1.21),
+touches ~4.8, ep_rew rising — self-play camping degeneracy post-anneal.
+PREPARED FIX (blocked on Elliot approval — permission layer would not let the
+overnight session mutate the remote box): (1) seed remote league/registry.jsonl
+with v1 entries ck 320M/520M/550M (schema_version=1), (2) restart remote from
+ck_000520765440 (the 1.90 peak) with `resume_train.py
+checkpoints_entity/ck_000520765440.pt --config configs/train_v1.toml --league`
+(v1-native league; opponent_frac 0.2 default; entropy unchanged — one variable
+at a time; entropy_coef 0.01→0.005 remains the fallback if league alone
+doesn't hold). Drifted steps 520→590M+ get discarded by rollback; cost of
+waiting = GPU-hours only. Monitoring continues hourly, documentation-only.
+
+### 2026-07-18 ~07:45 (monitor) — ⚠ POST-ANNEAL DRIFT WARNING
+| steps | sps | ent | ep_rew | goals/min |
+|---|---|---|---|---|
+| 582.7M | 8,095 | 3.77 | **7.26 ↑** | **1.29 ↓** (ck 580M) |
+First sub-1.35 reading, WITH the signature: ep_rew rising (5.7→7.3) while
+goals fell (1.90→1.80→1.29), touches collapsing monotonically
+(15.2→10.5→9.2→4.7), mean ball dist 1452→2715 (agent hanging back). v_loss
+0.35 (critic confident in whatever it's doing). One reading below line —
+confirmation eval armed on next synced ck. If confirmed: rollback to ck 520M
+(1.90 peak) + change needed to break the loop — candidates: entropy_coef
+0.01→0.005 (ent climbed 3.26→3.77 post-anneal), league re-enable (v1-native
+registry landed in league-v1 merge — self-play degeneracy is the likely
+mechanism; both selves camping = no touches, and ep_rew can rise on
+vel_to_ball income + own-goal asymmetries without finishing).
+
+### 2026-07-18 ~05:45 (monitor)
+Post-anneal reading 1: ck 520M → **1.90 goals/min** (new high; teacher 1.56,
+prior peak 1.81). Touches 15.2→10.5/min, dist 1452→1882 — fewer but more
+decisive possessions, goals up: efficiency, NOT the hacking signature. Remote
+sps 5.5k→8.1k post-anneal (teacher forward gone); log dropped kick_kl/lambda_k
+fields as expected. ent 3.67 elevated — watch decline. BC epoch 0 at 32k/177k
+batches, loss 1.94. No flags.
+
+### 2026-07-18 ~05:00 (monitor)
+| steps | sps | kick_kl | lambda_k | ent | goals/min |
+|---|---|---|---|---|---|
+| 495.7M | 5,465 | 0.74-0.78 | 0.009 | 3.58-3.63 | 1.44 (ck 494M) |
+Anneal effectively done. kick_kl rising into the end (0.40→0.77) + ent up
+3.26→3.63 — teacher pull gone, student exploring; expected, KL now vestigial.
+Eval 1.44: down from 1.79@320M but inside the ±0.2 noise band and above the
+1.35 regression line — single reading, not flagged. Post-anneal watch armed:
+two consecutive <1.35 = rollback proposal. BC epoch 0: batch 23.7k/177k,
+loss 2.00, 19.2k samples/s. run-B 45k sps. Disk 191.6G host-free. All UP.
+
+### 2026-07-18 ~03:50 — GPU MYSTERY SOLVED: rlviser renders on the training GPU
+BC train hit a cliff at 02:41 (20k→2k samples/s; GPU "100%", clocks/temps
+normal, zero IO pressure — looked like a loader problem, wasn't). Proven by
+kill-test: stopping rlviser.exe instantly restored 21k samples/s. rlviser
+renders on the same RTX 4060 WSL CUDA uses; an active-play scene costs ~10x
+trainer throughput (cliff = rotation to active segment). Viewer stack paused
+overnight (relay stays up); memory updated with the diagnostic signature.
+Side finding: scripts/bc_train.py lacks a __main__ guard — an import executed
+a second full training run during diagnosis (killed; add guard = todo).
+Overnight state: BC 18.9k samples/s (epoch 1 ends ~13:00), run-B restarted
+and at 50k sps (best since morning — rlviser was throttling it too), remote
+kickstart anneal ends ~04:30. loader prefetch fix 72e38f5 (10x on its own:
+0.47→5 batch/s).
+
+### 2026-07-18 ~01:30 — B4 CORPUS EXPORT COMPLETE (+ disk crash postmortem)
+v4 re-parse: 67,568 replays, 0 failures, 233G, manifest 381.7M ticks all-1v1.
+bc-export: 67,568/67,568 shards → 163G COMPRESSED npz (plan's 180 B/sample
+estimate was 11x low — real 2,089 B/sample f32 = 1.6TB; deflate 9x on masked
+entity slots saved it, commit 61ea406), 704,498,136 samples, 0 export failures.
+OPS: WSL crashed mid-export — vhdx filled the Windows host disk (WSL df lies;
+real host free ~180G). Cleanup freed ~105G (v3 shards 85G superseded, uv/HF
+caches 20G); host-disk guard monitor added (kills export <100G); run-B lost two
+0-byte cks to the crash (quarantined, resumed from 3.5747B intact). Crash also
+proved the bc-export fsync gap: truncated-but-renamed bc npz in the pre-crash
+cohort — scanned/deleted/re-exported. vhdx compaction recommended to Elliot
+(wsl --set-sparse) at next downtime. BC TRAINING (B5 run) starting: 4 epochs,
+batch 4096, weighted CE, RTX 4060 (sharing with run-B learner).
+
+### 2026-07-17 ~19:45 (monitor)
+| steps | sps | kick_kl | lambda_k | ent | goals/min |
+|---|---|---|---|---|---|
+| 321.8M | 5,467 | 0.40 | 0.357 | 3.26 | **1.79** (ck 320M) |
+Trend: back above teacher (1.56) after the 1.40 dip; KL 0.37→0.40 post-restart
+wobble, inside noise. NOTE: this eval logged 4 contained blowups, all "arena
+rebuilt" — pre-fix, those arenas ran dead-ball for the rest of the tape,
+meaning EARLIER EVAL READINGS (1.71 / 1.40 / 1.81) carried dead-ball
+depression noise; the 1.40 "dip" was likely artifact. Expect eval variance to
+tighten from here. Run-B resumed on fixed engine, 3.528B (sps depressed by
+parse sweep, recovers ~21:00). Re-parse batch_0008/12, ETA ~21:00 → B4.

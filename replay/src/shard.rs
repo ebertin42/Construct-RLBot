@@ -11,12 +11,33 @@
 //!
 //! ## Array layout
 //! - `ball` `[T, 13]`: pos3, vel3, ang_vel3, quat4 (`[x,y,z,w]`).
-//! - `cars_state` `[T, P, 16]`: pos3, vel3, ang_vel3, quat4, boost (0..1),
-//!   on_ground (0/1), demoed (0/1). `P` = `player_teams.len()`, same car
-//!   order as `player_teams` and `cars_action`.
+//! - `cars_state` `[T, P, 17]`: pos3, vel3, ang_vel3, quat4, boost (0..1),
+//!   on_ground (0/1), demoed (0/1), has_flip (0/1, v4). `P` =
+//!   `player_teams.len()`, same car order as `player_teams` and
+//!   `cars_action`.
 //! - `cars_action` `[T, P, 8]`: throttle, steer, pitch, yaw, roll, jump,
 //!   boost, handbrake (jump/boost/handbrake as 0.0/1.0) — the applied
 //!   `CarControls` for that tick's 30 Hz interval (see `Tick::actions`).
+//! - `cars_action_idx` `[T, P]` (`i64`, Task B2): `cars_action[t,p]`
+//!   projected onto its nearest row of
+//!   `construct_engine::actions::make_lookup_table_v1()` (92 rows), via
+//!   `crate::project::project_action` gated by that car's `on_ground`,
+//!   `has_flip`, and `boost` (see `project_action`'s doc for the cost
+//!   model). Values are always in `[0, 92)`. Computed here in `write_shard`
+//!   rather than in `reconstruct.rs` because everything the projection
+//!   needs (`tick.actions[p]`, `car.on_ground`, `tick.has_flip[p]`,
+//!   `car.boost`) is already assembled in this loop, one column over from
+//!   `cars_action` itself — no need to thread it back through `Tick`.
+//! - `pads` `[T, 34, 2]` (v4): every boost pad's `(timer, is_active)`, in
+//!   the arena's fixed construction order (see `reconstruct::Tick::pads`
+//!   doc). `timer` is `0.0..=1.0` (0 while active, else `cooldown / 10.0`);
+//!   `is_active` is 0/1.
+//! - `ball_pred` `[T, 4, 6]` (v4): ball position+velocity prediction at
+//!   +0.5/1.0/1.5/2.0s (ascending horizon), each row `[pos_x, pos_y, pos_z,
+//!   vel_x, vel_y, vel_z]` (see `reconstruct::Tick::ball_pred` doc — only
+//!   computed via a real roll-forward simulation for ticks landing on this
+//!   shard's `stride` selection; see `write_shard`'s doc for why that always
+//!   holds when `reconstruct_120hz` was called with the same `stride`).
 //! - `player_teams` `[P]` (`i64`, 0=blue/1=orange).
 //! - `tick_index` `[T]` (`i64`): global monotonic 120 Hz tick position in the
 //!   ORIGINAL undropped sub-step sequence (see `reconstruct`'s module doc),
@@ -30,12 +51,13 @@
 //!   whenever `is_boundary[i+1] == 1` — that transition is a fresh step from
 //!   a re-snapped arena, not `action[i]` applied to `state[i]`.
 //!
-//! `cars_state`'s column count is 16, not the 15 a naive plan sketch assumed
-//! (pos3+vel3+ang_vel3+quat4 = 13, +boost+on_ground+demoed = 16) — every
-//! field is kept because IDM/BC need `demoed` to mask dead-car ticks and
-//! `on_ground` for the aerial-vs-grounded action split. The sidecar's
-//! `cars_state_columns` is the source of truth; consumers should assert
-//! against its length rather than hardcoding 15 or 16.
+//! `cars_state`'s column count is 17 as of schema v4 (pos3+vel3+ang_vel3+
+//! quat4 = 13, +boost+on_ground+demoed+has_flip = 17) — every field is kept
+//! because IDM/BC need `demoed` to mask dead-car ticks, `on_ground` for the
+//! aerial-vs-grounded action split, and `has_flip` for the action-projection
+//! context gate (Task B2). The sidecar's `cars_state_columns` is the source
+//! of truth; consumers should assert against its length rather than
+//! hardcoding a column count.
 //!
 //! `T`/`P` == 0 (empty reconstruction, e.g. a replay with no players or no
 //! usable ticks) is treated as a hard error rather than writing an empty
@@ -49,8 +71,11 @@ use ndarray::{Array1, Array2, Array3};
 use ndarray_npy::NpzWriter;
 use serde::Serialize;
 
+use construct_engine::actions::make_lookup_table_v1;
+
 use crate::{
     meta::ReplayMeta,
+    project::project_action,
     reconstruct::{Reconstructed, Tick},
 };
 
@@ -66,20 +91,46 @@ use crate::{
 /// per shard instead of being a fixed 120 Hz, so the sidecar records `stride`
 /// + `effective_hz` and downstream loaders must read those rather than
 /// assuming 120 Hz.
-pub const SHARD_SCHEMA_VERSION: u32 = 3;
+///
+/// v4: added `has_flip` to `cars_state` (16 -> 17 columns), plus two new
+/// arrays: `pads` `[T, 34, 2]` (per-pad timer/is_active) and `ball_pred`
+/// `[T, 4, 6]` (ball pos+vel prediction at +0.5/1/1.5/2s) — see the module
+/// doc's "Array layout" section and `reconstruct::Tick`'s doc for the exact
+/// per-column semantics and how they're computed.
+///
+/// Task B2 adds `cars_action_idx` `[T, P]` (the projected 92-table action
+/// index) WITHOUT bumping this constant: no v4 corpus exists yet (v4 was
+/// only just introduced by B1), so there is nothing on disk that predates
+/// `cars_action_idx` and needs distinguishing from shards that have it —
+/// every v4 shard written after this change carries the new array. A future
+/// schema change that touches an EXISTING v4 array (rather than adding a
+/// new one) should still bump to v5.
+pub const SHARD_SCHEMA_VERSION: u32 = 4;
 
 pub const BALL_COLUMNS: [&str; 13] = [
     "pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z", "ang_vel_x", "ang_vel_y", "ang_vel_z",
     "quat_x", "quat_y", "quat_z", "quat_w",
 ];
 
-pub const CARS_STATE_COLUMNS: [&str; 16] = [
+pub const CARS_STATE_COLUMNS: [&str; 17] = [
     "pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z", "ang_vel_x", "ang_vel_y", "ang_vel_z",
-    "quat_x", "quat_y", "quat_z", "quat_w", "boost", "on_ground", "demoed",
+    "quat_x", "quat_y", "quat_z", "quat_w", "boost", "on_ground", "demoed", "has_flip",
 ];
 
 pub const CARS_ACTION_COLUMNS: [&str; 8] =
     ["throttle", "steer", "pitch", "yaw", "roll", "jump", "boost", "handbrake"];
+
+/// `pads` array last-dim column names (v4) — see module doc's "Array layout".
+pub const PAD_COLUMNS: [&str; 2] = ["timer", "is_active"];
+
+/// `ball_pred` array last-dim column names (v4) — see module doc's "Array
+/// layout". Middle dim (4) is ascending prediction horizon, documented
+/// separately in the sidecar's `ball_pred_horizons_sec`.
+pub const BALL_PRED_COLUMNS: [&str; 6] = ["pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z"];
+
+/// `ball_pred` array middle-dim horizons, in seconds, ascending — matches
+/// `construct_engine::ballpred::Tracker::predict`'s +0.5/1/1.5/2s snapshots.
+pub const BALL_PRED_HORIZONS_SEC: [f64; 4] = [0.5, 1.0, 1.5, 2.0];
 
 #[derive(Debug, Serialize)]
 struct ShardSidecar {
@@ -100,6 +151,17 @@ struct ShardSidecar {
     ball_columns: Vec<String>,
     cars_state_columns: Vec<String>,
     cars_action_columns: Vec<String>,
+    /// v4: `pads` array last-dim column names.
+    pad_columns: Vec<String>,
+    /// v4: `ball_pred` array last-dim column names.
+    ball_pred_columns: Vec<String>,
+    /// v4: `ball_pred` array middle-dim horizons, in seconds (ascending).
+    ball_pred_horizons_sec: Vec<f64>,
+    /// Task B2: number of rows in the action table `cars_action_idx` was
+    /// projected against (`construct_engine::actions::make_lookup_table_v1
+    /// ().len()`, currently 92) — every `cars_action_idx` value is in
+    /// `[0, action_table_size)`.
+    action_table_size: usize,
 }
 
 /// Writes `rec` to `<out_dir>/<replay_id>.npz` (+ `<replay_id>.json`
@@ -147,17 +209,27 @@ pub fn write_shard(
         .map_err(|e| format!("create_dir_all {}: {e}", out_dir.display()))?;
 
     let mut ball = Array2::<f32>::zeros((num_ticks, 13));
-    let mut cars_state = Array3::<f32>::zeros((num_ticks, num_players, 16));
+    let mut cars_state = Array3::<f32>::zeros((num_ticks, num_players, 17));
     let mut cars_action = Array3::<f32>::zeros((num_ticks, num_players, 8));
+    let mut cars_action_idx = Array2::<i64>::zeros((num_ticks, num_players));
+    let mut pads = Array3::<f32>::zeros((num_ticks, 34, 2));
+    let mut ball_pred = Array3::<f32>::zeros((num_ticks, 4, 6));
     let mut tick_index = Array1::<i64>::zeros(num_ticks);
     let mut is_boundary = Array1::<i64>::zeros(num_ticks);
 
+    // Built once and reused for every (t, p) projection below — Task B2.
+    let action_table = make_lookup_table_v1();
+
     for (t, tick) in selected.iter().enumerate() {
-        if tick.cars.len() != num_players || tick.actions.len() != num_players {
+        if tick.cars.len() != num_players
+            || tick.actions.len() != num_players
+            || tick.has_flip.len() != num_players
+        {
             return Err(format!(
-                "tick {t}: expected {num_players} cars, got {} cars / {} actions",
+                "tick {t}: expected {num_players} cars, got {} cars / {} actions / {} has_flip",
                 tick.cars.len(),
-                tick.actions.len()
+                tick.actions.len(),
+                tick.has_flip.len()
             ));
         }
 
@@ -197,10 +269,35 @@ pub fn write_shard(
             cars_state[[t, p, 13]] = car.boost;
             cars_state[[t, p, 14]] = if car.on_ground { 1.0 } else { 0.0 };
             cars_state[[t, p, 15]] = if car.demoed { 1.0 } else { 0.0 };
+            cars_state[[t, p, 16]] = if tick.has_flip[p] { 1.0 } else { 0.0 };
 
             let action = tick.actions[p];
             for (k, &v) in action.iter().enumerate() {
                 cars_action[[t, p, k]] = v;
+            }
+            cars_action_idx[[t, p]] = project_action(
+                &action,
+                car.on_ground,
+                tick.has_flip[p],
+                car.boost,
+                &action_table,
+            ) as i64;
+        }
+
+        // pads: fixed arena order, (timer, is_active) — see `Tick::pads` doc.
+        // `.take(34)` defensively caps at the documented array width in case
+        // an arena config ever reports a different pad count (standard
+        // soccar always has exactly 34).
+        for (pad_idx, &(timer, active)) in tick.pads.iter().take(34).enumerate() {
+            pads[[t, pad_idx, 0]] = timer;
+            pads[[t, pad_idx, 1]] = if active { 1.0 } else { 0.0 };
+        }
+
+        // ball_pred: ascending horizon, each row pos3+vel3 — see
+        // `Tick::ball_pred` doc.
+        for (h, row) in tick.ball_pred.iter().enumerate() {
+            for (k, &v) in row.iter().enumerate() {
+                ball_pred[[t, h, k]] = v;
             }
         }
     }
@@ -217,6 +314,9 @@ pub fn write_shard(
     npz.add_array("ball", &ball).map_err(|e| e.to_string())?;
     npz.add_array("cars_state", &cars_state).map_err(|e| e.to_string())?;
     npz.add_array("cars_action", &cars_action).map_err(|e| e.to_string())?;
+    npz.add_array("cars_action_idx", &cars_action_idx).map_err(|e| e.to_string())?;
+    npz.add_array("pads", &pads).map_err(|e| e.to_string())?;
+    npz.add_array("ball_pred", &ball_pred).map_err(|e| e.to_string())?;
     npz.add_array("player_teams", &player_teams).map_err(|e| e.to_string())?;
     npz.add_array("tick_index", &tick_index).map_err(|e| e.to_string())?;
     npz.add_array("is_boundary", &is_boundary).map_err(|e| e.to_string())?;
@@ -234,6 +334,10 @@ pub fn write_shard(
         ball_columns: BALL_COLUMNS.iter().map(|s| s.to_string()).collect(),
         cars_state_columns: CARS_STATE_COLUMNS.iter().map(|s| s.to_string()).collect(),
         cars_action_columns: CARS_ACTION_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        pad_columns: PAD_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        ball_pred_columns: BALL_PRED_COLUMNS.iter().map(|s| s.to_string()).collect(),
+        ball_pred_horizons_sec: BALL_PRED_HORIZONS_SEC.to_vec(),
+        action_table_size: action_table.len(),
     };
     let sidecar_path = out_dir.join(format!("{replay_id}.json"));
     let sidecar_file = std::fs::File::create(&sidecar_path)

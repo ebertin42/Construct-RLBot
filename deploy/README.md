@@ -11,6 +11,69 @@
    RLBOT_AGENT_ID=construct/construct_v0 set)
 RLBot only works in local/offline matches; it launches the game with -rlbot.
 
+## Checkpoint schema dispatch (v0 MLP / v1 entity transformer)
+
+`deploy/model.py::load_policy` dispatches on `checkpoint.pt`'s
+`schema_version`:
+
+- `0` — the original 94-obs MLP (`PolicyValueNet`) with the 90-row action
+  table. Behavior unchanged.
+- `1` — the entity-transformer (`EntityPolicyNet`, 128/2/4/512, vendored from
+  `python/construct/learn/model_v1.py`) with the 92-row v1.1 action table
+  (90 v0 rows + 2 stalls). Obs is the obs-v1 entity set
+  (`engine/src/obs_v1.rs`): 17 entities x 26 features + mask + 64-float query
+  + prev-5 action indices.
+
+To switch models just replace `checkpoint.pt` (e.g. with any
+`checkpoints_entity/ck_*.pt`) — the bot picks the right net, obs builder,
+and action table at startup. Both paths act greedily (argmax) every 8
+physics ticks.
+
+### v1: verified offline (WSL, tests/python/test_deploy_v1.py)
+
+- Action table: deploy's 92 rows equal `construct._engine.action_table_v1()`
+  row-for-row.
+- Obs: `deploy/obs.py::build_obs_v1` reproduces a real bc-export golden
+  (`replay/src/bc_obs.rs`, the exact engine `obs_v1::build` output) to 1e-5
+  on ents/mask/query — including the orange-POV mirror and the boost-pad
+  mirror permutation.
+- prev-5 ring: `update_prev_ring` (newest-first) reproduces the bc-export
+  `prev` array exactly over a full shard.
+- Model: a real `checkpoints_entity` checkpoint loads through `load_policy`
+  and its logits/value are bit-identical to the training-side
+  `construct.learn.model_v1.EntityPolicyNet` on the same inputs.
+- Pad order: the rlgym/rlbot pad ordering (rlgym_compat `BOOST_LOCATIONS`,
+  including its (-940, 3310) 2uu quirk) maps bijectively onto the canonical
+  RocketSim arena order via nearest-position matching.
+
+### v1: needs live checking (Windows, real match)
+
+- Ball prediction mapping: the bot reads RLBot v5's `self.ball_prediction`
+  (120 Hz slices, `slices[0]` = now) at indices 60/120/180/240 for the
+  +0.5/1/1.5/2 s horizons. Confirm slices are present and the sampled
+  positions look sane. If the prediction is missing the bot falls back to a
+  ballistic extrapolation (gravity -650 uu/s^2, **no wall/floor bounces** —
+  approximate by design; the trained net saw RocketSim rollouts).
+- Pad matching: `field_info.boost_pads` positions must be the standard 34
+  soccar pads (mapping is built once in `initialize`; a non-standard count
+  degrades to "all pads active"). Confirm `packet.boost_pads` order matches
+  `field_info.boost_pads` order and that `BoostPadState.timer` counts
+  seconds SINCE pickup (deploy converts to seconds-until-respawn via
+  10 s big / 4 s small).
+- Compat accessors: everything in the v0 checklist below, plus the v1 flip
+  flag — obs f22 uses RocketSim `HasFlipOrJump` semantics, mapped as
+  `car.on_ground or car.has_flip` (NOT v0's `can_flip`).
+- prev-action ring: zeroed at bot init and while `goal_scored` is set (the
+  post-goal replay/kickoff); otherwise continuous. Mid-match hot-joins keep
+  a stale ring for ~5 acting steps (accepted, mirrors bc-export's known
+  goal-gap behavior).
+- Scoreboard: the 3 score/clock floats in the query row are deliberately
+  ALWAYS 0.0 — the net was trained with zeros (engine has no scoreboard);
+  writing real values would be out-of-distribution.
+- Car ordering: mate/opp entity slots sort ascending by rlbot `player_id`;
+  the engine sorts by RocketSim car id (spawn order). Confirm the id space
+  rlbot hands out is stable within a match.
+
 ## Live-verification checklist
 
 `deploy/bot.py` was written against the rlgym-compat API surface described in

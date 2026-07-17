@@ -93,6 +93,75 @@ fn physics_nan_contained_as_termination() {
 }
 
 #[test]
+fn containment_rebuilds_arena_leaving_live_physics() {
+    // Dead-ball repro. When the contact solver blows up (NaN), Bullet's
+    // updateSingleAabb latches DISABLE_SIMULATION on the poisoned body — a
+    // one-way latch RocketSim never clears (Ball::SetState only attempts
+    // activation when velocity != 0, and plain setActivationState refuses to
+    // leave DISABLE_SIMULATION). Containment that merely resets the POISONED
+    // arena therefore leaves the ball permanently frozen (observed live:
+    // viewer ghost ball, arenas degraded to zero-touch episodes). The fix is
+    // to rebuild the arena on containment; this test asserts post-containment
+    // physics health, which a reset-in-place cannot provide.
+    let mut a = mk(1, 1, 5);
+    let ids = |a: &mut construct_engine::episode::EpisodeArena| -> Vec<(u32, u8)> {
+        let gs = a.game_state();
+        let mut v: Vec<(u32, u8)> = gs.cars.iter().map(|c| (c.id, c.team as u8)).collect();
+        v.sort();
+        v
+    };
+    let ids_before = ids(&mut a);
+
+    // 1. Poison the ball -> one step -> containment fires.
+    a.debug_place_ball([f32::NAN, f32::NAN, f32::NAN], [0.0, 0.0, 0.0]);
+    let mut r = vec![0.0; 2];
+    let mut f = vec![StepFlags::default(); 2];
+    let mut fo = vec![0.0; 2 * OBS_SIZE];
+    a.step(&[0, 0], &mut r, &mut f, &mut fo);
+    assert!(f[0].terminated && f[1].terminated, "poisoned arena must terminate episode");
+
+    // 2. Car ids must survive the rebuild bit-identically (ids are a per-arena
+    // counter starting at 1; preserved add order re-issues 1..N), so the
+    // agent->car mapping and viewer identity hold.
+    let ids_after = ids(&mut a);
+    assert_eq!(ids_before, ids_after, "rebuilt arena must re-issue identical car ids");
+
+    // 3. The latched case: a MOVING ball must keep moving. (An exactly
+    // zero-velocity ball is legitimately frozen even on a healthy arena —
+    // RocketSim's Arena::Step forces ISLAND_SLEEPING whenever lin+ang vel are
+    // exactly zero, which is what keeps the kickoff ball pinned at center —
+    // so the discriminating probe is a small NONZERO velocity: Arena::Step
+    // then calls setActivationState(ACTIVE_TAG) every tick, which a healthy
+    // ball obeys and a DISABLE_SIMULATION-latched ball refuses.) On the old
+    // reset-in-place containment the ball stays at z=500 bit-exactly forever
+    // despite its velocity — the live dead-ball symptom.
+    for _ in 0..3 {
+        a.step(&[0, 0], &mut r, &mut f, &mut fo);
+    }
+    a.debug_place_ball([0.0, 0.0, 500.0], [0.0, 0.0, -10.0]);
+    for _ in 0..20 {
+        a.step(&[0, 0], &mut r, &mut f, &mut fo);
+    }
+    let z = a.game_state().ball.pos.z;
+    assert!(
+        z < 490.0,
+        "gravity must act on the ball after containment (Bullet DISABLE_SIMULATION latch), ball z = {z}"
+    );
+
+    // 4. Cars must still drive on the rebuilt arena.
+    let pos_before = a.game_state().cars[0].state.pos;
+    for _ in 0..10 {
+        a.step(&[2, 2], &mut r, &mut f, &mut fo); // action 2 = straight reverse
+    }
+    let pos_after = a.game_state().cars[0].state.pos;
+    let moved = ((pos_after.x - pos_before.x).powi(2)
+        + (pos_after.y - pos_before.y).powi(2)
+        + (pos_after.z - pos_before.z).powi(2))
+    .sqrt();
+    assert!(moved > 10.0, "car must still move after containment, moved {moved} uu");
+}
+
+#[test]
 fn physics_insane_but_finite_contained_as_termination() {
     // A contact-solver blowup can ramp through huge-but-finite values before (or
     // instead of) ever reaching NaN/inf. `state_is_finite` alone accepts these

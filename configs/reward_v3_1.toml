@@ -1,0 +1,26 @@
+# reward v3.1 = v3 with the goal-trading exploit closed. Separate file for
+# regime provenance (v3 resumes never change regime).
+#
+# WHY: post-kickstart-anneal self-play (2026-07-18, ~520-650M steps) found a
+# POSITIVE-SUM exploit in v3's +10 goal / -8 concede asymmetry: partners
+# alternate goals, each netting +2 per exchange. Live ep_rew exploded 5.7→16.6
+# while neutral-tape goals collapsed 1.90→0.46/min (mechanism: journal
+# 2026-07-18 09:40, commit aa560ab). v3.1 makes conceding cost MORE than a
+# goal pays (+10/-12): any trade is now net -2 — the loop is strictly
+# unprofitable regardless of opponent cooperation. Deployed together with the
+# v1-native league (past selves as opponents) to break the cooperative
+# equilibrium from both sides.
+
+goal = 10.0                 # dominant; concede = -goal*(1-bias) = -12.0
+touch = 0.0
+vel_to_ball = 0.05          # unchanged tiny anti-degenerate engagement term
+aggression_bias = -0.2      # concede -12, score +10 -> defense-weighted
+
+# Farmable dense shaping stays OFF (v3 rationale):
+touch_accel = 0.0
+vel_ball_to_goal = 0.0
+offensive_potential = 0.0
+
+# Team play unchanged (isolate the variable).
+team_spirit = 0.3
+opp_spirit = 0.3
