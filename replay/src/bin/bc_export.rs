@@ -1,4 +1,4 @@
-//! `bc-export`: batch-converts schema-v4 shards (`<id>.npz` + `<id>.json`,
+//! `bc-export`: batch-converts schema v4/v5 shards (`<id>.npz` + `<id>.json`,
 //! from `replay-parse`) into obs-v1 BC training tensors (`bc_<id>.npz`) via
 //! `construct_replay::bc_obs` — which rebuilds a minimal `GameState` per
 //! stored tick and calls the live engine's own `obs_v1::build` per car (one
@@ -25,7 +25,7 @@ use construct_engine::schema::Schema;
 use construct_replay::bc_obs::{export_shard_file, pad_template};
 use rayon::prelude::*;
 
-/// Batch-convert schema-v4 replay shards into obs-v1 BC training tensors.
+/// Batch-convert schema v4/v5 replay shards into obs-v1 BC training tensors.
 ///
 /// Requires RocketSim's collision-mesh assets to resolve as
 /// `assets/collision_meshes` or `../assets/collision_meshes` from the

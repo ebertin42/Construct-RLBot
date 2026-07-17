@@ -139,7 +139,7 @@ pub struct Shard {
     pub action_table_size: usize,
 }
 
-/// Obs-v1 training tensors for one shard, `S = T * P` samples in row-major
+/// Obs-v1 training tensors for one shard, `S <= T * P` samples (demoed-car rows skipped on v5) in row-major
 /// `(t, p)` order — see the module doc's "Sample layout".
 pub struct BcTensors {
     pub ents: Array3<f32>,
