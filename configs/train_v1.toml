@@ -49,6 +49,12 @@ steps = 500000000          # anneal horizon: lambda_k 1.0 -> 0 over these steps
 # lambda_k = 1.0           # initial KL weight
 # lambda_v = 0.5           # value-regression weight (fixed while lambda_k > 0)
 
+# [kl_prior]
+# Frozen BC human prior (KL(student‖prior) added to PPO loss). Enable after
+# BC-pretrain B6 go (docs/superpowers/plans/2026-07-17-bc-pretrain.md).
+# ck = "checkpoints_bc/ck_epoch1.pt"
+# lambda = 0.05
+
 # [league]
 # enabled = true
 # opponent_frac = 0.2        # fraction of arenas (tail-assigned) driven by opponent-pool checkpoints

@@ -99,3 +99,29 @@ def test_v0_checkpoint_rejected(tmp_path):
     torch.save({"model": {}, "schema_version": 0, "config": {"net": {}}}, p)
     with pytest.raises(AssertionError):
         KLPrior(str(p), device="cpu")
+
+
+def test_config_kl_prior_block(tmp_path):
+    from construct.learn.config import TrainConfig
+    cfg_toml = tmp_path / "t.toml"
+    cfg_toml.write_text(
+        'schema_path = "schema/v1.toml"\n'
+        'reward_config_path = "configs/reward_v3.toml"\n'
+        "[kl_prior]\n"
+        'ck = "checkpoints_bc/bc.pt"\n'
+        "lambda = 0.1\n"
+    )
+    cfg = TrainConfig.load(str(cfg_toml))
+    assert cfg.kl_prior["ck"] == "checkpoints_bc/bc.pt"
+    assert float(cfg.kl_prior["lambda"]) == 0.1
+
+
+def test_config_kl_prior_default_empty(tmp_path):
+    from construct.learn.config import TrainConfig
+    cfg_toml = tmp_path / "t.toml"
+    cfg_toml.write_text(
+        'schema_path = "schema/v1.toml"\n'
+        'reward_config_path = "configs/reward_v3.toml"\n'
+    )
+    cfg = TrainConfig.load(str(cfg_toml))
+    assert cfg.kl_prior == {}
