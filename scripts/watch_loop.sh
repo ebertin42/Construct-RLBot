@@ -11,9 +11,11 @@ ROTATE_SECS="${1:-300}"
 slot=0
 
 while true; do
-    entity=$(ls checkpoints_entity/ck_*.pt 2>/dev/null | sort | tail -1)
-    teacher=$(ls checkpoints/ck_*.pt 2>/dev/null | sort | tail -1)
-    runb=$(ls checkpoints_b/ck_*.pt 2>/dev/null | sort | tail -1)
+    # newest by MTIME, not lexical step number: after a rollback the live
+    # frontier has SMALLER step numbers than stale pre-rollback files
+    entity=$(ls -t checkpoints_entity/ck_*.pt 2>/dev/null | head -1)
+    teacher=$(ls -t checkpoints/ck_*.pt 2>/dev/null | head -1)
+    runb=$(ls -t checkpoints_b/ck_*.pt 2>/dev/null | head -1)
     case $((slot % 5)) in
         0|2)
             if [ -n "$entity" ]; then
