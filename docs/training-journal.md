@@ -90,6 +90,19 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~16:40 — B6: NO-GO (copycat), prev-dropout retrain launched
+Epoch-1 BC ck: val top-1 66.9% / top-3 84.3% (way above Seer 35-50% band —
+red flag, not a win) but closed-loop eval near-random: 0.26 touches/min,
+0.06 goals/min vs random-init baseline 0.16/0.03. Probe confirmed COPYCAT:
+79% of predictions == prev[0] (humans repeat 70%); zeroing the prev ring
+collapses accuracy 69.6%→19.3% — ~3/4 of learned "skill" is echoing the
+prev-5 input. More epochs can't fix (it's the objective's optimum). FIX
+(Elliot-approved): prev-dropout p=0.5 (per-sample zero the prev ring during
+training; obs_v1 unchanged), retrain 2 epochs (~20h, prior ready ~mid-day
+2026-07-19). Copycat ck kept as ck_bc_ep00_copycat.pt for comparison. K4
+deploy waits on B6-v2. Remote left running in avoidance regime (checkpoints
+disposable; 562M rollback point intact both boxes).
+
 ### 2026-07-18 ~15:00 — ⚠ SECOND DEGENERACY: MUTUAL AVOIDANCE (confirmed)
 Post-rollback oscillation resolved downward: 2.25@562 → 2.11@589 → 0.66@608 →
 0.61@611 (two consecutive <1.5), touches 2.8, dist 3651, live ep_rew -1.3.
