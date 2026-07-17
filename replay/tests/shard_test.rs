@@ -183,6 +183,40 @@ fn writes_loadable_shard_with_schema() {
         }
     }
 
+    // --- ball_pred divergence (restored, task #45 → schema v5) ---
+    // Removed in d798ed8 because `ballpred::Tracker`'s poisoned Bullet arena
+    // latched DISABLE_SIMULATION forever after its first containment trip,
+    // collapsing EVERY subsequent prediction to an echo of the input ball —
+    // whether that latch engaged depended on binary allocation history, so
+    // any divergence assertion was testing per-build solver luck. Engine
+    // commit 0928e59 fixed the latch (predict() rebuilds its arena on
+    // containment before returning), so at most the rare individual
+    // containment-tripping call can still echo; a moving ball's +2s
+    // prediction must otherwise genuinely diverge from its current position.
+    // Assert the overwhelming majority of moving-ball ticks diverge — an
+    // all-echo (or mostly-echo) shard means the poisoned-latch regressed.
+    // (Measured on this box: 10714/10719 moving ticks diverge; the 5 echoes
+    // are individual containment trips, i.e. the expected transient.)
+    let mut moving = 0usize;
+    let mut diverged = 0usize;
+    for t in 0..num_ticks {
+        let speed = (ball[[t, 3]].powi(2) + ball[[t, 4]].powi(2) + ball[[t, 5]].powi(2)).sqrt();
+        if speed < 300.0 {
+            continue; // near-rest ball legitimately predicts near itself
+        }
+        moving += 1;
+        let d2: f32 = (0..3).map(|k| (ball_pred[[t, 3, k]] - ball[[t, k]]).powi(2)).sum();
+        if d2.sqrt() > 5.0 {
+            diverged += 1;
+        }
+    }
+    assert!(moving > 1000, "fixture must have plenty of moving-ball ticks, got {moving}");
+    assert!(
+        diverged as f64 >= moving as f64 * 0.9,
+        "+2s ball_pred must diverge >5uu from the current ball position on at least 90% of \
+         moving-ball (speed>300) ticks; got {diverged}/{moving} — echo predictions at this rate \
+         mean the ballpred poisoned-arena latch (fixed in engine 0928e59) is back"
+    );
 }
 
 #[test]
