@@ -90,6 +90,14 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~05:45 (monitor)
+Post-anneal reading 1: ck 520M → **1.90 goals/min** (new high; teacher 1.56,
+prior peak 1.81). Touches 15.2→10.5/min, dist 1452→1882 — fewer but more
+decisive possessions, goals up: efficiency, NOT the hacking signature. Remote
+sps 5.5k→8.1k post-anneal (teacher forward gone); log dropped kick_kl/lambda_k
+fields as expected. ent 3.67 elevated — watch decline. BC epoch 0 at 32k/177k
+batches, loss 1.94. No flags.
+
 ### 2026-07-18 ~05:00 (monitor)
 | steps | sps | kick_kl | lambda_k | ent | goals/min |
 |---|---|---|---|---|---|
