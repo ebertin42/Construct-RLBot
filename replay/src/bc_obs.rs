@@ -374,9 +374,25 @@ pub fn build_tensors(
 
 /// Exports one shard file to `<out_dir>/bc_<stem>.npz`. Returns
 /// `Ok(None)` without touching anything if the output already exists
-/// (resumability), else `Ok(Some((path, num_samples)))`. Writes to a `.tmp`
-/// sibling first and renames into place, so an interrupted export never
-/// leaves a partial file that a resumed run would wrongly skip.
+/// (resumability), else `Ok(Some((path, num_samples)))`.
+///
+/// Crash safety (task #45 follow-up, prompted by a 2026-07-18 WSL hard-crash
+/// that left 478 truncated-but-renamed `bc_*.npz` files which the
+/// skip-existing resume above then silently trusted as complete): writes to
+/// a `.tmp` sibling, `fsync`s the underlying file descriptor so the tmp
+/// file's bytes are durable on disk BEFORE the rename, and only then renames
+/// into place. `rename` alone is atomic w.r.t. a crash landing exactly on
+/// the directory entry, but says nothing about whether the tmp file's data
+/// actually reached disk first — without the `sync_all` a crash between
+/// `finish()` and `rename` (or one that reorders the writeback under the
+/// rename, as WSL9p/ext4 delayed allocation can) can still produce a
+/// renamed-but-truncated `out_path` that looks complete to the `out_path.
+/// exists()` check above. The tmp filename is additionally suffixed with
+/// this process's pid so two exporters racing on the same `out_dir` (e.g. a
+/// retried/parallel corpus run) never write-then-rename over each other's
+/// same-named tmp file mid-flight; any *foreign* leftover `.tmp.<pid>` from
+/// a dead process is simply ignored (never matched by `out_path.exists()`,
+/// and no other code path reads `.tmp` files back in).
 pub fn export_shard_file(
     shard_npz: &Path,
     out_dir: &Path,
@@ -396,7 +412,7 @@ pub fn export_shard_file(
     let bc = build_tensors(&shard, pad_template, norm)?;
     let samples = bc.action.len();
 
-    let tmp_path = out_dir.join(format!("bc_{stem}.npz.tmp"));
+    let tmp_path = out_dir.join(format!("bc_{stem}.npz.tmp.{}", std::process::id()));
     let file = std::fs::File::create(&tmp_path)
         .map_err(|e| format!("create {}: {e}", tmp_path.display()))?;
     // compressed: obs tensors are ~9x deflate-redundant (masked entity slots),
@@ -407,7 +423,13 @@ pub fn export_shard_file(
     npz.add_array("query", &bc.query).map_err(|e| e.to_string())?;
     npz.add_array("prev", &bc.prev).map_err(|e| e.to_string())?;
     npz.add_array("action", &bc.action).map_err(|e| e.to_string())?;
-    npz.finish().map_err(|e| e.to_string())?;
+    // `finish` hands back the underlying `File` (it's the zip writer's `W`),
+    // so the fsync below covers everything `NpzWriter` buffered internally,
+    // not just what a plain `File::sync_all` on the original handle would
+    // have seen.
+    let file = npz.finish().map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| format!("fsync {}: {e}", tmp_path.display()))?;
+    drop(file);
     std::fs::rename(&tmp_path, &out_path)
         .map_err(|e| format!("rename {} -> {}: {e}", tmp_path.display(), out_path.display()))?;
 

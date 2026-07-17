@@ -266,6 +266,43 @@ fn export_file_writes_npz_and_resumes_by_skipping_existing() {
 }
 
 #[test]
+fn foreign_leftover_tmp_file_does_not_break_export() {
+    // Task #45 follow-up: `export_shard_file`'s tmp filename is now
+    // pid-suffixed (`bc_<stem>.npz.tmp.<pid>`) specifically so concurrent/
+    // retried exporters can't interleave writes to the same tmp path. Guard
+    // that a *foreign* leftover tmp file (e.g. from a killed process, a
+    // different pid than ours) sitting in `out_dir` is simply ignored --
+    // never matched by the `out_path.exists()` skip-check, never read back,
+    // never clobbered by our own write+rename.
+    let out_dir = tempfile::tempdir().unwrap();
+    let pads = pad_template();
+    let nrm = norm();
+
+    let foreign_tmp = out_dir.path().join("bc_sample.npz.tmp.999999999");
+    std::fs::write(&foreign_tmp, b"stale partial data from a dead process").unwrap();
+
+    let result = export_shard_file(fixture_shard(), out_dir.path(), &pads, &nrm).unwrap();
+    let (out_path, samples) = result.expect("export must succeed despite a foreign leftover tmp file");
+    assert_eq!(out_path, out_dir.path().join("bc_sample.npz"));
+    assert!(out_path.exists());
+    assert!(samples > 0);
+
+    // Foreign tmp file: untouched, not deleted, not mistaken for our output.
+    assert!(foreign_tmp.exists(), "foreign .tmp file must not be deleted by export");
+    assert_eq!(
+        std::fs::read(&foreign_tmp).unwrap(),
+        b"stale partial data from a dead process",
+        "foreign .tmp file's contents must be untouched"
+    );
+
+    // The real output must load correctly (not e.g. accidentally the
+    // foreign file renamed into place).
+    let mut npz = NpzReader::new(std::fs::File::open(&out_path).unwrap()).unwrap();
+    let action: ndarray::Array1<i64> = npz.by_name("action.npy").unwrap();
+    assert_eq!(action.shape(), &[samples]);
+}
+
+#[test]
 fn export_is_deterministic() {
     let (bc, shard) = fixture_tensors();
     let pads = pad_template();
