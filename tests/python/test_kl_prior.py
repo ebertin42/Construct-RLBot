@@ -156,6 +156,58 @@ def test_composed_hook_prior_only(tmp_path):
     assert "kick_kl" not in info
 
 
+def test_composed_hook_kickstart_and_prior_both_active(tmp_path):
+    """Both extra-loss terms active in one hook call: kickstart distillation
+    (KL(teacher||student) + value MSE, annealed lambda_k/lambda_v) composed
+    with the BC-prior anchor (KL(student||prior), constant lambda_p). Mirrors
+    the reviewer's independent-recomputation check: the hook's loss must
+    equal lambda_k*kl + lambda_v*v_mse + lambda_p*kl_p computed by hand from
+    a second no_grad student forward on the same inputs (EntityPolicyNet has
+    no dropout/BN, so the two forwards are deterministic and bit-comparable)."""
+    from construct.learn.train import compose_extra_loss
+    from construct.learn.kickstart import kickstart_losses
+
+    torch.manual_seed(0)
+    student = EntityPolicyNet(**NET, action_table=_table())
+    torch.manual_seed(1)
+    other = EntityPolicyNet(**NET, action_table=_table())
+    prior = KLPrior(_save_ck(tmp_path, other, "p.pt"), device="cpu")
+    batch = _fake_batch()
+    with torch.no_grad():
+        prior_logits = prior.logits(batch["obs"])
+
+    b = batch["obs"]["ents"].shape[0]
+    g = torch.Generator().manual_seed(7)
+    # Synthesized teacher outputs matching KickstartTeacher.logits_values'
+    # contract: (logits [B,90], values [B]), float32.
+    t_logits = torch.randn(b, 90, generator=g)
+    t_values = torch.randn(b, generator=g)
+
+    lambda_k, lambda_v, lambda_p = 0.3, 0.2, 0.5
+    fn = compose_extra_loss(
+        student, batch,
+        kickstart=(t_logits, t_values), lambda_k=lambda_k, lambda_v=lambda_v,
+        prior_logits=prior_logits, lambda_p=lambda_p,
+    )
+    idx = torch.arange(4)
+    loss, info = fn(idx)
+
+    assert "kick_kl" in info and "kl_pri" in info
+    assert loss.requires_grad
+
+    # Independent recomputation: same student forward under no_grad, terms
+    # computed directly rather than through the hook.
+    with torch.no_grad():
+        s_logits, s_value = student(**{k: v[idx] for k, v in batch["obs"].items()})
+        kl, v_mse = kickstart_losses(s_logits, s_value.squeeze(-1), t_logits[idx], t_values[idx])
+        kl_p = kl_student_prior(s_logits, prior_logits[idx])
+        expected = lambda_k * kl + lambda_v * v_mse + lambda_p * kl_p
+
+    assert loss.item() == pytest.approx(expected.item(), abs=1e-5)
+    assert info["kick_kl"] == pytest.approx(kl.item(), abs=1e-6)
+    assert info["kl_pri"] == pytest.approx(kl_p.item(), abs=1e-6)
+
+
 def test_composed_hook_none_when_nothing_active():
     from construct.learn.train import compose_extra_loss
     student = EntityPolicyNet(**NET, action_table=_table())

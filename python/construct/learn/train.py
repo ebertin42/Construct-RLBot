@@ -48,6 +48,11 @@ def compose_extra_loss(net, batch, *, kickstart, lambda_k, lambda_v,
         # batch["obs"] is the entity dict (keys match EntityPolicyNet.
         # forward's params) -- both kickstart and the prior imply v1.
         s_logits, s_value = net(**{k: v[idx] for k, v in batch["obs"].items()})
+        # Roots `loss` in the autograd graph unconditionally (via a *0.0 no-op
+        # so it never contributes value) so `loss.requires_grad` holds even in
+        # a hypothetical future branch that adds neither kl nor kl_p; not
+        # load-bearing today since kick_on/prior_on guarantee at least one of
+        # kl or kl_p is added below, and either already carries the grad path.
         loss = s_logits.sum() * 0.0
         info = {}
         if kick_on:
