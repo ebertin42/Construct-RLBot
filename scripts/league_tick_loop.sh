@@ -12,6 +12,10 @@
 #   scripts/league_tick_loop.sh 14400 --schema-version 1 --registry league/registry_v1.jsonl
 # (--registry is optional -- league_tick.py already defaults to
 # league/registry_v1.jsonl when --schema-version 1 is given.)
+# To rate BOTH pools every tick with a fair split of the match budget:
+#   scripts/league_tick_loop.sh 14400 --schema-version all
+# (add --registry league/registry.jsonl if v0+v1 entries share one file,
+# as on the remote box).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 TICK_SECS="${1:-14400}"
