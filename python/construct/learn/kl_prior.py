@@ -15,24 +15,30 @@ from construct.learn.model_v1 import EntityPolicyNet
 class KLPrior:
     """Loads a frozen v1 (BC) checkpoint; serves full-distribution logits."""
 
-    def __init__(self, ck_path: str, device: str = "cpu"):
+    def __init__(self, ck_path: str, device: str = "cpu", expect_net: dict | None = None):
         ck = torch.load(ck_path, map_location="cpu", weights_only=False)
         sv = ck.get("schema_version")
         assert sv == 1, f"kl_prior needs a v1 checkpoint, got schema_version={sv} ({ck_path})"
         dims = ck["config"]["net"]
+        if expect_net is not None:
+            keys = ("d_model", "layers", "heads", "ff")
+            assert all(int(dims[k]) == int(expect_net[k]) for k in keys), (
+                f"kl_prior dims mismatch: checkpoint net={dims} != student "
+                f"expect_net={expect_net} ({ck_path})"
+            )
         self.net = EntityPolicyNet(
             d_model=int(dims["d_model"]), layers=int(dims["layers"]),
             heads=int(dims["heads"]), ff=int(dims["ff"]),
             action_table=ck["model"]["action_table"].numpy(),
         )
         self.net.load_state_dict(ck["model"])  # strict: dims mismatch raises
-        self.net.to(device).eval()
-        for p in self.net.parameters():
-            p.requires_grad_(False)
-        self.device = device
+        self.device = torch.device(device)
+        self.net.to(self.device).eval()
+        self.net.requires_grad_(False)
 
     @torch.no_grad()
     def logits(self, obs: dict) -> torch.Tensor:
+        obs = {k: v.to(self.device) for k, v in obs.items()}
         logits, _ = self.net(**obs)
         return logits
 

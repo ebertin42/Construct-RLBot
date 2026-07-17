@@ -82,6 +82,18 @@ def test_dim_mismatch_raises(tmp_path):
         KLPrior(str(p), device="cpu")
 
 
+def test_expect_net_dims_checked(tmp_path):
+    net = EntityPolicyNet(**NET, action_table=_table())
+    ck = _save_ck(tmp_path, net)
+    with pytest.raises(AssertionError) as exc:
+        KLPrior(ck, device="cpu", expect_net={**NET, "d_model": 64})
+    msg = str(exc.value)
+    assert "128" in msg and "64" in msg
+    # matching expect_net loads fine
+    prior = KLPrior(ck, device="cpu", expect_net=NET)
+    assert isinstance(prior, KLPrior)
+
+
 def test_v0_checkpoint_rejected(tmp_path):
     p = tmp_path / "v0.pt"
     torch.save({"model": {}, "schema_version": 0, "config": {"net": {}}}, p)
