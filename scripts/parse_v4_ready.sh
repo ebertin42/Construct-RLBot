@@ -21,8 +21,8 @@ for pass in $(seq 1 40); do
         fi
     done
     # exit when all batches are parsed
-    total=$(ls -d data/replays/grand-champion-2/duels/batch_* | wc -l)
-    done_n=$(ls data/shards_v4/.batch_*.parsed_v4 2>/dev/null | wc -l)
+    total=$(find data/replays/grand-champion-2/duels -maxdepth 1 -name 'batch_*' | wc -l)
+    done_n=$(find data/shards_v4 -maxdepth 1 -name '.batch_*.parsed_v4' 2>/dev/null | wc -l)
     [ "$done_n" -ge "$total" ] && { echo "$(date +%H:%M:%S) ALL BATCHES V4-PARSED"; break; }
     [ "$did" = "0" ] && sleep 300  # nothing ready; wait for downloads
 done

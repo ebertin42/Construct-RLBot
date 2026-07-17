@@ -22,12 +22,12 @@ n = pull_hf_subset(Path('data/replays'), ['$B/**'])
 print('pulled total on disk:', n)
 " || echo "$(date +%H:%M:%S) [$B] pull timed out — parsing what landed"
     IN="data/replays/$B"
-    CNT=$(ls "$IN"/*.replay 2>/dev/null | wc -l)
+    CNT=$(find "$IN" -maxdepth 1 -name '*.replay' 2>/dev/null | wc -l)
     echo "$(date +%H:%M:%S) [$B] parsing $CNT replays..."
     nice -n 10 ./target/release/replay-parse --input-dir "$IN" --output-dir data/shards \
         --reset-pool-out data/reset_pool.jsonl --reset-samples-per-replay 16 \
         --min-team-size 1 --stride 8
-    echo "$(date +%H:%M:%S) [$B] done. shards so far: $(ls data/shards/*.npz | wc -l), $(du -sh data/shards | cut -f1)"
+    echo "$(date +%H:%M:%S) [$B] done. shards so far: $(find data/shards -maxdepth 1 -name '*.npz' | wc -l), $(du -sh data/shards | cut -f1)"
 done
 
 echo "$(date +%H:%M:%S) rebuilding manifest..."

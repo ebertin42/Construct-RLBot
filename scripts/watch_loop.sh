@@ -13,9 +13,9 @@ slot=0
 while true; do
     # newest by MTIME, not lexical step number: after a rollback the live
     # frontier has SMALLER step numbers than stale pre-rollback files
-    entity=$(ls -t checkpoints_entity/ck_*.pt 2>/dev/null | head -1)
-    teacher=$(ls -t checkpoints/ck_*.pt 2>/dev/null | head -1)
-    runb=$(ls -t checkpoints_b/ck_*.pt 2>/dev/null | head -1)
+    entity=$(find checkpoints_entity -maxdepth 1 -name 'ck_*.pt' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    teacher=$(find checkpoints -maxdepth 1 -name 'ck_*.pt' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    runb=$(find checkpoints_b -maxdepth 1 -name 'ck_*.pt' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
     case $((slot % 5)) in
         0|2)
             if [ -n "$entity" ]; then
