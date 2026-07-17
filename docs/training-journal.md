@@ -90,6 +90,24 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-19 ~00:45 — B6-v2 preview: FAIL AGAIN — pivot to v5 corpus (BC-v3)
+Prev-dropout epoch-1 ck: probe CONFIRMED dropout worked (prev-zeroed acc
+0.193→0.451, pred==prev0 0.794→0.755 vs human 0.698, val top1 65.9) — yet
+closed-loop STILL dead: 0.31 touches/0.10 goals self-play, and 0-98 vs the
+520M peak via league MatchRunner (decisive: not a self-mirror artifact).
+Copycat was real but secondary. Prime suspect now: TRAIN/EVAL feature-
+distribution mismatch from the 69% poisoned ball_pred corpus — the net
+learned pred-slots≈current-ball; live eval feeds HEALTHY predictions (post-
+0928e59), so 4 entity slots are off-distribution every tick. AUTONOMY CALL:
+killed epoch 2 (same poisoned data, low marginal value); chained: v5 parse
+(done soon) → manifest → bc-export --force on v5 corpus (healthy ball_pred +
+demoed-skip + kickoff markers) → BC-v3 (prev-dropout, 2 epochs, ~47k/s).
+Saves ~4h vs finishing epoch 2 first. K4 NOT deployed (needs a working
+prior). Archived: ck_bc_ep00_dropout_poisoned.pt. If BC-v3 also fails
+closed-loop → next hypotheses: deeper compounding (needs DAgger-style or
+noise-injected BC), or an unfound obs mismatch (recheck B3 parity vs LIVE
+engine obs rather than bc-export goldens).
+
 ### 2026-07-18 ~17:00 — UNATTENDED EVENING: 3 workstreams landed + v5 re-parse live
 Elliot away, full autonomy granted. Landed (all agent-built + reviewed):
 (1) shard schema v5 (9b67c67+ce103ca, review APPROVED): is_demoed (col 17,
