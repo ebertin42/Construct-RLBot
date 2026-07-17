@@ -14,22 +14,28 @@ import argparse
 from construct._engine import action_table_v1
 from construct.learn.bc import BCConfig, BCTrainer
 
-p = argparse.ArgumentParser()
-p.add_argument("--config", default="configs/bc_v1.toml")
-p.add_argument("--data-dir", default=None)
-p.add_argument("--device", default=None)
-p.add_argument("--epochs", type=int, default=None)
-p.add_argument("--checkpoint-dir", default=None)
-args = p.parse_args()
 
-cfg = BCConfig.load(args.config)
-if args.data_dir:
-    cfg.data_dir = args.data_dir
-if args.device:
-    cfg.run["device"] = args.device
-if args.epochs is not None:
-    cfg.train["epochs"] = args.epochs
-if args.checkpoint_dir:
-    cfg.run["checkpoint_dir"] = args.checkpoint_dir
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default="configs/bc_v1.toml")
+    p.add_argument("--data-dir", default=None)
+    p.add_argument("--device", default=None)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--checkpoint-dir", default=None)
+    args = p.parse_args()
 
-BCTrainer(cfg, action_table_v1()).run()
+    cfg = BCConfig.load(args.config)
+    if args.data_dir:
+        cfg.data_dir = args.data_dir
+    if args.device:
+        cfg.run["device"] = args.device
+    if args.epochs is not None:
+        cfg.train["epochs"] = args.epochs
+    if args.checkpoint_dir:
+        cfg.run["checkpoint_dir"] = args.checkpoint_dir
+
+    BCTrainer(cfg, action_table_v1()).run()
+
+
+if __name__ == "__main__":
+    main()
