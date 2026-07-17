@@ -90,6 +90,21 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~07:45 (monitor) — ⚠ POST-ANNEAL DRIFT WARNING
+| steps | sps | ent | ep_rew | goals/min |
+|---|---|---|---|---|
+| 582.7M | 8,095 | 3.77 | **7.26 ↑** | **1.29 ↓** (ck 580M) |
+First sub-1.35 reading, WITH the signature: ep_rew rising (5.7→7.3) while
+goals fell (1.90→1.80→1.29), touches collapsing monotonically
+(15.2→10.5→9.2→4.7), mean ball dist 1452→2715 (agent hanging back). v_loss
+0.35 (critic confident in whatever it's doing). One reading below line —
+confirmation eval armed on next synced ck. If confirmed: rollback to ck 520M
+(1.90 peak) + change needed to break the loop — candidates: entropy_coef
+0.01→0.005 (ent climbed 3.26→3.77 post-anneal), league re-enable (v1-native
+registry landed in league-v1 merge — self-play degeneracy is the likely
+mechanism; both selves camping = no touches, and ep_rew can rise on
+vel_to_ball income + own-goal asymmetries without finishing).
+
 ### 2026-07-18 ~05:45 (monitor)
 Post-anneal reading 1: ck 520M → **1.90 goals/min** (new high; teacher 1.56,
 prior peak 1.81). Touches 15.2→10.5/min, dist 1452→1882 — fewer but more
