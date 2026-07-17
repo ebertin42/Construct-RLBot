@@ -90,6 +90,18 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~10:20 — FIX DEPLOYED (Elliot-approved): rollback + league + v3.1
+Elliot back, approved "League + reward v3.1". Executed: reward_v3_1.toml
+(aggression_bias -0.2 → concede -12 vs goal +10; any trade now net -2 — loop
+strictly unprofitable; commit 72b36b5) shipped to remote; league registry
+seeded with v1 cks 320M/520M/550M; remote restarted from ck_000520765440
+(the 1.90 peak). Verified: "resumed at 520,765,440", league opponents line
+lists all 3 seeds, ep_rew instantly 3.0-5.0 (trading income gone), sps ~7.6k
+warming. 520→659M exploit-era steps discarded (~4.7h GPU). Watch next: eval
+trend recovery toward 1.8-1.9, ep_rew staying in 3-6 band, ent decline;
+league_tick on remote still v0-loop — v1 ladder ratings TODO if PFSP weighting
+matters. Viewer stays off until BC done (Elliot-approved).
+
 ### 2026-07-18 ~09:40 — ⚠⚠ MECHANISM IDENTIFIED: GOAL-TRADING LOOP
 ck 631M → 0.46 goals/min while live ep_rew EXPLODED to 14.3 (2.5x teacher).
 Arithmetic gives the exploit: reward_v3 goal +10 / concede -8 → alternating
