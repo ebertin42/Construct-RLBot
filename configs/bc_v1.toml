@@ -20,6 +20,8 @@ epochs = 4
 val_fraction = 0.05      # 95/5 split by stable shard-name hash
 weight_clamp = [0.1, 10.0]  # inverse-action-frequency CE weights, clamped
 grad_clip = 1.0
+prev_dropout = 0.5      # per-sample prob of zeroing the prev-action ring
+                         # during training only -- anti-copycat; 0.0 disables
 
 [run]
 device = "cuda"          # falls back to cpu if unavailable; GPU may be busy

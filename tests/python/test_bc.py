@@ -12,6 +12,7 @@ from construct._engine import action_table_v1
 from construct.learn.bc import (
     BCConfig,
     BCTrainer,
+    apply_prev_dropout,
     class_counts,
     class_weights,
     iter_batches,
@@ -72,7 +73,7 @@ def test_config_toml_parses():
     assert cfg.data_dir == "data/bc"
     assert cfg.net == {"d_model": 128, "layers": 2, "heads": 4, "ff": 512}
     for key in ("seed", "lr", "weight_decay", "batch_size", "epochs",
-                "val_fraction", "weight_clamp", "grad_clip"):
+                "val_fraction", "weight_clamp", "grad_clip", "prev_dropout"):
         assert key in cfg.train, key
     assert "device" in cfg.run
 
@@ -213,3 +214,96 @@ def test_trainer_is_deterministic_across_runs(tmp_path):
     h2 = BCTrainer(cfg, action_table_v1()).run()
     assert h1[0]["train_loss"] == h2[0]["train_loss"]
     assert h1[0]["val_loss"] == h2[0]["val_loss"]
+
+
+def _spy_prevs(trainer):
+    """Wrap trainer._loss to record a copy of every batch['prev'] it's
+    called with (train_epoch and evaluate() both route through _loss), and
+    return the list that gets filled in as the trainer runs."""
+    prevs = []
+    orig_loss = trainer._loss
+
+    def spy(batch):
+        prevs.append(batch["prev"].copy())
+        return orig_loss(batch)
+
+    trainer._loss = spy
+    return prevs
+
+
+def test_prev_dropout_zero_is_batch_stream_noop(tmp_path):
+    """p=0.0 must be a TRUE no-op: the prev arrays seen by _loss during
+    training are byte-identical to plain iter_batches with no dropout
+    involved at all (apply_prev_dropout never even draws from its rng)."""
+    _corpus(tmp_path)
+    cfg = _cfg(tmp_path, epochs=1, prev_dropout=0.0)
+    trainer = BCTrainer(cfg, action_table_v1())
+    seen = _spy_prevs(trainer)
+    trainer.train_epoch(0)
+
+    expected = [b["prev"] for b in iter_batches(
+        trainer.train_shards, trainer.batch_size, seed=trainer.seed, epoch=0,
+        loader_threads=trainer.loader_threads)]
+    assert len(seen) == len(expected) and len(seen) > 0
+    for got, exp in zip(seen, expected):
+        np.testing.assert_array_equal(got, exp)
+
+    # also exercised directly, with no trainer involved: p=0.0 returns the
+    # exact same object and never touches the rng
+    rng = np.random.default_rng(123)
+    state_before = rng.bit_generator.state
+    batch = {"prev": np.arange(20).reshape(4, 5).astype(np.int64),
+             "action": np.zeros(4, dtype=np.int64)}
+    out = apply_prev_dropout(batch, 0.0, rng)
+    assert out is batch
+    assert rng.bit_generator.state == state_before
+
+
+def test_prev_dropout_one_zeros_train_only_not_val(tmp_path):
+    """p=1.0: every TRAIN batch's prev is all zeros, but the val batches
+    (evaluate() path) keep their real, nonzero prev -- dropout must never
+    reach evaluate()."""
+    _corpus(tmp_path)
+    cfg = _cfg(tmp_path, epochs=1, prev_dropout=1.0)
+    trainer = BCTrainer(cfg, action_table_v1())
+    assert trainer.val_shards, "test assumes a nonempty val split"
+
+    train_seen = _spy_prevs(trainer)
+    trainer.train_epoch(0)
+    assert train_seen
+    for prev in train_seen:
+        assert (prev == 0).all()
+
+    val_seen = _spy_prevs(trainer)  # re-wrap: fresh list, still spies on _loss
+    metrics = trainer.evaluate()
+    assert metrics is not None
+    assert val_seen, "evaluate() made no _loss calls"
+    assert any((prev != 0).any() for prev in val_seen), (
+        "val prev was zeroed -- prev_dropout leaked into evaluate()"
+    )
+
+
+def test_prev_dropout_half_fraction_and_deterministic(tmp_path):
+    """p=0.5: roughly half of train samples get zeroed (loose bound, since
+    this is a statistical draw), and re-running the identical config zeroes
+    the identical sample set (same rng seed derivation per epoch)."""
+    _corpus(tmp_path)
+    cfg = _cfg(tmp_path, epochs=1, prev_dropout=0.5)
+
+    def collect():
+        trainer = BCTrainer(cfg, action_table_v1())
+        prevs = _spy_prevs(trainer)
+        trainer.train_epoch(0)
+        return prevs
+
+    prevs1 = collect()
+    prevs2 = collect()
+
+    zeroed1 = np.concatenate([(p == 0).all(axis=1) for p in prevs1])
+    zeroed2 = np.concatenate([(p == 0).all(axis=1) for p in prevs2])
+    frac = zeroed1.mean()
+    assert 0.3 < frac < 0.7, f"prev_dropout=0.5 zeroed fraction {frac} out of range"
+
+    np.testing.assert_array_equal(zeroed1, zeroed2)  # same zeroed sample set
+    for p1, p2 in zip(prevs1, prevs2):
+        np.testing.assert_array_equal(p1, p2)
