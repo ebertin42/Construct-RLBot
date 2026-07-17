@@ -22,6 +22,8 @@ TICK_SECS="${1:-14400}"
 shift || true  # remaining args ($@), if any, pass straight through to league_tick.py
 while true; do
     echo "$(date +%H:%M:%S) league tick"
-    nice -n 15 python scripts/league_tick.py --matches 6 "$@"
+    # prefer the repo venv (remote boxes have no bare `python` on PATH)
+    PY="python"; [ -x .venv/bin/python ] && PY=".venv/bin/python"
+    nice -n 15 "$PY" scripts/league_tick.py --matches 6 "$@"
     sleep "$TICK_SECS"
 done
