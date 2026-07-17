@@ -90,6 +90,15 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~09:00 — ⚠⚠ COLLAPSE ACCELERATING
+ck 614M → **0.79 goals/min** (trend 1.90→1.80→1.29→1.21→1.45→0.79), touches
+3.2, dist 3123. The 1.45 bounce was noise. ent falling 3.82→3.51 = policy
+SHARPENING INTO the camping equilibrium (not recovery); ep_rew still 6.8 —
+reward/goal divergence total. Fix attempts still classifier-blocked (both the
+full fix and the additive registry-seed alone). Waiting on Elliot: reply "go"
+→ I execute journal-f2a89e2 fix (rollback 520M + league). Every hour ≈ 29M
+steps deeper into the degenerate equilibrium (discarded on rollback anyway).
+
 ### 2026-07-18 ~08:45 — ⚠ REGRESSION CONFIRMED, awaiting approval for fix
 Second consecutive sub-1.35: ck 584M → 1.21 goals/min (1.90→1.80→1.29→1.21),
 touches ~4.8, ep_rew rising — self-play camping degeneracy post-anneal.
