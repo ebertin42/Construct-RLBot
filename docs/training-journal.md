@@ -90,6 +90,19 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~15:00 — ⚠ SECOND DEGENERACY: MUTUAL AVOIDANCE (confirmed)
+Post-rollback oscillation resolved downward: 2.25@562 → 2.11@589 → 0.66@608 →
+0.61@611 (two consecutive <1.5), touches 2.8, dist 3651, live ep_rew -1.3.
+DIFFERENT signature than goal-trading (ep_rew down WITH goals): v3.1 made
+goal exchange negative-sum (-2/trade), and the self-play equilibrium of a
+negative-sum game is mutual avoidance; league counters in only ~20% of
+arenas. DECISION (with Elliot): no third reward surgery — deploy KL-prior
+(K4) immediately after B6: the human anchor is the structural anti-avoidance
+fix (λ_p tunable upward if 0.05 too gentle). BC at 90%, epoch-1 ck ~15:20.
+Day's tally of degeneracy modes on reward_v3.x self-play: trading (+10/-8),
+avoidance (+10/-12) — the exploit-free reward likely doesn't exist without a
+behavioral prior; that's the whole KL-PPO thesis, now empirically motivated.
+
 ### 2026-07-18 ~12:30 (monitor) — RECOVERY CONFIRMED, NEW HIGH
 | steps | sps | ent | ep_rew | goals/min |
 |---|---|---|---|---|
