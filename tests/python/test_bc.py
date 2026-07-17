@@ -145,6 +145,21 @@ def test_fixed_seed_gives_identical_batches(tmp_path):
     assert any(not np.array_equal(x["action"], y["action"]) for x, y in zip(a, c))
 
 
+def test_loader_threads_do_not_change_batch_stream(tmp_path):
+    """The prefetcher's contract: parallel decompress, ordered consumption.
+    loader_threads=1 (the old synchronous path) and loader_threads=4 must
+    yield byte-identical batch sequences, shuffled and unshuffled."""
+    paths = _corpus(tmp_path)
+    for kwargs in ({"seed": 7, "epoch": 3}, {"shuffle": False}):
+        a = list(iter_batches(paths, 64, loader_threads=1, **kwargs))
+        b = list(iter_batches(paths, 64, loader_threads=4, **kwargs))
+        assert len(a) == len(b)
+        for ba, bb in zip(a, b):
+            assert sorted(ba) == sorted(bb)
+            for k in ba:
+                np.testing.assert_array_equal(ba[k], bb[k])
+
+
 def test_rare_class_rows_match_v1_table_semantics():
     rows = rare_class_rows(action_table_v1())
     assert list(rows["stall"]) == [90, 91]  # the two appended v1.1 stalls

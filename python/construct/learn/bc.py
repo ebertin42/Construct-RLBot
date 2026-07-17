@@ -15,9 +15,13 @@ Data streaming: npz archives are zip files, so numpy cannot mmap them --
 each shard is loaded whole (a shard is a few tens of MB), with shuffled
 shard order + an in-shard permutation per epoch, all driven by one seeded
 rng (fixed seed => identical batch sequence, the repo's determinism
-contract). Train/val split is 95/5 by a stable hash of the shard FILENAME
-(not list order), so the split survives re-listing, resharding of other
-files, and machine moves.
+contract). Decompression is the loader's cost, and zlib inflate releases
+the GIL, so `loader_threads` (train config, default 4) worker threads
+decompress up to _MAX_INFLIGHT shards ahead while the training loop runs --
+but shards are always CONSUMED in shard order, so the batch stream is
+byte-identical for any thread count (see _iter_shards). Train/val split is
+95/5 by a stable hash of the shard FILENAME (not list order), so the split
+survives re-listing, resharding of other files, and machine moves.
 
 Class weights: one first pass over every shard's `action` array counts the
 92 classes; counts are cached to json next to the data and recomputed only
@@ -40,10 +44,14 @@ the rare classes (jump rows, stalls) rather than chasing top-1.
 
 import glob
 import hashlib
+import itertools
 import json
 import math
 import os
+import time
 import tomllib
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -163,20 +171,54 @@ def _load_shard(path: str) -> dict[str, np.ndarray]:
         return {k: z[k] for k in BC_KEYS}
 
 
+# Bounded prefetch window: at most this many decompressed shards in flight
+# (submitted but not yet consumed), ~8 x ~25 MB decompressed on the real
+# corpus. Bounds memory no matter how far the loaders outrun the GPU.
+_MAX_INFLIGHT = 8
+
+
+def _iter_shards(order: list[str], loader_threads: int):
+    """Yield decompressed shard dicts for `order`, strictly IN ORDER. With
+    loader_threads > 1 a thread pool decompresses up to _MAX_INFLIGHT shards
+    ahead (np.load's zlib inflate releases the GIL, so workers overlap with
+    the training loop), but results are consumed in submission order --
+    parallel decompress, ordered consumption -- so the caller sees the exact
+    shard sequence the synchronous path produces. loader_threads <= 1 is the
+    plain synchronous loop."""
+    if loader_threads <= 1:
+        for p in order:
+            yield _load_shard(p)
+        return
+    with ThreadPoolExecutor(max_workers=loader_threads,
+                            thread_name_prefix="bc-loader") as pool:
+        it = iter(order)
+        pending = deque(pool.submit(_load_shard, p)
+                        for p in itertools.islice(it, _MAX_INFLIGHT))
+        while pending:
+            arrs = pending.popleft().result()  # re-raises worker exceptions
+            nxt = next(it, None)
+            if nxt is not None:
+                pending.append(pool.submit(_load_shard, nxt))
+            yield arrs
+
+
 def iter_batches(paths, batch_size: int, *, seed: int = 0, epoch: int = 0,
-                 shuffle: bool = True):
+                 shuffle: bool = True, loader_threads: int = 4):
     """Yield {ents, mask, query, prev, action} numpy batches. Shuffled shard
     order + in-shard permutation from one rng seeded by (seed, epoch), so a
     fixed seed replays the identical batch sequence and each epoch sees a
     different order. A carry buffer stitches shard remainders together, so
-    every batch is full-size except possibly the last of the epoch."""
+    every batch is full-size except possibly the last of the epoch.
+
+    loader_threads only controls how far ahead shard DECOMPRESSION runs
+    (_iter_shards); shards are consumed -- and the rng advanced -- in shard
+    order, so the batch stream is byte-identical for any thread count."""
     order = list(paths)
     rng = np.random.default_rng([seed, epoch])
     if shuffle:
         rng.shuffle(order)
     carry: dict[str, np.ndarray] | None = None
-    for p in order:
-        arrs = _load_shard(p)
+    for arrs in _iter_shards(order, loader_threads):
         if shuffle:
             perm = rng.permutation(arrs["action"].shape[0])
             arrs = {k: v[perm] for k, v in arrs.items()}
@@ -211,6 +253,9 @@ class BCTrainer:
         self.batch_size = int(t.get("batch_size", 4096))
         self.epochs = int(t.get("epochs", 4))
         self.grad_clip = float(t.get("grad_clip", 1.0))
+        # shard-decompression threads; 1 = synchronous (the old behavior).
+        # Any value yields the identical batch stream -- see iter_batches.
+        self.loader_threads = max(1, int(t.get("loader_threads", 4)))
         clamp = tuple(t.get("weight_clamp", (0.1, 10.0)))
 
         self.shards = find_shards(cfg.data_dir)
@@ -266,8 +311,10 @@ class BCTrainer:
         self.net.train()
         log_every = int(self.cfg.run.get("log_every_batches", 50))
         loss_sum = n_sum = 0
+        t_last, n_last = time.perf_counter(), 0
         for i, batch in enumerate(iter_batches(
-                self.train_shards, self.batch_size, seed=self.seed, epoch=epoch)):
+                self.train_shards, self.batch_size, seed=self.seed, epoch=epoch,
+                loader_threads=self.loader_threads)):
             loss, _ = self._loss(batch)
             self.opt.zero_grad()
             loss.backward()
@@ -282,8 +329,12 @@ class BCTrainer:
             n_sum += n
             self.total_steps += n
             if (i + 1) % log_every == 0:
+                now = time.perf_counter()
+                sps = (n_sum - n_last) / max(now - t_last, 1e-9)
+                t_last, n_last = now, n_sum
                 print(f"bc epoch {epoch} batch {i + 1}/{self.batches_per_epoch} "
-                      f"loss {loss_sum / n_sum:.4f} lr {self.sched.get_last_lr()[0]:.2e}",
+                      f"loss {loss_sum / n_sum:.4f} lr {self.sched.get_last_lr()[0]:.2e} "
+                      f"{sps:.0f} samples/s",
                       flush=True)
         return loss_sum / max(1, n_sum)
 
@@ -299,7 +350,8 @@ class BCTrainer:
         loss_sum = n_sum = top1 = top3 = 0
         hits = np.zeros(A, dtype=np.int64)
         support = np.zeros(A, dtype=np.int64)
-        for batch in iter_batches(self.val_shards, self.batch_size, shuffle=False):
+        for batch in iter_batches(self.val_shards, self.batch_size, shuffle=False,
+                                  loader_threads=self.loader_threads):
             loss, logits = self._loss(batch)
             target = torch.as_tensor(batch["action"], device=self.device)
             n = target.shape[0]
