@@ -90,6 +90,18 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~12:30 (monitor) — RECOVERY CONFIRMED, NEW HIGH
+| steps | sps | ent | ep_rew | goals/min |
+|---|---|---|---|---|
+| 563.3M | 7,479 | 3.55 | 0.61 | **2.25** (ck 562M, all-time high) |
+Post-rollback trajectory: 1.19@548M (adaptation dip while critic re-learned
+v3.1 values) → 2.25@562M. Touches 4.4→8.3. Turtling refuted; league+v3.1
+outperforms the pre-exploit line (peak was 1.90). ep_rew ~0.6 is the honest
+scale now (negative-sum goal exchange). BC epoch 0 at 73%, epoch-1 ck ~14:30
+→ B6. KL-prior plan written (bccc2e9, task #49) — K1-K3 code next, K4 deploy
+after B6 + approval. Exploit-era cks ≥554M quarantined both boxes; viewer
+picks by mtime now (91f4472).
+
 ### 2026-07-18 ~10:20 — FIX DEPLOYED (Elliot-approved): rollback + league + v3.1
 Elliot back, approved "League + reward v3.1". Executed: reward_v3_1.toml
 (aggression_bias -0.2 → concede -12 vs goal +10; any trade now net -2 — loop
