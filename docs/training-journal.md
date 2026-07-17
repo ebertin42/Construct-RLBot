@@ -90,6 +90,18 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~09:40 — ⚠⚠ MECHANISM IDENTIFIED: GOAL-TRADING LOOP
+ck 631M → 0.46 goals/min while live ep_rew EXPLODED to 14.3 (2.5x teacher).
+Arithmetic gives the exploit: reward_v3 goal +10 / concede -8 → alternating
+goals net +2 per agent per exchange. Self-play partners learned COOPERATIVE
+GOAL-TRADING (positive-sum loop); vs a non-cooperating eval opponent the
+policy looks like camping with 0.46 goals/min. Explains touches ~4 (kickoff
+exchanges only), v_loss 0.19 (very predictable income), ent oscillation.
+FIXES: (immediate, staged) league opponents break the loop — past selves
+don't cooperate; (structural, for Elliot) reward_v3.1 with |concede| ≥ goal
+(e.g. -10/-12) makes trading zero/negative-sum — recommend BOTH. Staged fix
+unchanged: rollback ck 520M + --league. Awaiting approval.
+
 ### 2026-07-18 ~09:00 — ⚠⚠ COLLAPSE ACCELERATING
 ck 614M → **0.79 goals/min** (trend 1.90→1.80→1.29→1.21→1.45→0.79), touches
 3.2, dist 3123. The 1.45 bounce was noise. ent falling 3.82→3.51 = policy
