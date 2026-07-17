@@ -10,6 +10,13 @@ cd "$(dirname "$0")/.."
 ROTATE_SECS="${1:-300}"
 slot=0
 
+# Status file for the Windows overlay (deploy/windows_stream_overlay.ps1)
+STATUS_FILE="${CONSTRUCT_STREAM_STATUS:-/mnt/c/Users/Elliot/AppData/Local/Construct/current_stream.txt}"
+announce() {  # $1 = label, $2 = ck path
+    echo "$(date +%H:%M:%S) [$1] streaming $2 for ${ROTATE_SECS}s"
+    printf '%s  %s  (%s)' "$1" "$(basename "$2" .pt)" "$(date +%H:%M)" > "$STATUS_FILE" 2>/dev/null || true
+}
+
 while true; do
     # newest by MTIME, not lexical step number: after a rollback the live
     # frontier has SMALLER step numbers than stale pre-rollback files
@@ -19,22 +26,22 @@ while true; do
     case $((slot % 5)) in
         0|2)
             if [ -n "$entity" ]; then
-                echo "$(date +%H:%M:%S) [ENTITY 1v1] streaming $entity for ${ROTATE_SECS}s"
+                announce "ENTITY 1v1" "$entity"
                 timeout "$ROTATE_SECS" python scripts/watch.py "$entity"
             fi ;;
         1)
             if [ -n "$entity" ]; then
-                echo "$(date +%H:%M:%S) [ENTITY 2v2] streaming $entity for ${ROTATE_SECS}s"
+                announce "ENTITY 2v2" "$entity"
                 timeout "$ROTATE_SECS" python scripts/watch.py "$entity" --mode 2v2
             fi ;;
         3)
             if [ -n "$runb" ]; then
-                echo "$(date +%H:%M:%S) [RUN-B 1v1] streaming $runb for ${ROTATE_SECS}s"
+                announce "RUN-B 1v1" "$runb"
                 timeout "$ROTATE_SECS" python scripts/watch.py "$runb"
             fi ;;
         4)
             if [ -n "$teacher" ]; then
-                echo "$(date +%H:%M:%S) [TEACHER v3 1v1] streaming $teacher for ${ROTATE_SECS}s"
+                announce "TEACHER v3 1v1" "$teacher"
                 timeout "$ROTATE_SECS" python scripts/watch.py "$teacher"
             fi ;;
     esac
