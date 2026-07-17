@@ -14,9 +14,55 @@ from construct.learn.kickstart import (
     KickstartTeacher,
     kickstart_losses,
 )
+from construct.learn.kl_prior import KLPrior, kl_student_prior
 from construct.learn.model import PolicyValueNet
 from construct.learn.model_v1 import EntityPolicyNet
 from construct.learn.ppo import ppo_update
+
+
+def compose_extra_loss(net, batch, *, kickstart, lambda_k, lambda_v,
+                       prior_logits, lambda_p):
+    """Build the per-minibatch extra-loss hook for ppo_update, composing the
+    kickstart distillation term (KL(teacher‖student)+value MSE, annealed) and
+    the BC-prior anchor (KL(student‖prior), constant lambda_p). Returns None
+    when neither is active — ppo_update's no-hook path stays byte-identical
+    (v0 runs and prior-less v1 runs are untouched, per T7's original
+    byte-identity guarantee, now extended to cover the prior term too).
+
+    kickstart: None or (t_logits, t_values) precomputed full-batch teacher
+    outputs; prior_logits: None or precomputed full-batch prior logits."""
+    kick_on = kickstart is not None and (lambda_k > 0.0 or lambda_v > 0.0)
+    prior_on = prior_logits is not None and lambda_p > 0.0
+    if not kick_on and not prior_on:
+        return None
+
+    def fn(idx):
+        # One student forward serves both terms (full [B,92] distribution).
+        # Re-runs the student net's forward directly (rather than threading
+        # logits out through evaluate()/Categorical) to get the full [B,92]
+        # distribution both KL terms need -- evaluate() only returns the
+        # sampled action's logprob. This costs a second forward pass per
+        # minibatch versus changing model.py/model_v1.py's evaluate()
+        # signature to also return logits; traded deliberately for keeping
+        # those files (and ppo.py's default no-hook path) untouched.
+        # batch["obs"] is the entity dict (keys match EntityPolicyNet.
+        # forward's params) -- both kickstart and the prior imply v1.
+        s_logits, s_value = net(**{k: v[idx] for k, v in batch["obs"].items()})
+        loss = s_logits.sum() * 0.0
+        info = {}
+        if kick_on:
+            t_logits, t_values = kickstart
+            kl, v_mse = kickstart_losses(s_logits, s_value.squeeze(-1),
+                                         t_logits[idx], t_values[idx])
+            loss = loss + lambda_k * kl + lambda_v * v_mse
+            info["kick_kl"] = kl.item()
+        if prior_on:
+            kl_p = kl_student_prior(s_logits, prior_logits[idx])
+            loss = loss + lambda_p * kl_p
+            info["kl_pri"] = kl_p.item()
+        return loss, info
+
+    return fn
 
 
 class Trainer:
@@ -93,6 +139,27 @@ class Trainer:
                     lambda_v=float(cfg.kickstart.get("lambda_v", 0.5)),
                 ),
             }
+
+        # BC-prior anchor (K3): only meaningful for a v1-schema run with a
+        # [kl_prior] block that names a checkpoint (the config template ships
+        # with `ck` absent, so cfg.kl_prior stays {} and this block is
+        # inactive). Gate mirrors kickstart's: cfg.kl_prior.get("ck") truthy
+        # AND self.is_v1. For v0 runs and prior-less v1 runs self.kl_prior
+        # stays None, so run()'s prior_logits stays None and
+        # compose_extra_loss's prior_on branch is dead -- byte-identical to
+        # pre-K3 behavior.
+        self.kl_prior: dict | None = None
+        if cfg.kl_prior.get("ck") and self.is_v1:
+            self.kl_prior = {
+                # expect_net closes the Global Constraint "prior dims must equal
+                # student dims": cfg.net IS the student's dims (restored from the
+                # resume checkpoint by resume_train.py before Trainer init).
+                "net": KLPrior(cfg.kl_prior["ck"], device=str(self.device),
+                               expect_net=cfg.net),
+                "lambda": float(cfg.kl_prior.get("lambda", 0.05)),
+            }
+            print(f"kl_prior: anchored to {cfg.kl_prior['ck']} "
+                  f"lambda_p={self.kl_prior['lambda']}", flush=True)
 
         # Opponent-pool ("league") integration. Disabled by default (cfg.league == {}
         # or {"enabled": False}) -> self._assignment stays None -> engine.collect's
@@ -278,38 +345,34 @@ class Trainer:
                 self._refresh_opponents(it)
             batch = self.collect(p["rollout_steps"])
 
-            # --- kickstart distillation hook (T7) -------------------------------
-            # Guarded on self.kickstart (None for every v0 run, and for any v1
-            # run without a [kickstart] config) AND on "obs_v0" actually being
-            # in the batch -- collect() only puts it there when the engine was
-            # built with emit_v0_obs=True, i.e. exactly the kickstart_active
-            # case from __init__. `extra_loss_fn` stays None otherwise, which
-            # makes ppo_update's new hook parameter a complete no-op: v0 runs
-            # are byte-identical to pre-T7 behavior.
-            extra_loss_fn = None
+            # --- extra-loss hook: kickstart distillation (T7) + BC-prior anchor (K3) ---
+            # Both terms funnel through compose_extra_loss (module-level, see its
+            # docstring). Kickstart is guarded on self.kickstart (None for every v0
+            # run, and for any v1 run without a [kickstart] config) AND on "obs_v0"
+            # actually being in the batch -- collect() only puts it there when the
+            # engine was built with emit_v0_obs=True, i.e. exactly the
+            # kickstart_active case from __init__. The prior is guarded on
+            # self.kl_prior (None for every v0 run, and for any v1 run without a
+            # [kl_prior] config). compose_extra_loss returns None when neither is
+            # active, which makes ppo_update's hook parameter a complete no-op: v0
+            # runs and prior-less v1 runs are byte-identical to pre-K3 behavior.
+            kickstart_outs = None
             lambda_k = lambda_v = 0.0
             if self.kickstart is not None and "obs_v0" in batch:
                 lambda_k, lambda_v = self.kickstart["schedule"].coef(self.total_steps)
                 if lambda_k > 0.0 or lambda_v > 0.0:
                     with torch.no_grad():
-                        t_logits, t_values = self.kickstart["teacher"].logits_values(batch["obs_v0"])
-
-                    def extra_loss_fn(idx, _lk=lambda_k, _lv=lambda_v, _tl=t_logits, _tv=t_values):
-                        # Re-runs the student net's forward directly (rather than
-                        # threading logits out through evaluate()/Categorical) to
-                        # get the full [B,92] distribution KL needs -- evaluate()
-                        # only returns the sampled action's logprob. This costs a
-                        # second forward pass per minibatch versus changing
-                        # model.py/model_v1.py's evaluate() signature to also
-                        # return logits; traded deliberately for keeping those
-                        # files (and ppo.py's default no-hook path) untouched.
-                        # Kickstart implies v1, so batch["obs"] is the entity
-                        # dict (keys match EntityPolicyNet.forward's params).
-                        s_logits, s_value = self.net(
-                            **{k: v[idx] for k, v in batch["obs"].items()}
-                        )
-                        kl, v_mse = kickstart_losses(s_logits, s_value.squeeze(-1), _tl[idx], _tv[idx])
-                        return _lk * kl + _lv * v_mse, {"kick_kl": kl.item()}
+                        kickstart_outs = self.kickstart["teacher"].logits_values(batch["obs_v0"])
+            prior_logits, lambda_p = None, 0.0
+            if self.kl_prior is not None:
+                lambda_p = self.kl_prior["lambda"]
+                with torch.no_grad():
+                    prior_logits = self.kl_prior["net"].logits(batch["obs"])
+            extra_loss_fn = compose_extra_loss(
+                self.net, batch,
+                kickstart=kickstart_outs, lambda_k=lambda_k, lambda_v=lambda_v,
+                prior_logits=prior_logits, lambda_p=lambda_p,
+            )
 
             stats = ppo_update(
                 self.net, self.opt, batch, clip=p["clip"], entropy_coef=p["entropy_coef"],
@@ -330,8 +393,10 @@ class Trainer:
                     f"pi_loss {stats['policy_loss']:.4f} v_loss {stats['value_loss']:.4f} "
                     f"ent {stats['entropy']:.3f} clip {stats['clip_frac']:.3f}"
                 )
-                if extra_loss_fn is not None:
+                if kickstart_outs is not None:
                     msg += f" kick_kl {stats.get('kick_kl', 0.0):.4f} lambda_k {lambda_k:.3f}"
+                if self.kl_prior is not None:
+                    msg += f" kl_pri {stats.get('kl_pri', 0.0):.4f} lambda_p {lambda_p:.3f}"
                 print(msg, flush=True)
             if it % self.cfg.run.get("save_every_iters", 20) == 0:
                 os.makedirs(self.cfg.run["checkpoint_dir"], exist_ok=True)

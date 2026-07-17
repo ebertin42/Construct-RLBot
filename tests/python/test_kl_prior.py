@@ -125,3 +125,40 @@ def test_config_kl_prior_default_empty(tmp_path):
     )
     cfg = TrainConfig.load(str(cfg_toml))
     assert cfg.kl_prior == {}
+
+
+def _fake_batch(b=8):
+    obs = _obs(b=b, seed=3)
+    return {"obs": obs, "n_agents": b}
+
+
+def test_composed_hook_prior_only(tmp_path):
+    """No Trainer instantiation: drive the static composition helper."""
+    from construct.learn.train import compose_extra_loss
+    torch.manual_seed(0)
+    student = EntityPolicyNet(**NET, action_table=_table())
+    torch.manual_seed(1)
+    other = EntityPolicyNet(**NET, action_table=_table())
+    prior = KLPrior(_save_ck(tmp_path, other, "p.pt"), device="cpu")
+    batch = _fake_batch()
+    with torch.no_grad():
+        prior_logits = prior.logits(batch["obs"])
+
+    fn = compose_extra_loss(
+        student, batch,
+        kickstart=None, lambda_k=0.0, lambda_v=0.0,
+        prior_logits=prior_logits, lambda_p=0.5,
+    )
+    idx = torch.arange(4)
+    loss, info = fn(idx)
+    assert loss.requires_grad
+    assert info["kl_pri"] > 0.0
+    assert "kick_kl" not in info
+
+
+def test_composed_hook_none_when_nothing_active():
+    from construct.learn.train import compose_extra_loss
+    student = EntityPolicyNet(**NET, action_table=_table())
+    assert compose_extra_loss(student, _fake_batch(),
+                              kickstart=None, lambda_k=0.0, lambda_v=0.0,
+                              prior_logits=None, lambda_p=0.0) is None
