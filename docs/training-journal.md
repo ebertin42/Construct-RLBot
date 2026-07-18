@@ -90,6 +90,20 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~20:30 — CORRECTION: the "terminal" avoidance funk had SELF-RECOVERED
+Standard eval of the discarded funk-branch tip (ck 1.38B): **2.14 goals/min,
+touches 7.3** — the 0.46-0.79 readings at 608-631M were a trough in an
+oscillation that resolved during ~14 unwatched hours. league+v3.1 worked,
+noisily. PROCESS LESSON (recorded): single-ck evals on an oscillating run
+mislead — two "collapse" calls were cycle troughs; the dashboard's per-ck
+auto-eval history (which surfaced this) is the standing fix. COST: K4's
+rollback to 562M discarded ~800M steps of a ~2.14 policy (peak 2.25 —
+comparable). DECISION (Elliot informed, staying course (a)): anchored run
+keeps its ~100M-step window — entropy 1.21 vs funk-era 3.5+ is the
+structural difference the anchor was for; ck_001382942720 preserved on both
+boxes as fallback (options: un-anchored resume, or re-anchor from 1.38B).
+First anchored eval @+11M: 0.62 (expected transition dip; kl_pri 6.9→1.39).
+
 ### 2026-07-18 ~19:00 — K4 DEPLOYED: KL-PPO ERA BEGINS (Elliot-approved)
 BC-v3 (clean v5 corpus, prev-dropout) B6-v3: probe PASS (copy 0.725≈human
 0.70, prev-zeroed top-1 0.441, val top1 62.7) but closed-loop unchanged
