@@ -98,6 +98,70 @@ def test_venv_prefixed_path():
 
 
 # ---------------------------------------------------------------------------
+# CONSTRUCT_VISER_ADDR resolution -- regression coverage for the live-found
+# bug (viewer on streamed to localhost: CONSTRUCT_VISER_ADDR was resolved
+# from a stale hardcoded constant, never actually detected at runtime)
+# ---------------------------------------------------------------------------
+
+def test_parse_default_gateway_real_format():
+    # verbatim `ip route show default` output captured on the training box
+    output = "default via 172.17.176.1 dev eth0 proto kernel \n"
+    assert ctl.parse_default_gateway(output) == "172.17.176.1"
+
+
+def test_parse_default_gateway_no_match():
+    assert ctl.parse_default_gateway("") is None
+    assert ctl.parse_default_gateway("no default route here") is None
+
+
+def test_parse_default_gateway_multiline_route_table():
+    output = (
+        "default via 10.0.0.1 dev eth0 proto kernel \n"
+        "172.17.176.0/20 dev eth0 proto kernel scope link src 172.17.179.238\n"
+    )
+    assert ctl.parse_default_gateway(output) == "10.0.0.1"
+
+
+def test_resolve_viser_addr_prefers_explicit_env_override(monkeypatch):
+    monkeypatch.setenv("CONSTRUCT_VISER_ADDR", "9.9.9.9:12345")
+
+    def boom():
+        raise AssertionError("must not shell out to `ip route` when an "
+                              "explicit override is already set")
+    monkeypatch.setattr(ctl, "detect_host_gateway_ip", boom)
+    assert ctl.resolve_viser_addr() == "9.9.9.9:12345"
+
+
+def test_resolve_viser_addr_uses_live_detected_gateway(monkeypatch):
+    monkeypatch.delenv("CONSTRUCT_VISER_ADDR", raising=False)
+    monkeypatch.setattr(ctl, "detect_host_gateway_ip", lambda timeout=5: "10.20.30.40")
+    assert ctl.resolve_viser_addr() == "10.20.30.40:45250"
+
+
+def test_resolve_viser_addr_custom_port_with_detected_gateway(monkeypatch):
+    monkeypatch.delenv("CONSTRUCT_VISER_ADDR", raising=False)
+    monkeypatch.setattr(ctl, "detect_host_gateway_ip", lambda timeout=5: "10.20.30.40")
+    assert ctl.resolve_viser_addr(port=9999) == "10.20.30.40:9999"
+
+
+def test_resolve_viser_addr_falls_back_when_detection_fails(monkeypatch):
+    """This is the exact scenario the live bug hit: no env override, and
+    (in the old code) no live detection was ever attempted at all -- the
+    hardcoded fallback was used unconditionally instead of as a last
+    resort. Now detection is always attempted first; only a genuine
+    detection failure reaches the fallback."""
+    monkeypatch.delenv("CONSTRUCT_VISER_ADDR", raising=False)
+    monkeypatch.setattr(ctl, "detect_host_gateway_ip", lambda timeout=5: None)
+    assert ctl.resolve_viser_addr() == ctl.VISER_ADDR_FALLBACK
+
+
+def test_resolve_viser_addr_never_empty(monkeypatch):
+    monkeypatch.delenv("CONSTRUCT_VISER_ADDR", raising=False)
+    monkeypatch.setattr(ctl, "detect_host_gateway_ip", lambda timeout=5: None)
+    assert ctl.resolve_viser_addr()  # truthy -- never "" or None
+
+
+# ---------------------------------------------------------------------------
 # ck-sweep: crash-recovery checkpoint quarantine (tmp_path only)
 # ---------------------------------------------------------------------------
 
@@ -468,6 +532,25 @@ def test_overlay_start_plan():
     assert plan["cwd"] == "/mnt/c"
 
 
+@pytest.mark.parametrize("plan_fn", [ctl.relay_start_plan, ctl.rlviser_start_plan,
+                                      ctl.overlay_start_plan])
+def test_windows_interop_launches_are_marked_detached(plan_fn):
+    """Regression test for the ~120s `viewer on` hang: these three are the
+    only run_bg() callers invoked with log_path=None (no log file to
+    redirect stdio to instead), so they're the only ones that were ever at
+    risk of inheriting ctl.py's stdout pipe -- which WSL's interop layer
+    keeps open until the spawned Windows process's console fully detaches.
+    `detach=True` is what tells run_bg() to force DEVNULL instead."""
+    assert plan_fn()["detach"] is True
+
+
+def test_bc_start_plan_not_marked_detached():
+    # contrast case: bc/ssl/parse/export/loop launches always get an
+    # explicit log_path, so their stdio is redirected to a file regardless
+    # -- they were never at risk and don't need the detach marker.
+    assert ctl.bc_start_plan()["detach"] is False
+
+
 def test_watch_loop_start_plan_runs_from_repo_root_not_mnt_c():
     plan = ctl.watch_loop_start_plan("172.17.176.1:45250", rotate_secs=300)
     assert plan["argv"] == ["setsid", "./scripts/watch_loop.sh", "300"]
@@ -479,6 +562,18 @@ def test_watch_loop_start_plan_runs_from_repo_root_not_mnt_c():
 def test_watch_loop_start_plan_custom_rotate():
     plan = ctl.watch_loop_start_plan("1.2.3.4:45250", rotate_secs=60)
     assert plan["argv"] == ["setsid", "./scripts/watch_loop.sh", "60"]
+
+
+def test_watch_loop_start_plan_rejects_empty_addr():
+    """Regression test for the live-found bug: an empty/missing
+    CONSTRUCT_VISER_ADDR silently makes the engine default to 127.0.0.1
+    (engine/src/viser.rs) -- the stream never reaches the Windows-side
+    viewer. The plan builder now refuses to build a plan for that case at
+    all, rather than silently producing an env dict that omits the var."""
+    with pytest.raises(ValueError):
+        ctl.watch_loop_start_plan("")
+    with pytest.raises(ValueError):
+        ctl.watch_loop_start_plan(None)
 
 
 def test_rlviser_stop_plan():
@@ -677,6 +772,47 @@ def test_run_bg_dry_run_never_touches_disk_or_subprocess(tmp_path, capsys, monke
     assert "[dry-run]" in out
 
 
+def test_run_bg_uses_devnull_not_inherited_stdio_when_no_log_path(monkeypatch):
+    """Regression test for the live-found ~120s `viewer on` hang: launches
+    with no log_path (relay/rlviser/overlay -- the `detach=True` plans) must
+    get subprocess.DEVNULL for stdout/stderr, never None (which means
+    "inherit from ctl.py's own stdio" and is what caused the hang under
+    WSL's cmd.exe interop)."""
+    captured = {}
+
+    def fake_popen(argv, **kwargs):
+        captured.update(kwargs)
+
+        class FakeProc:
+            pass
+        return FakeProc()
+
+    monkeypatch.setattr(ctl.subprocess, "Popen", fake_popen)
+    ctl.run_bg(ctl.relay_start_plan(), log_path=None, dry_run=False)
+    assert captured["stdout"] == ctl.subprocess.DEVNULL
+    assert captured["stderr"] == ctl.subprocess.DEVNULL
+    assert captured["stdin"] == ctl.subprocess.DEVNULL
+    assert captured.get("start_new_session") is True
+
+
+def test_run_bg_still_redirects_to_log_file_when_given(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_popen(argv, **kwargs):
+        captured.update(kwargs)
+
+        class FakeProc:
+            pass
+        return FakeProc()
+
+    monkeypatch.setattr(ctl.subprocess, "Popen", fake_popen)
+    log_path = tmp_path / "out.log"
+    ctl.run_bg(ctl.bc_start_plan(), log_path=log_path, dry_run=False)
+    assert captured["stdout"] is not ctl.subprocess.DEVNULL
+    assert captured["stdout"] is not None  # a real open file handle
+    assert log_path.exists()
+
+
 def test_run_fg_dry_run_never_calls_subprocess(monkeypatch, capsys):
     def boom(*a, **k):
         raise AssertionError("subprocess.run must not be called in dry-run")
@@ -812,9 +948,30 @@ def test_main_bc_start_refuses_double_launch_when_not_dry_run(capsys, monkeypatc
 def test_main_viewer_on_dry_run_prints_all_four_steps(capsys, monkeypatch, no_real_procs):
     monkeypatch.setattr(ctl, "run_fg", lambda plan, dry_run=False, timeout=60:
                          None if dry_run else pytest.fail("run_fg must be dry-run"))
+    monkeypatch.setattr(ctl, "resolve_viser_addr", lambda port=45250: "10.0.0.99:45250")
     ctl.main(["viewer", "on", "--dry-run"])
     out = capsys.readouterr().out
     assert out.count("[dry-run]") >= 4  # relay check + relay/rlviser/overlay/watch_loop
+    # Regression coverage for the live-found bug: argv-only assertions (the
+    # count above) let a missing/wrong CONSTRUCT_VISER_ADDR slip through
+    # silently, since the watch_loop argv itself doesn't carry the addr --
+    # it's env-only. Must assert the actual resolved value made it into the
+    # printed plan for the watch_loop.sh launch specifically.
+    watch_loop_line = next(ln for ln in out.splitlines() if "watch_loop.sh" in ln)
+    assert "CONSTRUCT_VISER_ADDR=10.0.0.99:45250" in watch_loop_line
+
+
+def test_main_viewer_on_uses_resolve_viser_addr_not_raw_environ(capsys, monkeypatch, no_real_procs):
+    """Guards against regressing back to the old
+    os.environ.get("CONSTRUCT_VISER_ADDR", VISER_ADDR_FALLBACK) call, which
+    never attempted live `ip route` detection at all."""
+    monkeypatch.setattr(ctl, "run_fg", lambda plan, dry_run=False, timeout=60: None)
+    calls = []
+    monkeypatch.setattr(ctl, "resolve_viser_addr", lambda port=45250: calls.append(1) or "1.2.3.4:45250")
+    ctl.main(["viewer", "on", "--dry-run"])
+    assert calls, "resolve_viser_addr() must be called by `viewer on`"
+    out = capsys.readouterr().out
+    assert "CONSTRUCT_VISER_ADDR=1.2.3.4:45250" in out
 
 
 def test_main_ck_sweep_dry_run_on_tmp_dirs(tmp_path, capsys, monkeypatch):

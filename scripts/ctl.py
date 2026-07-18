@@ -113,6 +113,62 @@ def venv_prefixed_path(base_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# CONSTRUCT_VISER_ADDR resolution (WSL2 -> Windows-host rlviser.exe)
+# ---------------------------------------------------------------------------
+# BUG FIXED (live-found 2026-07-19): `viewer on` previously read only
+# os.environ.get("CONSTRUCT_VISER_ADDR", VISER_ADDR_FALLBACK) -- a stale
+# hardcoded constant used whenever the launching shell didn't happen to
+# already export the var. engine/src/viser.rs falls back to 127.0.0.1:45243
+# when the env var is *absent* from the watch.py process's own environment,
+# so any gap in the chain (a drifted gateway IP, a shell that didn't
+# inherit it, ...) silently streams to localhost and the Windows-side
+# viewer never sees packets. Fixed by resolving the gateway at runtime via
+# `ip route show default` (memory: rlviser-viewer-setup -- "host ip = `ip
+# route show default`, was 172.17.176.1"), with the hardcoded value kept
+# only as a last-resort fallback if live detection fails.
+
+GATEWAY_RE = re.compile(r"\bvia\s+(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+
+def parse_default_gateway(ip_route_output: str) -> str | None:
+    """Pure parser for `ip route show default` output, e.g.
+    "default via 172.17.176.1 dev eth0 proto kernel " -> "172.17.176.1"."""
+    m = GATEWAY_RE.search(ip_route_output)
+    return m.group(1) if m else None
+
+
+def detect_host_gateway_ip(timeout: float = 5) -> str | None:
+    """Real subprocess call. WSL2's default gateway is the Windows host's
+    WSL-visible IP -- the address rlviser.exe (running on Windows) is
+    reachable at from a WSL process. Drifts across WSL/network restarts, so
+    it must be resolved at runtime rather than trusted from a constant."""
+    try:
+        out = subprocess.run(["ip", "route", "show", "default"],
+                              capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return parse_default_gateway(out.stdout)
+
+
+def resolve_viser_addr(port: int = 45250) -> str:
+    """CONSTRUCT_VISER_ADDR resolution order: (1) an explicit env override
+    (operator knows better -- e.g. a non-default rlviser port), (2) the
+    live-detected WSL2 default gateway (the normal case), (3) the last-known
+    hardcoded fallback if detection fails. Always returns a non-empty
+    string -- an empty/missing value silently degrades to 127.0.0.1 in the
+    engine (engine/src/viser.rs) and the stream never reaches Windows."""
+    override = os.environ.get("CONSTRUCT_VISER_ADDR")
+    if override:
+        return override
+    ip = detect_host_gateway_ip()
+    if ip:
+        return f"{ip}:{port}"
+    return VISER_ADDR_FALLBACK
+
+
+# ---------------------------------------------------------------------------
 # process discovery / log tailing (real subprocess calls -- not unit tested
 # directly; only the pure functions above/below are)
 # ---------------------------------------------------------------------------
@@ -389,12 +445,22 @@ def ck_sweep(dirs: list[Path], n: int = 3, dry_run: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # mutating-action plan builders (pure -- argv/cwd/env only, no execution)
 # ---------------------------------------------------------------------------
-# Every builder returns {"argv": [...], "cwd": str|None, "env": {...}}. `env`
-# is an OVERLAY merged onto a copy of the caller's environment at run time,
-# never the full environment itself (keeps builders pure/small to assert on).
+# Every builder returns {"argv": [...], "cwd": str|None, "env": {...},
+# "detach": bool}. `env` is an OVERLAY merged onto a copy of the caller's
+# environment at run time, never the full environment itself (keeps builders
+# pure/small to assert on). `detach` marks launches that must NOT inherit
+# ctl.py's own stdout/stderr (run_bg redirects them to DEVNULL instead of
+# inheriting) -- BUG FIXED (live-found 2026-07-19): the three `cmd.exe /c
+# start` Windows-interop launches (relay/rlviser/overlay) hung `viewer on`
+# for ~120s after already succeeding, because they inherited ctl.py's stdout
+# pipe and WSL's interop layer keeps that pipe open until the spawned
+# Windows process's console fully detaches. These three are the only
+# run_bg() callers invoked with log_path=None (no log file to redirect to
+# instead), so they're the only ones that were ever at risk.
 
-def _plan(argv: list[str], cwd: str | None = None, env: dict | None = None) -> dict:
-    return {"argv": list(argv), "cwd": cwd, "env": dict(env) if env else {}}
+def _plan(argv: list[str], cwd: str | None = None, env: dict | None = None,
+          detach: bool = False) -> dict:
+    return {"argv": list(argv), "cwd": cwd, "env": dict(env) if env else {}, "detach": detach}
 
 
 # --- viewer ------------------------------------------------------------
@@ -410,24 +476,31 @@ def relay_start_plan() -> dict:
     return _plan([
         "cmd.exe", "/c", "start", "", "powershell.exe", "-NoProfile",
         "-ExecutionPolicy", "Bypass", "-File", RELAY_PS1,
-    ], cwd="/mnt/c")
+    ], cwd="/mnt/c", detach=True)
 
 
 def rlviser_start_plan() -> dict:
     return _plan(["cmd.exe", "/c", "start", "", "/D", RLVISER_WIN_DIR, "rlviser.exe"],
-                 cwd="/mnt/c")
+                 cwd="/mnt/c", detach=True)
 
 
 def overlay_start_plan() -> dict:
     return _plan([
         "cmd.exe", "/c", "start", "", "powershell.exe", "-NoProfile",
         "-ExecutionPolicy", "Bypass", "-File", OVERLAY_PS1,
-    ], cwd="/mnt/c")
+    ], cwd="/mnt/c", detach=True)
 
 
 def watch_loop_start_plan(viser_addr: str, rotate_secs: int = 300) -> dict:
     """Must run from the repo root -- the classic cwd trap is launching this
     from a shell that `cd /mnt/c`'d for the relay/rlviser/overlay steps."""
+    if not viser_addr:
+        raise ValueError(
+            "watch_loop_start_plan: viser_addr must not be empty -- an "
+            "empty/missing CONSTRUCT_VISER_ADDR silently falls back to "
+            "127.0.0.1 in the engine (engine/src/viser.rs) and the stream "
+            "never reaches the Windows-side viewer"
+        )
     return _plan(
         ["setsid", "./scripts/watch_loop.sh", str(rotate_secs)],
         cwd=str(REPO_ROOT),
@@ -607,7 +680,13 @@ def render_plan(plan: dict) -> str:
 
 def run_bg(plan: dict, log_path: Path | None, dry_run: bool = False) -> None:
     """Detached background launch (setsid-style): stdout/stderr appended to
-    log_path if given."""
+    log_path if given, otherwise DEVNULL -- NEVER inherited from ctl.py's
+    own stdio. BUG FIXED (live-found 2026-07-19): inheriting (stdout=None)
+    used to be the default for log_path=None callers (relay/rlviser/overlay
+    -- see their `detach=True` plan marker), which hung `viewer on` for
+    ~120s after it had already succeeded: WSL's interop layer keeps a
+    `cmd.exe /c start` child's inherited pipe open until the spawned
+    Windows process's console fully detaches."""
     if dry_run:
         dest = f" >> {log_path} 2>&1" if log_path else ""
         print(f"[dry-run] would run: {render_plan(plan)}{dest}")
@@ -615,17 +694,19 @@ def run_bg(plan: dict, log_path: Path | None, dry_run: bool = False) -> None:
     env = dict(os.environ)
     env.update(plan.get("env", {}))
     logf = None
-    stdout = stderr = None
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         logf = open(log_path, "ab")
         stdout = logf
         stderr = subprocess.STDOUT
+    else:
+        stdout = subprocess.DEVNULL
+        stderr = subprocess.DEVNULL
     try:
         subprocess.Popen(
             plan["argv"], cwd=plan.get("cwd"), env=env,
             stdout=stdout, stderr=stderr, stdin=subprocess.DEVNULL,
-            start_new_session=True,
+            start_new_session=True, close_fds=True,
         )
     finally:
         if logf is not None:
@@ -826,7 +907,7 @@ def cmd_viewer(args) -> None:
         if is_running(bracket_proof("watch_loop.sh")) and not args.dry_run:
             print("refusing to double-launch: watch_loop.sh already running")
             return
-        addr = os.environ.get("CONSTRUCT_VISER_ADDR", VISER_ADDR_FALLBACK)
+        addr = resolve_viser_addr()
         run_bg(watch_loop_start_plan(addr), log_path=LOGS_DIR / "watch_loop.log",
                dry_run=args.dry_run)
         return
