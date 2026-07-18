@@ -14,6 +14,8 @@ from dashboard import (  # noqa: E402
     _ssl_epoch,
     bc_summary,
     downsample,
+    estimate_bc_times,
+    estimate_train_times,
     parse_bc_log,
     parse_eval_history,
     parse_iter_line,
@@ -154,6 +156,65 @@ def test_bc_summary_progress_and_history():
 
 def test_bc_summary_empty():
     assert bc_summary([]) == {"runs": 0, "history": [], "current": None}
+
+
+# --- estimated wall times (logs carry no timestamps) ------------------------
+
+def _row(steps, sps):
+    return {"steps": steps, "sps": sps}
+
+
+def test_estimate_train_times_anchor_and_monotonic():
+    rows = [_row(100_000, 5000), _row(200_000, 5000), _row(300_000, 4000)]
+    out = estimate_train_times(rows, anchor_ts=1_000_000.0)
+    assert out[-1] == (1_000_000.0, False)  # last row anchored exactly at mtime
+    ts = [t for t, _ in out]
+    assert ts == sorted(ts)  # monotone non-decreasing
+    assert ts[2] - ts[1] == 100_000 / 4000  # steps_delta / later row's sps
+    assert ts[1] - ts[0] == 100_000 / 5000
+    assert not any(rough for _, rough in out)  # no restarts -> nothing rough
+
+
+def test_estimate_train_times_resume_boundary_marks_rough():
+    rows = [_row(100_000, 5000), _row(200_000, 5000),
+            _row(410_000, 5000), _row(500_000, 5000)]
+    out = estimate_train_times(rows, 1_000_000.0, restarts=[400_000])
+    # the 200k -> 410k gap contains the resume: everything at or before it is
+    # shifted by unknowable downtime
+    assert [rough for _, rough in out] == [True, True, False, False]
+    ts = [t for t, _ in out]
+    assert ts == sorted(ts) and ts[-1] == 1_000_000.0
+
+
+def test_estimate_train_times_edge_cases():
+    assert estimate_train_times([], 5.0) == []
+    assert estimate_train_times([_row(1, 100)], 5.0) == [(5.0, False)]
+    # zero sps must not divide by zero; ts stays monotone
+    out = estimate_train_times([_row(100, 0), _row(200, 0)], 5.0)
+    assert [t for t, _ in out] == [5.0, 5.0]
+
+
+def test_estimate_bc_times():
+    b = [{"epoch": 0, "batch": 100, "total": 1000, "samples_s": 8192, "loss": 1.0},
+         {"epoch": 0, "batch": 200, "total": 1000, "samples_s": 8192, "loss": 1.0},
+         {"epoch": 1, "batch": 50, "total": 1000, "samples_s": 4096, "loss": 1.0}]
+    ts = estimate_bc_times(b, 10_000.0)
+    assert ts[-1] == 10_000.0
+    # gb 200 -> 1050 across the epoch rollover: 850 batches * 4096 / 4096 s/s
+    assert ts[2] - ts[1] == 850 * 4096 / 4096
+    assert ts[1] - ts[0] == 100 * 4096 / 8192
+    assert ts == sorted(ts)
+    assert estimate_bc_times([], 1.0) == []
+
+
+def test_bc_summary_attaches_ts_est():
+    s = bc_summary(parse_bc_log(BC_TEXT), anchor_ts=50_000.0)
+    pts = s["current"]["loss"]
+    assert pts[-1]["ts_est"] == 50_000.0  # anchored at the log mtime
+    assert [p["ts_est"] for p in pts] == sorted(p["ts_est"] for p in pts)
+    # without an anchor the key is absent (payload stays lean)
+    s2 = bc_summary(parse_bc_log(BC_TEXT))
+    assert "ts_est" not in s2["current"]["loss"][0]
 
 
 # --- league registry --------------------------------------------------------

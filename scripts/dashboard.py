@@ -176,9 +176,11 @@ def parse_bc_log(text):
     return runs
 
 
-def bc_summary(runs, max_points=300):
+def bc_summary(runs, max_points=300, anchor_ts=None):
     """Shape parse_bc_log() output for the page: current-run progress + loss
-    series, and epoch-done history across all runs labeled by banner index."""
+    series, and epoch-done history across all runs labeled by banner index.
+    With anchor_ts (the log's mtime) each series point gets an estimated wall
+    time (see estimate_bc_times) for the chart tooltips."""
     history = [{"run": i + 1, **d} for i, run in enumerate(runs) for d in run["epochs_done"]]
     out = {"runs": len(runs), "history": history, "current": None}
     if runs:
@@ -187,16 +189,65 @@ def bc_summary(runs, max_points=300):
         frac = None
         if prog and cur["epochs"] and prog["total"]:
             frac = (prog["epoch"] * prog["total"] + prog["batch"]) / (cur["epochs"] * prog["total"])
-        series = [
-            {"gb": b["epoch"] * b["total"] + b["batch"], "loss": b["loss"], "sps": b["samples_s"]}
-            for b in cur["batches"] if b["loss"] is not None
-        ]
+        times = estimate_bc_times(cur["batches"], anchor_ts) if anchor_ts is not None else None
+        series = []
+        for j, b in enumerate(cur["batches"]):
+            if b["loss"] is None:
+                continue
+            pt = {"gb": b["epoch"] * b["total"] + b["batch"], "loss": b["loss"], "sps": b["samples_s"]}
+            if times is not None:
+                pt["ts_est"] = round(times[j], 1)
+            series.append(pt)
         out["current"] = {
             "banner": {k: cur[k] for k in ("train_shards", "val_shards", "batches_per_epoch", "epochs")},
             "progress": prog, "frac": frac, "loss": downsample(series, max_points),
             "last_done": cur["epochs_done"][-1] if cur["epochs_done"] else None,
         }
     return out
+
+
+def estimate_train_times(rows, anchor_ts, restarts=()):
+    """Iter lines carry no timestamps. Estimate per-row wall time by anchoring
+    the LAST row at the log's mtime and walking backwards: each gap costs
+    steps_delta / sps seconds (sps of the later row — its iteration rate).
+    Crossing a 'resumed at S' boundary makes every earlier estimate 'rough':
+    the downtime at the seam is unknowable, so everything before it is shifted
+    by an unknown amount. Returns [(ts, rough), ...] aligned to rows."""
+    n = len(rows)
+    if not n:
+        return []
+    ts, rough = [0.0] * n, [False] * n
+    ts[-1] = anchor_ts
+    rs = sorted(restarts)
+    beyond_boundary = False
+    for i in range(n - 1, 0, -1):
+        prev, cur = rows[i - 1], rows[i]
+        delta = max(0, cur["steps"] - prev["steps"])
+        sps = cur.get("sps") or prev.get("sps") or 0
+        ts[i - 1] = ts[i] - (delta / sps if sps > 0 else 0.0)
+        if any(prev["steps"] <= s < cur["steps"] for s in rs):
+            beyond_boundary = True
+        rough[i - 1] = beyond_boundary
+    return list(zip(ts, rough))
+
+
+def estimate_bc_times(batches, anchor_ts, batch_size=4096):
+    """Same backward walk for timestamp-less bc batch lines: a gap costs
+    batch_delta * batch_size / samples_per_s seconds. Called per run (banner
+    boundaries reset the walk by construction — the caller passes one run's
+    batches). Returns a ts list aligned to batches."""
+    n = len(batches)
+    if not n:
+        return []
+    ts = [0.0] * n
+    ts[-1] = anchor_ts
+    for i in range(n - 1, 0, -1):
+        prev, cur = batches[i - 1], batches[i]
+        gb_prev = prev["epoch"] * prev["total"] + prev["batch"]
+        gb_cur = cur["epoch"] * cur["total"] + cur["batch"]
+        sps = cur.get("samples_s") or prev.get("samples_s") or 0
+        ts[i - 1] = ts[i] - (max(0, gb_cur - gb_prev) * batch_size / sps if sps > 0 else 0.0)
+    return ts
 
 
 def parse_registry(text, src=""):
@@ -521,8 +572,24 @@ EVALER = None
 # payload
 # ---------------------------------------------------------------------------
 
+def _parse_main(text):
+    """parse_train_log + estimated wall times (anchored at the log's mtime —
+    consistent with the cache key, which includes mtime). Runs once per file
+    change, so the O(rows) walk stays off the steady-state request path."""
+    out = parse_train_log(text)
+    try:
+        anchor = MAIN_LOG.stat().st_mtime
+    except OSError:
+        anchor = time.time()
+    for r, (t, rough) in zip(out["rows"], estimate_train_times(out["rows"], anchor, out["restarts"])):
+        r["ts_est"] = round(t, 1)
+        if rough:
+            r["ts_rough"] = True
+    return out
+
+
 def _main_payload(now):
-    train = cached_parse(MAIN_LOG, parse_train_log)
+    train = cached_parse(MAIN_LOG, _parse_main, tag="main")
     rows = downsample(train["rows"], MAX_POINTS, tail=150)
     last = rows[-1] if rows else None
     eta = None
@@ -558,9 +625,13 @@ def payload():
         + cached_parse(EVAL_HISTORY, parse_eval_history, tag="ev_new"),
         key=lambda r: r["ts"],
     )
+    try:
+        bc_anchor = BC_LOG.stat().st_mtime
+    except OSError:
+        bc_anchor = None
     return {
         "main": _main_payload(now),
-        "bc": bc_summary(cached_parse(BC_LOG, parse_bc_log)),
+        "bc": bc_summary(cached_parse(BC_LOG, parse_bc_log), anchor_ts=bc_anchor),
         "league": league,
         "ssl": _ssl_payload(now),
         "evals": evals,
@@ -722,7 +793,7 @@ const fmtDur = s => { const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
                       return h ? `${h}h ${m}m` : `${m}m`; };
 const fmtAgo = s => s == null ? "—" : s < 90 ? "just now" :
                     s < 5400 ? Math.round(s/60)+"m ago" : (s/3600).toFixed(1)+"h ago";
-const fmtClock = v => new Date(v*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
+const fmtClock = v => new Date(v*1000).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",hour12:false});
 const fmtDay = v => { const d = new Date(v*1000);
   return `${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")} ${fmtClock(v)}`; };
 const mkcard = () => Object.assign(document.createElement("div"), {className:"card"});
@@ -776,9 +847,16 @@ function chart(el, rows, m, xKey, xFmt, restarts) {
     cross.setAttribute("x1", px); cross.setAttribute("x2", px);
     dot.setAttribute("cx", px); dot.setAttribute("cy", py);
     tip.style.display = "block";
-    tip.style.left = Math.min(e.clientX + 14, innerWidth - 190) + "px";
+    tip.style.left = Math.min(e.clientX + 14, innerWidth - 210) + "px";
     tip.style.top = (e.clientY + 14) + "px";
-    tip.innerHTML = `<b>${m.fmt(r[m.key])}</b><br><span style="color:var(--ink2)">at ${xFmt(r[xKey])}</span>`;
+    // datetime: real ts when the row has one; otherwise the estimate
+    // reconstructed from the log mtime ('~', '~~' once past a resume boundary
+    // where the downtime is unknowable)
+    const dt = r.ts_est != null ? (r.ts_rough ? "~~" : "~") + fmtDay(r.ts_est)
+             : r.ts != null ? fmtDay(r.ts) : null;
+    const xtxt = xKey === "ts" ? null : "at " + xFmt(r[xKey]);
+    tip.innerHTML = `<b>${m.fmt(r[m.key])}</b> <span style="color:var(--ink2)">${m.title}</span><br>` +
+      `<span style="color:var(--ink2)">${[xtxt, dt].filter(Boolean).join(" · ")}</span>`;
   });
   svg.addEventListener("mouseleave", () => {
     tip.style.display = "none";
@@ -954,7 +1032,7 @@ async function refresh() {
   try { d = await (await fetch("/data")).json(); }
   catch { document.getElementById("status").textContent = "server unreachable"; return; }
   document.getElementById("status").textContent =
-    `updated ${new Date().toLocaleTimeString()} · auto-refresh 5s · dashed lines = training restarts`;
+    `updated ${new Date().toLocaleTimeString()} · auto-refresh 5s · dashed lines = training restarts · ~time = estimated from log mtime (~~ past a restart)`;
   LAST = d;
   renderAll(d);
 }
