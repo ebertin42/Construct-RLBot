@@ -310,3 +310,12 @@ meaning EARLIER EVAL READINGS (1.71 / 1.40 / 1.81) carried dead-ball
 depression noise; the 1.40 "dip" was likely artifact. Expect eval variance to
 tighten from here. Run-B resumed on fixed engine, 3.528B (sps depressed by
 parse sweep, recovers ~21:00). Re-parse batch_0008/12, ETA ~21:00 → B4.
+
+### 2026-07-18 ~23:30 — prior upgraded to ep01 (Elliot-approved)
+BC-v3 finished 2 epochs: ep01 probe state-only 0.492 (vs ep00 0.441), copy
+0.718. Remote eval trend pre-swap: 0.62→0.85→0.78→0.91 (+83M) — climbing, no
+λ_p change warranted. Swapped anchor to ep01 via single restart from ck
+644.7M: kl_pri 0.47 at resume (no shock), ep_rew 1.96, ent 1.23. Ops: ctl.py
+unified CLI landed (ccde06d, 118 tests) — first live status run surfaced the
+run-B-prune/league-registry dead refs (cleaned 17→6) and the ep_rew recovery.
+Dashboard: multi-run panels + hover datetime tooltips (3ddc53a, 021da44).
