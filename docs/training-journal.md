@@ -90,6 +90,22 @@ fixed aeafbe7) — now on batch_0006/12, ETA ~21:00, then B4 export. Note for B6
 kickstart-teacher tooling is v0-only by design; BC ckpt feeds the future
 kl_prior seam, not KickstartTeacher.
 
+### 2026-07-18 ~19:00 — K4 DEPLOYED: KL-PPO ERA BEGINS (Elliot-approved)
+BC-v3 (clean v5 corpus, prev-dropout) B6-v3: probe PASS (copy 0.725≈human
+0.70, prev-zeroed top-1 0.441, val top1 62.7) but closed-loop unchanged
+(0.29 touches, 0-118 vs 520M) — ball_pred-poisoning hypothesis for closed-
+loop failure REFUTED; compounding error is structural per COLT-2025/Seer
+precedent (Seer's 820k-replay BC also couldn't play; they lacked the KL
+regularizer). DECISION (Elliot): anchor needs conditionals at PPO's states,
+not rollout competence — deployed at λ_p 0.05. Remote resumed from
+ck_000562083840 (the 2.25 peak) + league + v3.1 + --kl-prior. Verified:
+anchored line, kl_pri 6.95@iter1 (large → room to compress), sps warming.
+WATCH: kl_pri declining, sps settling ≥6.5k, evals (touches>9, goals≥1.5,
+then >2.25); kill-switch = restart without --kl-prior. B1-B6 (#44) and
+K1-K4 (#49) COMPLETE — P2 arc closed. Next: reset-pool 0.7 engine task
+(levers #1 — aligns PPO states with prior distribution, compounds the
+anchor), aux RP head, reward-v4 design pass (zero-sum subtraction).
+
 ### 2026-07-19 ~00:45 — B6-v2 preview: FAIL AGAIN — pivot to v5 corpus (BC-v3)
 Prev-dropout epoch-1 ck: probe CONFIRMED dropout worked (prev-zeroed acc
 0.193→0.451, pred==prev0 0.794→0.755 vs human 0.698, val top1 65.9) — yet
