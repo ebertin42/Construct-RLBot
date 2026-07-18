@@ -11,7 +11,10 @@ through engine.collect() instead: one set_weights, one collect() call for the
 whole eval window, sampled actions (matches training and the v0 tape's
 sampled-action convention -- see the v0 branch's determinism comment below).
 """
+import json
 import sys
+import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -67,9 +70,7 @@ if is_v1:
 
     minutes = STEPS / 15 / 60 * eng.num_agents
     match_minutes = STEPS / 15 / 60 * 16  # 16 arenas = 16 concurrent matches
-    print(f"touches/min/agent: {touches / minutes:.2f}")
-    print(f"mean dist to ball: {dist_mean:.0f} uu")
-    print(f"goals/min/match: {goals / match_minutes:.2f}")
+    touches_min, goals_min, dist = touches / minutes, goals / match_minutes, dist_mean
 else:
     eng = Engine(num_arenas=16, blue=1, orange=1, schema_path="schema/v0.toml",
                  reward_config_path="configs/reward_v0.toml", seed=1234)
@@ -96,6 +97,20 @@ else:
 
     minutes = STEPS / 15 / 60 * eng.num_agents
     match_minutes = STEPS / 15 / 60 * 16  # 16 arenas = 16 concurrent matches
-    print(f"touches/min/agent: {touches / minutes:.2f}")
-    print(f"mean dist to ball: {dist_sum / STEPS:.0f} uu")
-    print(f"goals/min/match: {goals / match_minutes:.2f}")
+    touches_min, goals_min, dist = touches / minutes, goals / match_minutes, dist_sum / STEPS
+
+# stdout is parsed by other tooling (dashboard EvalRunner used to regex it) —
+# keep the three lines byte-identical to before.
+print(f"touches/min/agent: {touches_min:.2f}")
+print(f"mean dist to ball: {dist:.0f} uu")
+print(f"goals/min/match: {goals_min:.2f}")
+
+# Structured seam for the dashboard's eval-history panel: one jsonl row per run.
+_hist = Path(__file__).resolve().parent.parent / "logs" / "eval_history.jsonl"
+_hist.parent.mkdir(parents=True, exist_ok=True)
+with _hist.open("a") as f:
+    f.write(json.dumps({
+        "ts": int(time.time()), "ck": Path(sys.argv[1]).name,
+        "goals_min": round(goals_min, 4), "touches_min": round(touches_min, 4),
+        "dist": round(dist, 1),
+    }) + "\n")
