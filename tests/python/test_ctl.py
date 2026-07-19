@@ -676,6 +676,41 @@ def test_eval_plan_custom_nice():
     assert plan["argv"][:3] == ["nice", "-n", "10"]
 
 
+# --- h2h -----------------------------------------------------------------
+
+def test_h2h_plan_default_wraps_vs_references():
+    plan = ctl.h2h_plan("checkpoints_entity/ck_001382942720.pt")
+    assert plan["argv"] == [
+        "nice", "-n", "15", str(ctl.VENV_PY), "scripts/h2h_eval.py",
+        "--vs-references", "checkpoints_entity/ck_001382942720.pt",
+    ]
+
+
+def test_h2h_plan_passes_through_steps_arenas_seed_nice():
+    plan = ctl.h2h_plan("ck.pt", steps=1000, arenas=4, seed=7, nice=10)
+    assert plan["argv"] == [
+        "nice", "-n", "10", str(ctl.VENV_PY), "scripts/h2h_eval.py",
+        "--vs-references", "ck.pt", "--steps", "1000", "--arenas", "4", "--seed", "7",
+    ]
+
+
+def test_h2h_action_requires_refs_flag(capsys):
+    parser = ctl.build_parser()
+    args = parser.parse_args(["h2h", "ck.pt", "--dry-run"])
+    with pytest.raises(SystemExit) as exc:
+        ctl.cmd_h2h(args)
+    assert exc.value.code == 1
+    assert "--refs" in capsys.readouterr().err
+
+
+def test_h2h_action_with_refs_dry_run_prints_plan(capsys):
+    parser = ctl.build_parser()
+    args = parser.parse_args(["h2h", "ck.pt", "--refs", "--dry-run"])
+    ctl.cmd_h2h(args)
+    out = capsys.readouterr().out
+    assert "h2h_eval.py" in out and "--vs-references" in out
+
+
 # --- remote ------------------------------------------------------------
 
 HOST = "elliot@192.168.86.117"
@@ -886,7 +921,7 @@ def test_build_parser_subcommands():
     names = set(sub_actions[0].choices.keys())
     assert names == {
         "status", "viewer", "bc", "ssl", "parse-v5", "export", "loops",
-        "eval", "ck-sweep", "recover", "remote",
+        "eval", "h2h", "ck-sweep", "recover", "remote",
     }
 
 

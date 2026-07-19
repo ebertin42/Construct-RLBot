@@ -6,6 +6,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 # scripts/ isn't a package, so import it by adding it to sys.path.
 _SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -18,6 +20,7 @@ from dashboard import (  # noqa: E402
     estimate_train_times,
     parse_bc_log,
     parse_eval_history,
+    parse_h2h_history,
     parse_iter_line,
     parse_registry,
     parse_ssl_log,
@@ -311,3 +314,36 @@ def test_parse_eval_history_both_schemas():
     assert legacy["dist"] == 1542.0
     assert new["ck"] == "ck_000163573760.pt" and new["goals_min"] == 0.4
     assert new["dist"] == 2100.5
+
+
+# --- h2h history jsonl -------------------------------------------------------
+
+H2H_TEXT = """{"ts": 1784200000, "ck": "ck_001382942720.pt", "ref": "ck_000562083840.pt", "ref_label": "peak-562M", "goals_ck": 35, "goals_ref": 119, "share": 0.2273, "steps": 5400, "seed": 11}
+{"ts": 1784163285, "ck": "ck_000909000000.pt", "ref": "ck_000562083840.pt", "ref_label": "peak-562M", "goals_ck": 22, "goals_ref": 77, "share": 0.2222, "steps": 5400, "seed": 11}
+garbage
+{"no_ts": true}
+"""
+
+
+def test_parse_h2h_history_sorted_by_ts():
+    rows = parse_h2h_history(H2H_TEXT)
+    assert len(rows) == 2
+    assert [r["ts"] for r in rows] == [1784163285, 1784200000]
+    first, second = rows
+    assert first["ck"] == "ck_000909000000.pt"
+    assert first["ref_label"] == "peak-562M"
+    assert first["goals_ck"] == 22 and first["goals_ref"] == 77
+    assert first["share"] == pytest.approx(0.2222)
+    assert second["ck"] == "ck_001382942720.pt" and second["steps"] == 5400 and second["seed"] == 11
+
+
+def test_parse_h2h_history_recomputes_missing_share():
+    text = '{"ts": 1, "ck": "a.pt", "ref": "b.pt", "ref_label": "L", "goals_ck": 3, "goals_ref": 1, "steps": 10, "seed": 0}\n'
+    rows = parse_h2h_history(text)
+    assert rows[0]["share"] == pytest.approx(0.75)
+
+
+def test_parse_h2h_history_zero_zero_share_is_none():
+    text = '{"ts": 1, "ck": "a.pt", "ref": "b.pt", "ref_label": "L", "goals_ck": 0, "goals_ref": 0, "steps": 10, "seed": 0}\n'
+    rows = parse_h2h_history(text)
+    assert rows[0]["share"] is None

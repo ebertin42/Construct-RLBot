@@ -1,0 +1,28 @@
+# Head-to-head reference set for scripts/h2h_eval.py --vs-references.
+#
+# WHY: self-play goals/min (scripts/eval_metrics.py) moves with both sides'
+# defense, not skill -- it hid an 800M-step regression and made a 3.5x-
+# weaker policy look like it was improving (docs/training-journal.md,
+# 2026-07-19 ~14:50, the KL-anchor kill-switch). Head-to-head against a
+# FROZEN reference checkpoint doesn't have that confound: a stronger policy
+# wins more of a fixed opponent regardless of how either side's own defense
+# trends over training.
+#
+# Seeded with the project's current high-water mark (confirmed by
+# head-to-head, not just self-play -- see the journal entry above: 562M beat
+# both the anchored 909M run AND the unanchored 1.38B tip). Add more
+# [[reference]] entries as new peaks are confirmed the same way; keep old
+# peaks around too so regressions relative to them stay visible.
+
+[[reference]]
+ck = "checkpoints_entity/ck_000562083840.pt"
+label = "peak-562M"
+
+# Slot for task #54 (external bots) -- the eventual ABSOLUTE anchor. Every
+# reference above this line is still just "our own best checkpoint so far",
+# which can only ever be a relative ruler against itself. Uncomment and
+# point at an external-bot-compatible checkpoint/bridge once #54 lands:
+#
+# [[reference]]
+# ck = "path/to/external_bot.pt"
+# label = "necto-ish"

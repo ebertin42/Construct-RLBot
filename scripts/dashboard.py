@@ -1,10 +1,14 @@
 """Multi-run training dashboard. One dark page, a panel per workstream:
 
   main    remote KL-PPO entity run   checkpoints_entity/train_remote.log (synced)
+  h2h     head-to-head skill eval    logs/h2h_history.jsonl (appended by scripts/h2h_eval.py) --
+          the REAL skill ruler (frozen references, side-order-summed); visually primary --
+          self-play goals/min below (relabeled "evals") is behavioral, NOT skill (journal 2026-07-19 ~14:50)
   bc      local BC pre-training      logs/bc_train.log (multiple runs, banner-split)
   league  ladder registries          league/registry.jsonl + league/registry_remote.jsonl
   ssl     SSL replay pull            logs/ssl_pull.log + data/replays/ssl/**/*.replay
-  evals   skill evals over time      logs/eval_history.jsonl (+ legacy checkpoints/eval_history.jsonl)
+  evals   self-play BEHAVIOR         logs/eval_history.jsonl (+ legacy checkpoints/eval_history.jsonl) --
+          touches/dist/goals-in-mirror-match; NOT a skill ranking, see h2h above
   system  CPU / RAM / GPU samplers   + Windows-host C: free (powershell, cached)
 
 Parsing lives in pure functions at the top of this file, tested in
@@ -39,6 +43,7 @@ SSL_LOG = REPO / "logs" / "ssl_pull.log"
 SSL_DIR = REPO / "data" / "replays" / "ssl"
 EVAL_HISTORY = REPO / "logs" / "eval_history.jsonl"           # appended by eval_metrics.py
 EVAL_HISTORY_LEGACY = REPO / "checkpoints" / "eval_history.jsonl"
+H2H_HISTORY = REPO / "logs" / "h2h_history.jsonl"              # appended by h2h_eval.py
 MAX_POINTS = 500
 
 # ---------------------------------------------------------------------------
@@ -382,6 +387,40 @@ def parse_eval_history(text):
     return rows
 
 
+def parse_h2h_history(text):
+    """Head-to-head history jsonl (scripts/h2h_eval.py) -> rows sorted by
+    ts. Schema: {ts, ck, ref, ref_label, goals_ck, goals_ref, share, steps,
+    seed} -- see h2h_eval.append_h2h_history. This is the REAL skill ruler
+    (frozen-reference goal share); parse_eval_history above is self-play
+    behavior, not skill -- see the panel labels in PAGE for why that
+    distinction matters (journal 2026-07-19 ~14:50)."""
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict) or "ts" not in e or "ck" not in e:
+            continue
+        goals_ck = int(e.get("goals_ck") or 0)
+        goals_ref = int(e.get("goals_ref") or 0)
+        share = _f(e.get("share"))
+        if share is None:
+            total = goals_ck + goals_ref
+            share = goals_ck / total if total else None
+        rows.append({
+            "ts": int(e["ts"]), "ck": str(e["ck"]), "ref": str(e.get("ref", "?")),
+            "ref_label": str(e.get("ref_label", e.get("ref", "?"))),
+            "goals_ck": goals_ck, "goals_ref": goals_ref, "share": share,
+            "steps": int(e.get("steps") or 0), "seed": int(e.get("seed") or 0),
+        })
+    rows.sort(key=lambda r: r["ts"])
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # IO + caching (parses re-run only when the file's mtime/size changes)
 # ---------------------------------------------------------------------------
@@ -625,6 +664,7 @@ def payload():
         + cached_parse(EVAL_HISTORY, parse_eval_history, tag="ev_new"),
         key=lambda r: r["ts"],
     )
+    h2h = cached_parse(H2H_HISTORY, parse_h2h_history, tag="h2h")
     try:
         bc_anchor = BC_LOG.stat().st_mtime
     except OSError:
@@ -635,6 +675,7 @@ def payload():
         "league": league,
         "ssl": _ssl_payload(now),
         "evals": evals,
+        "h2h": h2h,
         "eval_status": EVALER.status if EVALER else "disabled",
         "sys": list(SAMPLER.history),
         "host_free_gb": SLOW.host_free_gb,
@@ -651,7 +692,8 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <style>
 :root { --surface:#131312; --panel:#1b1b19; --card:#232320; --ink:#f4f3ec;
         --ink2:#c3c2b7; --muted:#8a897e; --grid:#33322f; --border:#33322f;
-        --series:#3987e5; --accent:rgba(57,135,229,.16) }
+        --series:#3987e5; --accent:rgba(57,135,229,.16);
+        --h2h:#e0a730; --h2h-series:#e0a730; --h2h-accent:rgba(224,167,48,.18) }
 * { box-sizing:border-box; margin:0 }
 body { background:var(--surface); color:var(--ink);
        font:14px/1.45 system-ui,-apple-system,sans-serif; padding:18px; }
@@ -660,6 +702,11 @@ h1 { font-size:17px; font-weight:650 }
 .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px;
          padding:14px 16px 12px; margin-bottom:14px }
 .panel.main { border-color:#2c5e9e }
+.panel.h2h { border-color:var(--h2h); border-width:2px; box-shadow:0 0 0 1px rgba(224,167,48,.25) }
+.panel.h2h h2 { color:var(--h2h) }
+svg.chart.h2h .line { stroke:var(--h2h-series) }
+svg.chart.h2h .mark, svg.chart.h2h .dot { fill:var(--h2h-series) }
+.parity { stroke:var(--muted); stroke-width:1; stroke-dasharray:4 3 }
 .panel h2 { font-size:13px; font-weight:650; color:var(--ink2); margin-bottom:10px;
             text-transform:uppercase; letter-spacing:.05em }
 .panel h2 .meta { font-weight:400; text-transform:none; letter-spacing:0;
@@ -725,6 +772,13 @@ tr.curr td { background:var(--accent) }
     <div class="wrap"><table id="tbl"></table></div></details>
 </section>
 
+<section class="panel h2h">
+  <h2>Head-to-head (skill)<span class="meta" id="h2h-meta"></span></h2>
+  <div class="tiles" id="h2h-tiles"></div>
+  <div class="grid" id="h2h-charts"></div>
+  <div class="wrap"><table id="h2h-hist"></table></div>
+</section>
+
 <div class="cols">
   <section class="panel">
     <h2>BC training · local<span class="meta" id="bc-meta"></span></h2>
@@ -743,7 +797,7 @@ tr.curr td { background:var(--accent) }
     <div class="tiles" id="ssl-tiles"></div>
   </section>
   <section class="panel">
-    <h2>Skill evals<span class="meta" id="evalstatus"></span></h2>
+    <h2>Self-play behavior (not a skill metric)<span class="meta" id="evalstatus"></span></h2>
     <div class="grid" id="evalcharts"></div>
   </section>
 </div>
@@ -780,12 +834,12 @@ const SYS_METRICS = [
    why:"Dataloaders, SSL pull, sync loops, RocketSim evals."},
 ];
 const EVAL_METRICS = [
-  {key:"goals_min", title:"Goals / min / match", fmt:v=>v.toFixed(2), marks:true,
-   why:"Goals per match-minute in a headless eval — the objective skill metric, plotted over wall time across checkpoints."},
+  {key:"goals_min", title:"Goals / min / match (self-play — behavioral, not skill)", fmt:v=>v.toFixed(2), marks:true,
+   why:"SELF-PLAY: both sides run the SAME policy, so this moves with both sides' defense, not skill — better defense suppresses it with zero skill loss, and both-sides-worse leaves it flat. It hid an 800M-step regression and made a 3.5x-weaker policy look like it was improving (journal 2026-07-19 ~14:50). Use the Head-to-head panel above for the real skill ruler."},
   {key:"touches_min", title:"Ball touches / min / agent", fmt:v=>v.toFixed(1), marks:true,
-   why:"How often the bot contacts the ball. Random baseline 0.0."},
+   why:"How often the bot contacts the ball. Random baseline 0.0. Behavioral descriptor, not a skill ranking."},
   {key:"dist", title:"Mean dist to ball (uu)", fmt:v=>v.toFixed(0), marks:true,
-   why:"Average car-to-ball distance. Random baseline 3769 uu; lower = involved in the play."},
+   why:"Average car-to-ball distance. Random baseline 3769 uu; lower = involved in the play. Behavioral descriptor, not a skill ranking."},
 ];
 const tip = document.getElementById("tip");
 const fmtSteps = v => v >= 1e9 ? (v/1e9).toFixed(2)+"B" : v >= 1e6 ? (v/1e6).toFixed(0)+"M" : v.toLocaleString();
@@ -807,11 +861,13 @@ function spark(vals) {
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${pts}"/></svg>`;
 }
 
-function chart(el, rows, m, xKey, xFmt, restarts) {
+function chart(el, rows, m, xKey, xFmt, restarts, extraClass) {
   const W = el.clientWidth || 320, H = 150, L = 48, R = 8, T = 8, B = 20;
   const xs = rows.map(r => r[xKey]), ys = rows.map(r => r[m.key]);
   let lo = Math.min(...ys), hi = Math.max(...ys);
   if (m.cap) { const s = [...ys].sort((a,b)=>a-b); hi = s[Math.floor((s.length-1)*m.cap)]; }
+  if (m.yMin != null) lo = Math.min(lo, m.yMin);
+  if (m.yMax != null) hi = Math.max(hi, m.yMax);
   if (lo === hi) { lo -= 1; hi += 1; }
   const x0 = xs[0], x1 = xs[xs.length-1] || 1;
   const X = v => L + (v - x0) / (x1 - x0 || 1) * (W - L - R);
@@ -829,10 +885,14 @@ function chart(el, rows, m, xKey, xFmt, restarts) {
     if (rv > x0 && rv < x1)
       g += `<line class="restart" x1="${X(rv)}" x2="${X(rv)}" y1="${T}" y2="${H-B}"><title>training resumed here</title></line>`;
   });
+  if (m.refLine != null && m.refLine >= lo && m.refLine <= hi) {
+    const y = Y(m.refLine);
+    g += `<line class="parity" x1="${L}" x2="${W-R}" y1="${y}" y2="${y}"><title>${m.refLineLabel||""}</title></line>`;
+  }
   const path = rows.map((r,i)=>`${i?"L":"M"}${X(r[xKey]).toFixed(1)},${Y(r[m.key]).toFixed(1)}`).join("");
   const marks = m.marks ? rows.map(r=>`<circle class="mark" r="4" cx="${X(r[xKey]).toFixed(1)}" cy="${Y(r[m.key]).toFixed(1)}"/>`).join("") : "";
   el.innerHTML = `<h3>${m.title}</h3>
-    <svg class="chart" viewBox="0 0 ${W} ${H}">${g}<path class="line" d="${path}"/>${marks}
+    <svg class="chart${extraClass ? " " + extraClass : ""}" viewBox="0 0 ${W} ${H}">${g}<path class="line" d="${path}"/>${marks}
       <line class="cross" y1="${T}" y2="${H-B}" x1="-9" x2="-9"/>
       <circle class="dot" r="4" cx="-9" cy="-9"/></svg>
     <div class="why">${m.why}</div>`;
@@ -978,6 +1038,60 @@ function renderSSL(s) {
   ]);
 }
 
+function renderH2H(rows) {
+  const meta = document.getElementById("h2h-meta");
+  const tiles_ = document.getElementById("h2h-tiles");
+  const grid = document.getElementById("h2h-charts");
+  const hist = document.getElementById("h2h-hist");
+  if (!rows.length) {
+    meta.textContent = "no logs/h2h_history.jsonl yet — run ctl.py h2h CK --refs";
+    tiles_.innerHTML = ""; grid.innerHTML = ""; hist.innerHTML = "";
+    return;
+  }
+  const refLabels = [...new Set(rows.map(r => r.ref_label))];
+  meta.textContent = `${rows.length} match${rows.length===1?"":"es"} · ${refLabels.length} reference${refLabels.length===1?"":"s"} · ` +
+    "the real skill ruler (frozen references, side-order-summed — not self-play)";
+  const last = rows[rows.length-1];
+  tiles(tiles_, [
+    ["Latest share", num(last.share, v=>(v*100).toFixed(1)+"%"),
+     `${last.ck} vs ${last.ref_label}`],
+    ["Latest score", `${last.goals_ck}-${last.goals_ref}`,
+     `${last.steps} steps/side · seed ${last.seed}`],
+    ["References tracked", refLabels.join(", "), "configs/h2h_references.toml"],
+  ]);
+  grid.innerHTML = "";
+  refLabels.forEach(label => {
+    const card = mkcard();
+    grid.appendChild(card);
+    const rs = rows.filter(r => r.ref_label === label && r.share != null);
+    const m = {
+      key: "share", title: `Goal share vs ${label}`, fmt: v => (v*100).toFixed(1)+"%",
+      marks: true, yMin: 0, yMax: 1, refLine: 0.5, refLineLabel: "parity (50%)",
+      why: "Fraction of combined goals won across BOTH side orders, always summed (side bias is real). Above the dashed 50% line = stronger than this frozen reference. This is the real skill ruler — the self-play panel below is not.",
+    };
+    if (rs.length > 1) {
+      chart(card, rs, m, "ts", fmtDay, [], "h2h");
+    } else if (rs.length === 1) {
+      const e0 = rs[0];
+      card.innerHTML = `<h3>${m.title}</h3>
+        <div class="tile" style="border:none;padding:6px 0"><div class="v">${m.fmt(e0.share)}</div>
+        <div class="d">single match (${e0.ck}) — chart appears after the next one</div></div>
+        <div class="why">${m.why}</div>`;
+    } else {
+      card.innerHTML = `<h3>${m.title}</h3><div class="d">no scored matches yet (0-0)</div><div class="why">${m.why}</div>`;
+    }
+  });
+  const cols = ["ck","ref_label","goals_ck","goals_ref","share","steps","seed"];
+  hist.innerHTML =
+    `<tr>${cols.map(c=>`<th${c==="ck"||c==="ref_label"?' style="text-align:left"':""}>${c}</th>`).join("")}</tr>` +
+    rows.slice(-15).reverse().map(r =>
+      `<tr>${cols.map(c => {
+        if (c === "share") return `<td>${num(r.share, v=>(v*100).toFixed(1)+"%")}</td>`;
+        if (c === "ck" || c === "ref_label") return `<td style="text-align:left">${r[c]}</td>`;
+        return `<td>${r[c]}</td>`;
+      }).join("")}</tr>`).join("");
+}
+
 function renderEvals(d) {
   document.getElementById("evalstatus").textContent = "· " + d.eval_status;
   const grid = grids("evalcharts", EVAL_METRICS);
@@ -1021,6 +1135,7 @@ function renderSys(d) {
 let LAST = null;
 function renderAll(d) {
   renderMain(d.main);
+  renderH2H(d.h2h);
   renderBC(d.bc);
   renderLeague(d.league);
   renderSSL(d.ssl);
@@ -1038,7 +1153,7 @@ async function refresh() {
 }
 refresh(); setInterval(refresh, 5000);
 addEventListener("resize", () => {
-  ["main-charts","bc-charts","syscharts","evalcharts"].forEach(id =>
+  ["main-charts","h2h-charts","bc-charts","syscharts","evalcharts"].forEach(id =>
     document.getElementById(id).innerHTML = "");
   if (LAST) renderAll(LAST);  // synchronous — no blank flash while refetching
 });

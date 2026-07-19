@@ -598,6 +598,33 @@ def eval_plan(ck: str, nice: int = 15) -> dict:
     )
 
 
+# --- h2h -----------------------------------------------------------------
+# Head-to-head skill eval (scripts/h2h_eval.py) -- see that file's module
+# docstring and docs/training-journal.md 2026-07-19 ~14:50 (the KL-anchor
+# kill-switch) for WHY: self-play goals/min (the `eval` subcommand above)
+# moves with both sides' defense, not skill, and hid an 800M-step
+# regression. This wraps ONLY --vs-references mode: ctl.py's surface is
+# "check a checkpoint against the reference ladder" (the repeatable
+# operational check), one CK in, one CK out. Ad hoc pairwise A-vs-B
+# comparisons (e.g. the kill-switch investigation itself) take a second
+# checkpoint the ctl CLI has no slot for -- run scripts/h2h_eval.py CK_A
+# CK_B directly for that. CPU-only engine (see h2h_eval.py's docstring), so
+# `nice -n 15` (matching eval_plan above) keeps it off GPU training's way
+# without needing to coordinate with it.
+
+def h2h_plan(ck: str, steps: int | None = None, arenas: int | None = None,
+             seed: int | None = None, nice: int = 15) -> dict:
+    argv = ["nice", "-n", str(nice), str(VENV_PY), "scripts/h2h_eval.py",
+            "--vs-references", ck]
+    if steps is not None:
+        argv += ["--steps", str(steps)]
+    if arenas is not None:
+        argv += ["--arenas", str(arenas)]
+    if seed is not None:
+        argv += ["--seed", str(seed)]
+    return _plan(argv, cwd=str(REPO_ROOT))
+
+
 # --- remote ------------------------------------------------------------
 
 def remote_ssh(host: str, *remote_argv: str) -> dict:
@@ -1003,6 +1030,22 @@ def cmd_eval(args) -> None:
     sys.exit(proc.returncode)
 
 
+def cmd_h2h(args) -> None:
+    if not args.refs:
+        print("ctl h2h currently wraps --vs-references mode only (one checkpoint "
+              "vs. the reference ladder in configs/h2h_references.toml) -- pass "
+              "--refs, or run scripts/h2h_eval.py CK_A CK_B directly for an ad "
+              "hoc pairwise comparison", file=sys.stderr)
+        sys.exit(1)
+    plan = h2h_plan(args.checkpoint, steps=args.steps, arenas=args.arenas,
+                     seed=args.seed, nice=args.nice)
+    if args.dry_run:
+        print(f"[dry-run] would run: {render_plan(plan)}")
+        return
+    proc = subprocess.run(plan["argv"], cwd=plan.get("cwd"))
+    sys.exit(proc.returncode)
+
+
 def cmd_ck_sweep(args) -> None:
     dirs = [REPO_ROOT / d for d in (args.dirs or CK_SWEEP_DEFAULT_DIRS)]
     report = ck_sweep(dirs, n=args.n, dry_run=args.dry_run)
@@ -1169,6 +1212,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--nice", type=int, default=15)
     sp.add_argument("--dry-run", action="store_true")
 
+    sp = sub.add_parser("h2h", help="head-to-head skill eval vs. the reference ladder (scripts/h2h_eval.py)")
+    sp.add_argument("checkpoint")
+    sp.add_argument("--refs", action="store_true",
+                     help="required for now -- play vs configs/h2h_references.toml "
+                          "(ctl only wraps this mode; see scripts/h2h_eval.py for ad hoc A-vs-B)")
+    sp.add_argument("--steps", type=int, default=None)
+    sp.add_argument("--arenas", type=int, default=None)
+    sp.add_argument("--seed", type=int, default=None)
+    sp.add_argument("--nice", type=int, default=15)
+    sp.add_argument("--dry-run", action="store_true")
+
     sp = sub.add_parser("ck-sweep", help="find/quarantine corrupt newest checkpoints")
     sp.add_argument("dirs", nargs="*", default=None)
     sp.add_argument("-n", type=int, default=3, help="newest N per dir to check")
@@ -1203,6 +1257,7 @@ HANDLERS = {
     "export": cmd_export,
     "loops": cmd_loops,
     "eval": cmd_eval,
+    "h2h": cmd_h2h,
     "ck-sweep": cmd_ck_sweep,
     "recover": cmd_recover,
     "remote": cmd_remote,
