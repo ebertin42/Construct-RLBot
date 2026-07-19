@@ -557,3 +557,39 @@ NEXT (needs Elliot's go — it is a training run): controlled A/B from 320M,
 entropy_coef 0.01 vs 0.001, ~20M steps each, measuring I(S;A) (diagnose_ppo)
 and h2h vs frozen 320M. Prediction: the low-entropy arm holds or gains
 state-dependence and h2h share; the 0.01 arm repeats the decay.
+
+### 2026-07-19 ~21:50 — A/B RESULT: prediction FALSIFIED (mechanism real, not the cause)
+Bounded A/B from ck_000320471040, seed 777, reward v4.1, league OFF, 145 iters
+(~23M steps) per arm, identical but for entropy_coef.
+| | I(S;A) on identical states | h2h vs frozen 320M (both orders) |
+|---|---|---|
+| baseline 320M | 0.876 (19.4%) | — |
+| arm A ent=0.01 | 0.483 (10.7%) | 25.5% (28-70 / 28-94) |
+| arm B ent=0.001 | **1.122 (24.8%)** | **10.4%** (13-105 / 10-94) |
+CONFIRMED: entropy_coef directly controls state-dependence — arm A lost 45%
+of I(S;A), arm B gained 28%, from the same start in the same steps. The
+state-blindness mechanism from the 20:00 entry is real.
+FALSIFIED: it is NOT why the policy is weak. BOTH arms lost badly, and the
+SHARPER, more state-dependent arm lost WORSE (10.4% vs 25.5%). Sharpening
+commits harder to whatever direction PPO is pushing — so the gradient
+DIRECTION is the problem, not the exploration level. My prediction on record
+was wrong; recording it as such.
+ALSO REFUTED (my next guess, killed by measurement before I acted on it):
+"dense vel_to_ball shaping outweighs goals". Measured contribution per
+episode — v4.1: goals 12.13 vs dense 6.61 (0.55:1); v3: 5.85 vs 5.47
+(0.94:1). Goals dominate in v4.1. The reward is not shaping-drowned.
+WHAT THE DATA NOW POINTS AT — and I introduced the confound myself: both arms
+ran with LEAGUE OFF (I disabled it to remove opponent variance). ep_rew ROSE
+in both (5.13, 6.06) while h2h vs a FIXED opponent FELL. That is the textbook
+self-play cycling signature: improving against a co-degrading mirror while
+losing absolute skill. It also fits the whole project history — the ONLY
+stable era was kickstart, i.e. anchored to a FIXED COMPETENT external teacher;
+every unanchored era (league at opponent_frac 0.2, so still 80% pure
+self-play) decayed; and the BC anchor failed because that anchor was fixed but
+INCOMPETENT. AlphaStar's ablations say exactly this: self-play alone forgets
+and cycles; PFSP + exploiters are what fix it (levers doc #5).
+NEXT PROPOSED (needs Elliot's go — arm C): 20M steps from 320M with league ON
+at HIGH opponent_frac (~0.5) against a pool seeded with the equal-strength
+kickstart-era cks (100M/200M/320M/440M), entropy_coef 0.003 (between the
+arms). If h2h holds >=45%, opponent diversity is the missing ingredient and
+the roadmap is league/exploiter work (levers #5/#6), not more reward design.
