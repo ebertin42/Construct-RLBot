@@ -1,0 +1,86 @@
+# reward v4 = symmetric zero-sum regime (levers-roadmap-2026-07-19.md lever #3).
+# Separate file for regime provenance (v0..v3.1 resumes never change regime).
+#
+# WHY: v3 (+10 goal / -8 concede, aggression_bias 0.2) bred a POSITIVE-SUM
+# goal-TRADING exploit — partners alternate goals and each nets +2 per
+# exchange regardless of cooperation (journal 2026-07-18 09:40, commit
+# aa560ab). v3.1's fix (+10/-12, aggression_bias -0.2) closed that loop
+# (-2/exchange) but instead bred a defense-weighted AVOIDANCE equilibrium,
+# suspected of a slow passivity decay over hundreds of M steps (journal
+# 2026-07-19 14:50 hypothesis). Diagnosis: hand-tuned goal/concede asymmetry
+# is the root cause in EITHER direction — the sign of the exploit follows the
+# sign of the asymmetry, not any property of aggression per se.
+#
+# FIX (Seer thesis, verbatim): "ensured that the reward is zero sum by
+# subtracting from each agent's reward, the reward of the opponent agent."
+# Two changes together, not one:
+#   1. Symmetric goal/concede (aggression_bias = 0.0): no hand-tuned skew.
+#   2. opp_spirit = 1.0: EpisodeArena::step's blend_team_spirit (episode.rs)
+#      applies r_i' = (1-tau)*r_i + tau*mean(own team) - opp*mean(opponents)
+#      to the FULL per-step reward (goal term + all shaping already summed
+#      in reward::compute), so every agent's reward becomes net-of-opponent.
+#      No shaping income exists that doesn't also cost the opponent — this is
+#      what makes goal-trading arithmetically unprofitable, not just
+#      unprofitable "for now" under one hand-picked asymmetry.
+#
+# CONSEQUENCE (read this before resuming a run on v4): with opp_spirit = 1.0,
+# a 1v1 goal event's raw compute() output is symmetric ±10 (scorer +10,
+# conceder -10 exactly, since concede = -goal*(1-bias) = -10.0), but after
+# blend_team_spirit the scorer receives 10 - 1.0*(-10) = +20 and the
+# conceder receives -10 - 1.0*10 = -20. The effective goal reward scale
+# DOUBLES vs v3.1's raw ±10/-12. This is a regime change in reward magnitude,
+# not just shape — the deploy of this config MUST use --reset-optimizer
+# (Adam's second-moment estimates from v3.1 would be stale for the new
+# scale). Deploy is Elliot's call; this file only documents the requirement.
+#
+# vel_to_ball stays 0.05 (unchanged from v3/v3.1): the only shaping term kept,
+# a tiny anti-degenerate engagement bonus so an already-competent policy
+# doesn't idle. It is bundled into reward::compute's return value BEFORE
+# blend_team_spirit runs, so it is now zero-summed too — not just the goal
+# term. touch / touch_accel / vel_ball_to_goal / offensive_potential stay at
+# v3's farm-free 0.0 (v3.toml's rationale: dense positional/impact shaping is
+# farmable and measured to depress goals/min ~-45%/B steps).
+#
+# team_spirit stays 0.3 (unchanged from v3/v3.1). NOTE: in 1v1 this term is a
+# mathematical no-op — with exactly one agent per team, mean(own team) ==
+# the agent's own raw reward, so (1-tau)*r_i + tau*r_i == r_i for ANY tau.
+# It only starts doing anything once a team has >1 agent (2v2+).
+#
+# DEFERRED, NOT IMPLEMENTED (Seer / Lucy-SKG recipe, levers doc #3):
+#   - annealed goal weight 1.25 -> 1.45 over training
+#   - multiplicative touch decay (x0.95/touch, floor 0.1)
+# Both need trainer-side scheduling that doesn't exist yet (same backlog
+# note as reward_v3.toml's "Annealing tau would need trainer support").
+# Touch decay is moot here regardless, since touch = 0.0 in this regime.
+
+goal = 10.0                 # symmetric; concede = -goal*(1-bias) = -10.0 exactly
+touch = 0.0                 # flat touch income OFF (v0 farm, v3 rationale)
+vel_to_ball = 0.05          # ONLY shaping kept: small anti-degenerate engagement
+aggression_bias = 0.0       # symmetric score/concede -> no hand-tuned skew (was the bug)
+
+# Farmable dense shaping stays OFF (v3 rationale, unchanged):
+touch_accel = 0.0           # impact-touch farm
+vel_ball_to_goal = 0.0      # goalward-nudge income farm
+offensive_potential = 0.0   # positioning KRC farm
+
+# Zero-sum blend: this is the actual fix. opp_spirit = 1.0 subtracts the full
+# opponent-team mean reward from each agent's own, making the total per-step
+# reward across both teams sum to (approximately) zero every step, and
+# EXACTLY zero for the goal event in 1v1 (see engine/src/reward.rs tests).
+team_spirit = 0.3           # unchanged; no-op in 1v1 (own-team mean == self)
+opp_spirit = 0.3            # v4.1: back to v3-era partial subtraction. opp_spirit=1.0 made the
+
+# --- v4.1 amendment (2026-07-19, after 2.75M steps of v4 measured 31.5% h2h
+# share vs the 562M peak with entropy RISING 3.53->3.83) ---
+# In 1v1 the blend reduces to r_i' = r_i - opp_spirit*r_j (team_spirit is a
+# no-op with one teammate). At opp_spirit=1.0 two cars chasing the ball
+# symmetrically have their vel_to_ball terms CANCEL EXACTLY, deleting the only
+# anti-degenerate engagement pull and leaving a near-sparse goals-only signal —
+# consistent with the observed entropy rise (policy diffusing without a dense
+# gradient). Full zero-sum was never required to kill goal-trading: symmetric
+# goal/concede (aggression_bias = 0.0) makes a trade cycle net exactly 0.0 at
+# ANY opp_spirit — see engine/src/reward.rs::trading_is_unprofitable_under_v4.
+# v4.1 therefore keeps the actual fix (symmetry) and restores opp_spirit to the
+# v3-era 0.3, which retains ~70% of the shaping's absolute pull and puts the
+# goal-event scale (+13 / -13) close to what the resumed value head already
+# knows (v3.1 was +13 / -15.6).

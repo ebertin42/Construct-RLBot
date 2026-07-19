@@ -405,3 +405,25 @@ and it is structurally unfarmable (trading nets 0). The skill signal is
 h2h share vs frozen ck_000562083840, not ep_rew and not self-play goals/min.
 Viewer also changed: streams the LIVE run only, cycling 1v1/2v2/3v3 in the
 trained 5/3/2 mix (3fd2dfe) — retired lineages dropped.
+
+### 2026-07-19 ~15:40 — v4 -> v4.1 (Elliot-approved): full zero-sum was a mistake
+First h2h reading of v4 (the new harness, 33bf03f): ck 564.8M scored 26-49 /
+20-51 swapped = 31.5% share vs the frozen 562M peak after only 2.75M steps,
+with entropy RISING 3.53->3.83 and ep_rew sinking to -5.
+ARITHMETIC FLAW FOUND: in 1v1 the blend reduces to r_i' = r_i - opp_spirit*r_j
+(team_spirit is a no-op with one teammate). At opp_spirit=1.0, two cars
+chasing the ball symmetrically have their vel_to_ball terms CANCEL EXACTLY —
+v4 deleted its own anti-degenerate engagement pull and left a near-sparse
+goals-only signal. Rising entropy = policy diffusing without a dense gradient.
+KEY INSIGHT: full zero-sum was never needed to kill trading. SYMMETRY does it
+— with aggression_bias = 0.0 a trade cycle nets exactly 0.0 at ANY opp_spirit
+(v4.1: blue scores +13/-13, orange scores -13/+13, cycle = 0).
+v4.1 = symmetric goal (the real fix) + opp_spirit 0.3 (v3-era), keeping ~70%
+of the shaping pull and a goal scale (+-13) close to what the resumed value
+head knows (v3.1 was +13/-15.6) — so NO --reset-optimizer this time, which
+also removes the biggest confound in reading the transient.
+First iter: ep_rew +0.79 (v4 was -1.17), v_loss 1.71, ent 3.54, sps 6.7k.
+Measurement discipline: auto-h2h fires at ~592M (+30M) vs the 562M peak.
+PROCESS NOTE: v4 lived ~30 min. Cheap because the h2h harness caught it in one
+reading — under the old self-play metric this would have looked like the usual
+"transition dip" and burned a day.
