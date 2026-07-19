@@ -1,0 +1,59 @@
+# DIAGNOSTIC-ONLY PROBE REWARD — NOT FOR REAL TRAINING.
+#
+# WHY THIS EXISTS: as of 2026-07-19 (~17:40 journal entry) head-to-head
+# tournaments showed that PPO self-play has never demonstrably improved this
+# policy — the kickstart-era checkpoints (100M/200M/320M/440M) are flat within
+# 43-54% of each other and beat every post-500M checkpoint by 80-90%, under
+# reward v3, v3.1, the BC anchor, v4 and v4.1 alike. Every one of those regimes
+# has a CONTESTED optimum: what the policy "should" do under a goal-dominant
+# self-play reward depends on what the opponent (itself) does, so a flat
+# learning curve is ambiguous between "the RL loop is broken" and "the reward
+# is a bad teacher".
+#
+# This config removes that ambiguity. It is the control experiment: a single
+# dense, per-agent, non-zero-sum, opponent-independent shaping term whose
+# optimum is unambiguous and known in advance — DRIVE AT THE BALL. It answers
+# exactly one question:
+#
+#     "Can this RL loop learn ANYTHING at all?"
+#
+# If a run under this config does not raise ep_rew (and visibly produce cars
+# that chase the ball), the fault is in the learning loop — not in reward
+# design — and no amount of reward iteration will help. If it DOES learn, the
+# loop works and the reward/regime debate is the real one.
+#
+# Every other term is exactly zero on purpose:
+#   goal = 0            no sparse credit-assignment problem to confound the read
+#   touch = 0           no contact income (that has its own farming pathology)
+#   touch_accel,
+#   vel_ball_to_goal,
+#   offensive_potential no dense shaping other than the one under test
+#   aggression_bias     no goal term for it to skew
+#   team_spirit = 0     each agent's reward depends only on its OWN velocity
+#   opp_spirit = 0      NOT zero-sum: two cars both driving at the ball must
+#                       both be rewarded. With opp_spirit > 0 the vel_to_ball
+#                       terms partially (at 1.0, exactly) cancel in 1v1 — the
+#                       v4 pathology documented in configs/reward_v4_1.toml —
+#                       which would destroy the very signal being probed.
+#
+# vel_to_ball = 1.0 (not v3's 0.05) so the probe signal is O(1) per step
+# instead of O(0.05): reward.rs computes
+#   vel_to_ball * clamp(proj(car_vel onto unit vector toward ball) / 2300, 0, 1)
+# so per-step reward here lies in [0, 1] and is maximized by driving at the
+# ball at supersonic speed. A value head resumed from a goal-scale regime is
+# miscalibrated for this scale — resume with --reset-optimizer, and expect the
+# first few hundred iterations to be value-head refitting.
+#
+# NEVER promote a checkpoint trained under this config. It is a probe.
+
+goal = 0.0
+touch = 0.0
+vel_to_ball = 1.0           # the ONLY live term: the whole point of this config
+
+aggression_bias = 0.0
+touch_accel = 0.0
+vel_ball_to_goal = 0.0
+offensive_potential = 0.0
+
+team_spirit = 0.0
+opp_spirit = 0.0
