@@ -455,4 +455,136 @@ mod tests {
         assert_eq!(v0.team_spirit, 0.0);
         assert_eq!(v0.opp_spirit, 0.0);
     }
+
+    // --- reward v4: symmetric zero-sum regime ---
+    // (levers-roadmap-2026-07-19.md lever #3; configs/reward_v4.toml has the full
+    // WHY. v3's +10/-8 asymmetry bred a positive-sum goal-trading exploit; v3.1's
+    // +10/-12 fix bred an avoidance equilibrium instead. v4's fix is symmetric
+    // goal/concede (aggression_bias = 0.0) PLUS full zero-sum opponent-subtraction
+    // (opp_spirit = 1.0) via episode::blend_team_spirit, applied to the whole
+    // per-step reward (goal + shaping), not just the goal term.)
+    use crate::episode::blend_team_spirit;
+
+    #[test]
+    fn v4_toml_matches_documented_design() {
+        // Guards against silent typos in configs/reward_v4.toml: every field must
+        // match the design documented in that file's header comments.
+        let c = RewardConfig::load("../configs/reward_v4.toml").unwrap();
+        assert_eq!(c.goal, 10.0);
+        assert_eq!(c.touch, 0.0);
+        assert_eq!(c.vel_to_ball, 0.05);
+        assert_eq!(c.aggression_bias, 0.0, "symmetric goal/concede is the whole point");
+        assert_eq!(c.touch_accel, 0.0);
+        assert_eq!(c.vel_ball_to_goal, 0.0);
+        assert_eq!(c.offensive_potential, 0.0);
+        assert_eq!(c.team_spirit, 0.3);
+        assert_eq!(c.opp_spirit, 1.0, "full zero-sum opponent subtraction is the fix");
+    }
+
+    // Test 1 (brief): with the real v4 config loaded, a 1v1 step where blue scores
+    // must produce a post-blend reward vector that sums to ~0, and specifically
+    // +20 / -20 (goal scale doubles under opp_spirit=1.0 — see config header).
+    // Composes reward::compute (raw, per-agent) with episode::blend_team_spirit
+    // (team/opponent blending), exactly as EpisodeArena::step does internally.
+    #[test]
+    fn v4_zero_sum_on_goal_event() {
+        ensure_init(None);
+        let cfg = RewardConfig::load("../configs/reward_v4.toml").unwrap();
+        let mut arena = Arena::default_standard();
+        arena.pin_mut().add_car(Team::Blue, CarConfig::octane());
+        arena.pin_mut().add_car(Team::Orange, CarConfig::octane());
+        arena.pin_mut().reset_to_random_kickoff(Some(1));
+        let gs = arena.pin_mut().get_game_state();
+        // Kickoff spawn velocity is 0, so vel_to_ball's shaping term is exactly 0
+        // here (proj = dot(vel, dir)/dist = 0) — the raw per-agent reward below is
+        // driven purely by the goal term, matching the config header's ±10 claim
+        // exactly rather than approximately.
+        let blue_idx = gs.cars.iter().position(|c| c.team == Team::Blue).unwrap();
+        let orange_idx = gs.cars.iter().position(|c| c.team == Team::Orange).unwrap();
+
+        let raw_blue = compute(&gs, &gs, blue_idx, Some(Team::Blue), &cfg);
+        let raw_orange = compute(&gs, &gs, orange_idx, Some(Team::Blue), &cfg);
+        assert_eq!(raw_blue, 10.0, "symmetric score, no shaping at kickoff velocity");
+        assert_eq!(raw_orange, -10.0, "symmetric concede, no shaping at kickoff velocity");
+
+        // blue_count = 1 (agent order: blue then orange, matching EpisodeArena's
+        // car_ids convention documented on that struct).
+        let mut rewards = [raw_blue, raw_orange];
+        blend_team_spirit(&mut rewards, 1, cfg.team_spirit, cfg.opp_spirit);
+
+        assert!((rewards[0] - 20.0).abs() < 1e-4, "scorer should net +20, got {}", rewards[0]);
+        assert!((rewards[1] - (-20.0)).abs() < 1e-4, "conceder should net -20, got {}", rewards[1]);
+        assert!(
+            (rewards[0] + rewards[1]).abs() < 1e-4,
+            "post-blend reward vector must sum to ~0 (zero-sum), got {} + {} = {}",
+            rewards[0],
+            rewards[1],
+            rewards[0] + rewards[1]
+        );
+    }
+
+    // Test 2 (brief): the regression test that pins WHY v4 exists. Simulates the
+    // goal-trading exploit arithmetically for two alternating goal events (blue
+    // scores, then orange scores) under both the real v3 config and the real v4
+    // config.
+    //
+    // v3 side deliberately uses v3's RAW (unblended) goal/concede reward — i.e.
+    // opp_spirit treated as 0 here, NOT v3.toml's actual opp_spirit=0.3 — because
+    // the historical trading-exploit diagnosis (journal 2026-07-18 09:40, commit
+    // aa560ab; "partners alternate goals, each netting +2 per exchange") was the
+    // pure asymmetric goal/concede arithmetic, independent of team-spirit
+    // blending (a separate mechanism: per-teammate reward pooling, orthogonal to
+    // the goal/concede skew that caused the exploit). This isolates the exact
+    // mechanism v4 fixes.
+    //
+    // v4 side uses the REAL config end-to-end, including its opp_spirit=1.0
+    // blend, because the blend IS the fix being tested.
+    #[test]
+    fn trading_is_unprofitable_under_v4_but_not_v3() {
+        let v3 = RewardConfig::load("../configs/reward_v3.toml").unwrap();
+        let v4 = RewardConfig::load("../configs/reward_v4.toml").unwrap();
+
+        // Sanity-pin the raw numbers the brief's design is stated in terms of.
+        assert_eq!(v3.goal, 10.0);
+        assert_eq!(v3.aggression_bias, 0.2);
+        let v3_concede = -v3.goal * (1.0 - v3.aggression_bias);
+        assert!((v3_concede - (-8.0)).abs() < 1e-5, "v3 concede should be -8.0, got {v3_concede}");
+
+        // --- v3: raw (unblended) arithmetic, opp_spirit treated as 0 ---
+        // Event A: blue scores (+goal for blue, concede for orange).
+        // Event B: orange scores (+goal for orange, concede for blue).
+        let v3_blue_net = v3.goal + v3_concede; // score then concede
+        let v3_orange_net = v3_concede + v3.goal; // concede then score
+        assert!((v3_blue_net - 2.0).abs() < 1e-5, "v3 blue should net +2/exchange, got {v3_blue_net}");
+        assert!(
+            (v3_orange_net - 2.0).abs() < 1e-5,
+            "v3 orange should net +2/exchange, got {v3_orange_net}"
+        );
+        // Positive-sum: both sides profit from trading regardless of cooperation.
+        assert!(v3_blue_net > 0.0 && v3_orange_net > 0.0);
+
+        // --- v4: real config end-to-end, including its zero-sum blend ---
+        assert_eq!(v4.goal, 10.0);
+        assert_eq!(v4.aggression_bias, 0.0);
+        let v4_concede = -v4.goal * (1.0 - v4.aggression_bias);
+        assert!((v4_concede - (-10.0)).abs() < 1e-5);
+
+        // Event A: blue scores.
+        let mut event_a = [v4.goal, v4_concede]; // [blue, orange]
+        blend_team_spirit(&mut event_a, 1, v4.team_spirit, v4.opp_spirit);
+        // Event B: orange scores.
+        let mut event_b = [v4_concede, v4.goal]; // [blue, orange]
+        blend_team_spirit(&mut event_b, 1, v4.team_spirit, v4.opp_spirit);
+
+        let v4_blue_net = event_a[0] + event_b[0];
+        let v4_orange_net = event_a[1] + event_b[1];
+        assert!(
+            v4_blue_net.abs() < 1e-4,
+            "v4 blue should net exactly 0.0/exchange, got {v4_blue_net}"
+        );
+        assert!(
+            v4_orange_net.abs() < 1e-4,
+            "v4 orange should net exactly 0.0/exchange, got {v4_orange_net}"
+        );
+    }
 }
