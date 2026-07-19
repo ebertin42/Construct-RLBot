@@ -389,3 +389,19 @@ Anchor post-mortem: it did deliver stability (zero degeneracies in 348M steps,
 entropy 1.2 vs 3.5) — the machinery works; λ_p=0.05 with a GC2 prior is just
 too strong a leash for a policy already above GC2 level. If retried: λ_p 0.01,
 or anneal it in, or anchor to our own best checkpoint instead of humans.
+
+### 2026-07-19 ~15:10 — REWARD V4 DEPLOYED (Elliot-approved): symmetric zero-sum
+v4 = goal 10.0 / aggression_bias 0.0 (concede exactly -10) + opp_spirit 1.0
+(full opponent subtraction). Engine test pins the point: a trade cycle nets
++2.0 under v3 and EXACTLY 0.0 under v4; a goal event is ±20 after blending.
+Deferred (need trainer scheduling that doesn't exist): annealed goal weight,
+touch decay (moot at touch=0). Deployed from ck_000562083840 (high-water
+mark) + league + jitter-v2 + --reset-optimizer (goal scale doubled, old
+value head miscalibrated). First iters: sps 6.5-7.5k (anchor tax gone),
+v_loss 2.06->1.36 recalibrating, ent 3.5.
+READ ep_rew DIFFERENTLY NOW: under zero-sum it is net advantage vs the
+opponent, not shaped income — negative early vs league opponents is expected
+and it is structurally unfarmable (trading nets 0). The skill signal is
+h2h share vs frozen ck_000562083840, not ep_rew and not self-play goals/min.
+Viewer also changed: streams the LIVE run only, cycling 1v1/2v2/3v3 in the
+trained 5/3/2 mix (3fd2dfe) — retired lineages dropped.
