@@ -330,3 +330,13 @@ entropy/kl_pri stable. Verdict upgraded: trajectory now competitive, not
 just stability. Watch: ~1.5 overnight; 2.14 fallback mark within ~a day at
 slope. ctl.py viewer-on bug found+fixed live (missing CONSTRUCT_VISER_ADDR,
 869bc23). BC-v3 closed: ep01 val top1 64.2/top3 84.4/jump-recall 51.6.
+
+### 2026-07-19 ~04:45 — kickoff jitter shipped (both boxes)
+Anchored policy's textbook symmetric kickoffs manufactured the RocketSim
+pinch blowup nearly EVERY kickoff (450 containments remote; viewer stuck in
+kickoff-restart loop — Elliot spotted it live). Fix: ±50uu/±0.09rad per-car
+kickoff spawn jitter from the existing episode rng (engine commit, bounds+
+determinism tests; A/B pinch test documented as physics-chaos-limited).
+Shipped: local .so swap + remote resume 741.1M (ep01 anchor intact, kl_pri
+0.40). Containment baseline 450 — delta watch. Side-benefit expected:
+kickoff-state variety. Run trend pre-ship: 1.16@694M, ep_rew to 5.7@resume.
