@@ -451,3 +451,35 @@ Escalate only if it exceeds ~5% of episodes.
 Also closed: #53 goldens were stale-not-broken — and the check that mattered
 came back clean, deploy/bot.py + deploy/obs.py already encode demoed cars the
 way obs_v1.rs does, so real-game play was never affected (4334e76).
+
+### 2026-07-19 ~17:00 — REPLAY-STATE RESET LEVER LANDED (inert; ultracode workflow)
+Levers doc #1 implemented via a 9-agent workflow (understand x3 -> spec ->
+implement -> adversarial verify x3 -> fix): engine/src/reset_pool.rs (loader,
+filters, reservoir, quat->rotmat port), curriculum.rs config surface,
+episode.rs three-way ResetKind draw + apply_replay_state, configs/
+curriculum_v2.toml. Commits 96cd7d0 + f600fc9.
+Mix: 0.70 replay / 0.10 kickoff / 0.20 random (the spec's 0.15 scenario-pack
+share folded into random — we have no scenario packs). 2v2/3v3 renormalize
+over {kickoff, random} since the pool is duels-only. Real-corpus production
+load: 1,081,088 read -> 891,720 kept (82.5%), 132.7 MB shared via Arc, 2.09 s.
+ALL THREE REVIEWERS said FIX_FIRST (7 blocking, 7 minor); 6+6 applied. The
+two most valuable catches were things I would not have found by reading:
+- F2's goal-band used |ball.y| > 5120, but step() runs 8 ticks BEFORE the
+  policy acts — a replayed near-goal state could score on tick 0. Band is now
+  4800 (= BALL_MAX_SPEED*8/120 + margin), making a first-step goal
+  ARITHMETICALLY unreachable, pinned by a const assert the fixer verified
+  fires by reverting it. Cost 5% of corpus.
+- No ang_vel clamp: real corpus states drove car ang_vel to 96.5 rad/s vs
+  RocketSim's 5.5 cap (obs features ~17x their design range). Post-filter max
+  is 5.78.
+Rejected finding (correctly): a ballpred test failure blamed on this commit —
+git show --stat proves the commit touches neither ballpred.rs nor its test,
+and it passes 1-in-3 in isolation. Documented flake, not a regression.
+Documented-not-fixed -> task #57: pool lacks has_flip + pad cooldowns (43% of
+corpus cars are airborne). Self-consistent within the sim, so not a bug, but
+it diverges from bc_obs.rs's real values — matters only when a BC prior is
+re-enabled. Needs replay/ changes + re-parse.
+STATUS: INERT BY DESIGN. train_v1.toml still points at curriculum_v1.toml;
+curriculum_v1.toml untouched. Deploy is a deliberate one-line operator switch,
+held until v4.1 has a second h2h reading >=50% (attribution discipline —
+never stack two regime changes on an unmeasured one again).
