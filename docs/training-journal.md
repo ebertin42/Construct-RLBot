@@ -658,3 +658,22 @@ throttle, 11.7% on throttle+handbrake). But the repertoires diverge sharply:
 boost 0.156 (human) vs 0.701 (RL), handbrake 0.340 vs 0.109, air-control 0.564
 vs 0.907; only 16-26% repertoire overlap. Our RL policies are boost-mashers.
 That is a symptom of what PPO optimizes toward here, not a limit of the table.
+
+### 2026-07-20 ~00:50 — CHAMPION GATING built (Elliot's idea, #59, commit 928d598)
+Given that training is destructive on average (arms A/B/C: 10.4-27.1% vs their
+own start), stop trusting it: a candidate must WIN head-to-head to become the
+champion, and the champion is what serves as KL anchor, league-pool seed, and
+deploy candidate. PPO becomes a mutation operator inside a hill-climb that
+cannot regress. scripts/champion_gate.py: status | gate CK [--promote-if-pass]
+| watch [--auto-promote] | promote/reject CK --reason (MANUAL override, Elliot
+hand-picking, recorded with manual=true + reason so the audit trail separates
+measured wins from judgment calls). Threshold 0.52, both side orders MANDATORY
+(single-order swings ~±6 goals), min_total_goals 20 so a 3-0 shutout cannot
+promote on 100% share, atomic tmp+rename pointer, promotion also appends the
+new champion to the league pool. History is a superset of the h2h schema so
+the dashboard plots gate results unchanged. 54 tests.
+ACCEPTANCE TEST (the one that matters): gated arm A — a candidate MEASURED at
+22-25% — result 19.8% FAIL, champion pointer verified unchanged. A gate that
+cannot reject a known-bad candidate would be worse than no gate.
+Champion initialized to ck_000320471040 (measured strongest across the whole
+project; beats the former "peak" 562M by 81.5%).
