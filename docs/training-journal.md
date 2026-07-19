@@ -632,3 +632,29 @@ PPO loop degrades the policy under EVERY configuration including its own
 native one — which would mean the loop cannot sustain skill at all and the
 remaining suspects are structural (92-action table expressiveness, obs
 conditioning, tick_skip 8 credit assignment).
+
+### 2026-07-20 ~00:30 — ARM D HOLDS PARITY: the anchor is (probably) the whole story
+| arm | config | I(S;A) | h2h vs frozen 320M |
+|---|---|---|---|
+| baseline | (no training) | 0.867 / 19.2% | — (null control 51.1%) |
+| A | ent .01, no league, v4.1 | 0.481 / 10.6% | 22.0-25.5% |
+| B | ent .001, no league, v4.1 | 1.114 / 24.6% | 10.4-11.4% |
+| C | ent .003, league 0.5 clean pool, v4.1 | 0.906 / 20.0% | 27.1% |
+| **D** | ent .01, no league, **v3 + KICKSTART ANCHOR** | 0.905 / 20.0% | **49.2%** (50-43 / 43-53) |
+All five identical otherwise: from ck_000320471040, 145 iters, seed 777, same
+measurement. With a competent anchor the policy KEEPS its skill through 20M
+steps; without one it loses 73-89% of goals to its own starting point. Entropy
+and opponent diversity move I(S;A) around but do not save it.
+CAVEAT I AM TESTING RATHER THAN ASSUMING: D differs from A in TWO ways —
+anchor ON and reward v3 (not v4.1). ARM E now running to isolate: v3, NO
+anchor, everything else identical to D. This completes a 2x2:
+  A = v4.1/no-anchor 22-25%   D = v3/anchor 49.2%   E = v3/no-anchor = ?
+If E lands ~25% -> the ANCHOR is causal and reward choice is a side issue.
+If E lands ~49% -> the REWARD SWITCH (v3->v4.1) did the damage, not the anchor,
+and the last two days of reward work were actively harmful rather than neutral.
+STRUCTURAL SUSPECT (i) REFUTED separately: the 92-action table is expressive
+enough — the BC prior reaches human behavior through it (17.9% mass on plain
+throttle, 11.7% on throttle+handbrake). But the repertoires diverge sharply:
+boost 0.156 (human) vs 0.701 (RL), handbrake 0.340 vs 0.109, air-control 0.564
+vs 0.907; only 16-26% repertoire overlap. Our RL policies are boost-mashers.
+That is a symptom of what PPO optimizes toward here, not a limit of the table.
