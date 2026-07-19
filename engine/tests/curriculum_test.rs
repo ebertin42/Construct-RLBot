@@ -70,7 +70,7 @@ fn no_curriculum_means_kickoff_only() {
     let mut a = mk(None, 3);
     for _ in 0..5 {
         let gs = a.game_state();
-        assert!(gs.ball.pos.x.abs() < 1.0 && gs.ball.pos.y.abs() < 1.0, "kickoff ball at center");
+        assert!(gs.ball.pos.x.abs() < 12.0 && gs.ball.pos.y.abs() < 12.0, "kickoff ball near center (±10uu jitter)");
         a.debug_force_reset();
     }
 }
@@ -92,7 +92,7 @@ fn constructor_kickoff_matches_raw_arena_within_jitter_bounds() {
 
     // Mirrors episode.rs's KICKOFF_JITTER_POS (private to that module — kept
     // in sync here rather than exposed as a public constant just for this).
-    const KICKOFF_JITTER_POS: f32 = 50.0;
+    const KICKOFF_JITTER_POS: f32 = 150.0;
 
     ensure_init(None);
     let s = Schema::load("../schema/v0.toml").unwrap();
@@ -106,8 +106,11 @@ fn constructor_kickoff_matches_raw_arena_within_jitter_bounds() {
     raw.pin_mut().reset_to_random_kickoff(Some(42));
     let gr = raw.pin_mut().get_game_state();
 
-    // Ball spawn is never jittered — still bit-identical.
-    assert_eq!(gs.ball.pos, gr.ball.pos, "ball pos differs from raw seed-42 kickoff");
+    // Ball spawn now carries ±10uu horizontal jitter (the decisive symmetry
+    // breaker); z stays exact.
+    assert!((gs.ball.pos.x - gr.ball.pos.x).abs() <= 10.0 + 1e-3, "ball x beyond jitter bound");
+    assert!((gs.ball.pos.y - gr.ball.pos.y).abs() <= 10.0 + 1e-3, "ball y beyond jitter bound");
+    assert_eq!(gs.ball.pos.z, gr.ball.pos.z, "ball z must be exact");
     assert_eq!(gs.cars.len(), gr.cars.len());
     for (c, r) in gs.cars.iter().zip(gr.cars.iter()) {
         let dx = c.state.pos.x - r.state.pos.x;

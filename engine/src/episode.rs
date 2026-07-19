@@ -29,8 +29,16 @@ const MAX_TICKS: u64 = 300 * TICKS_PER_SEC;
 /// spawn noise. ±50 uu (position) and ±0.09 rad (~5°, yaw) are big enough to
 /// desynchronize arrival tick/angle but small enough to leave every kickoff
 /// spawn legal (nowhere near a wall or the ball).
-const KICKOFF_JITTER_POS: f32 = 50.0;
-const KICKOFF_JITTER_YAW: f32 = 0.09;
+// 2026-07-19: ±50uu/±0.09rad proved insufficient live — the anchored policy
+// course-corrects over the 3-4s approach and both cars still pinch the ball
+// near-simultaneously (viewer sessions, where EVERY episode is a kickoff,
+// pinched each time; the remote "win" was confounded by curriculum's 60%
+// non-kickoff resets). Tripled car noise + small BALL horizontal offset —
+// the ball offset is the decisive symmetry breaker: contact geometry
+// diverges no matter how well both cars correct their approach.
+const KICKOFF_JITTER_POS: f32 = 150.0;
+const KICKOFF_JITTER_YAW: f32 = 0.17;
+const KICKOFF_JITTER_BALL: f32 = 10.0;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StepFlags {
@@ -354,6 +362,13 @@ impl EpisodeArena {
             cs.rot_mat = Angle { yaw: base_yaw + dyaw, pitch: 0.0, roll: 0.0 }.to_rotmat();
             self.arena.pin_mut().set_car(id, cs).expect("car exists (jitter_kickoff_spawns)");
         }
+        // Ball horizontal micro-offset (±KICKOFF_JITTER_BALL uu): even
+        // perfectly-corrected symmetric approaches now meet an off-center
+        // ball, so the two contacts can't mirror. z untouched (rest height).
+        let mut ball = self.arena.pin_mut().get_ball();
+        ball.pos.x += -KICKOFF_JITTER_BALL + self.rng.next_f32() * (2.0 * KICKOFF_JITTER_BALL);
+        ball.pos.y += -KICKOFF_JITTER_BALL + self.rng.next_f32() * (2.0 * KICKOFF_JITTER_BALL);
+        self.arena.pin_mut().set_ball(ball);
     }
 
     /// Test/debug helper: force an episode reset (through the same curriculum-aware
