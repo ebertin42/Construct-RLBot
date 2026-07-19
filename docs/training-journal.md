@@ -517,3 +517,43 @@ ALWAYS test both candidates against a common third party, and prefer a diverse
 panel + the league ladder. Note self-play goals/min was ANTI-correlated here:
 562M scored 2.25 (weak defense inflates both sides) vs 320M's 1.79, while
 320M wins the actual match 81.5%.
+
+### 2026-07-19 ~20:00 — DIAGNOSIS: the policy is going STATE-BLIND (entropy bonus)
+Elliot called "diagnose before restarting". Built scripts/diagnose_ppo.py
+(84d1a8b, 48 tests) — offline, read-only, no training.
+RULED OUT, cleanly:
+- Importance ratio: mean 1.000000, max |logp delta| 4.7e-5, 0 of 27,648
+  samples outside [0.9,1.1]. The candle(engine)/torch(learner) seam is exact;
+  every PPO update has applied correct importance weights. (My leading
+  hypothesis — that only kickstart worked because its KL term bypasses the
+  ratio — is REFUTED.)
+- Value head: ev 0.88/0.89, corr 0.94, scale calibrated, bias ~0. Advantages
+  are real signal. Stricter ev_mc (lam=1) 0.47/0.55 — mediocre, not broken.
+- Advantages: std 1.0-1.3, ZERO degenerate entries. Weight sync verified
+  earlier (train.py collect() calls set_weights before every rollout).
+THE FINDING — I(S;A), mutual information between state and sampled action,
+measured on IDENTICAL states (8192 rows from one shared rollout):
+| policy | E[H(A|s)] | I(S;A) | % of ln(92) |
+|---|---|---|---|
+| RL strong 320M | 3.208 | 0.837 | 18.5% |
+| RL degraded 592M | 3.605 | 0.486 | 10.8% |
+| **BC prior (same net/obs)** | **1.710** | **1.525** | **33.7%** |
+The BC prior is 3x more state-dependent than the degraded RL policy on the
+same architecture and inputs, so the net is fully CAPABLE of conditioning —
+RL training is what erodes it. The 320M->592M decay is a 42% loss of
+state-dependence with per-state entropy rising in lockstep, matching the h2h
+skill collapse exactly. ~86-89% of the RL policy's output entropy is
+unconditioned: it takes 56-61 of 92 actions to cover 90% of sampled mass.
+MECHANISM: entropy_coef=0.01 rewards H(A|s), and the cheapest way to maximize
+per-state entropy is to IGNORE THE STATE. That pull is small but SYSTEMATIC on
+every minibatch, while the policy-gradient term is zero-mean by construction
+(normalized advantages) and noise-dominated at 3.5 nats of sampling entropy
+over 92 actions. A consistent small bias beats large zero-mean noise over
+millions of updates. Kickstart's KL-to-teacher was a large SYSTEMATIC
+state-conditioned counter-force — which is why the only era this project ever
+held skill was the distillation era, and why decay began the moment the anneal
+zeroed that term at 500M. Four reward redesigns never touched this variable.
+NEXT (needs Elliot's go — it is a training run): controlled A/B from 320M,
+entropy_coef 0.01 vs 0.001, ~20M steps each, measuring I(S;A) (diagnose_ppo)
+and h2h vs frozen 320M. Prediction: the low-entropy arm holds or gains
+state-dependence and h2h share; the 0.01 arm repeats the decay.
