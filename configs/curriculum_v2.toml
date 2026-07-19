@@ -1,0 +1,31 @@
+# Episode-reset mixture v2 — replay-state resets (spec §4, levers doc #1).
+# Weights are relative (normalized internally at draw time).
+#
+# Spec target is 0.7 replay / 0.1 kickoff / 0.15 scenario-pack / 0.05 random.
+# No scenario packs exist yet, so the 0.15 scenario share is parked on `random`
+# (same role: non-replay, non-kickoff coverage). When scenario packs land,
+# drop random back to 0.05 and add scenario_weight = 0.15.
+#
+# Kickoff at 0.10 is deliberate: kickoffs are a small fraction of real play, and
+# the pool trims the first 2s of every replay, so kickoff states are reachable
+# ONLY through the kickoff branch.
+#
+# Note: the pool is duels-only, so 2v2/3v3 arenas renormalize over
+# {kickoff, random} (1:2) and never draw a replay state. Under a mixed
+# team_size_weights split the fleet-wide realized replay share is therefore
+# below `replay_weight` — raise team_size_weights[0] if you want the full 0.7.
+replay_weight  = 0.7
+kickoff_weight = 0.1
+random_weight  = 0.2
+
+[replay_pool]
+# Absent/unreadable file -> warning + empty pool + replay branch disabled.
+# The run continues at renormalized kickoff/random weights. Never fatal.
+path = "data/reset_pool_v5.jsonl"
+max_states = 0   # 0 = load every clean state (1.08M -> ~169 MB, ~1.6 s)
+
+[random]
+car_speed_max = 1800.0
+ball_speed_max = 2500.0
+z_max = 1700.0
+min_separation = 300.0

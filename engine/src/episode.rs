@@ -4,6 +4,7 @@ use crate::{
     curriculum::CurriculumConfig,
     obs::{self, OBS_SIZE},
     obs_v1::{self, ENT_FEAT, MAX_ENT, PREV_ACTIONS, Q_FEAT},
+    reset_pool::ResetState,
     reward::{self, RewardConfig},
     sampler::Pcg32,
     schema::Normalization,
@@ -39,6 +40,15 @@ const MAX_TICKS: u64 = 300 * TICKS_PER_SEC;
 const KICKOFF_JITTER_POS: f32 = 150.0;
 const KICKOFF_JITTER_YAW: f32 = 0.17;
 const KICKOFF_JITTER_BALL: f32 = 10.0;
+
+/// Which flavor of state an episode reset starts from. `Replay` carries the
+/// already-drawn pool index so the draw and the apply stay in one place.
+#[derive(Debug, Clone, Copy)]
+enum ResetKind {
+    Replay(usize),
+    Random,
+    Kickoff,
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StepFlags {
@@ -296,21 +306,72 @@ impl EpisodeArena {
     /// scenario when the curriculum draw says so — this keeps pad/hit-info hygiene
     /// identical across both reset flavors.
     fn reset_episode(&mut self) {
-        let use_random = match &self.curriculum {
+        let kind = match &self.curriculum {
             Some(c) => {
-                let p = c.random_weight / (c.random_weight + c.kickoff_weight);
-                self.rng.next_f32() < p
+                // The pool is duels-only by construction, so a 2v2/3v3 arena (or
+                // an empty/absent pool) zeroes the replay share and the draw
+                // RENORMALIZES over {kickoff, random}. It deliberately does NOT
+                // "draw replay, then fall back to kickoff": that would silently
+                // inflate kickoff to 0.8 in every non-duel arena — an 8x
+                // overweight of the one reset flavor this lever exists to move
+                // away from, landing on exactly the arenas most prone to the
+                // mirrored-kickoff pinch blowup.
+                let replay_eff = if !c.pool.is_empty() && self.car_ids.len() == 2 && self.blue_count == 1
+                {
+                    c.replay_weight
+                } else {
+                    0.0
+                };
+                let total = replay_eff + c.kickoff_weight + c.random_weight;
+                // Exactly ONE draw per reset, as before. Branch order and the
+                // threshold expressions are load-bearing: with `replay_eff ==
+                // 0.0`, `u < 0.0 / total` is always false (strict `<`, and
+                // `u ∈ [0,1)`), while `(0.0 + random) / (0.0 + kickoff + random)`
+                // is BIT-IDENTICAL to the legacy `random / (random + kickoff)`
+                // (`0.0 + x == x` exactly; IEEE addition is commutative). So
+                // every legacy config, every non-duel arena, and every arena
+                // with an empty pool reproduces the old rng stream and the old
+                // sequence of reset states exactly — pinned by T17/T18.
+                let u = self.rng.next_f32();
+                if total > 0.0 && u < replay_eff / total {
+                    // Index from `next_u32`, never from `next_f32`: with a ~1.08M
+                    // pool, `(next_f32() * len as f32) as usize` can round up to
+                    // exactly `len` in f32 (spacing near 1e6 is 0.125) and panic
+                    // out of bounds. Modulo bias over 2^32 is ~2.5e-4 relative.
+                    ResetKind::Replay((self.rng.next_u32() as usize) % c.pool.len())
+                } else if total > 0.0 && u < (replay_eff + c.random_weight) / total {
+                    ResetKind::Random
+                } else {
+                    ResetKind::Kickoff
+                }
             }
-            None => false,
+            None => ResetKind::Kickoff,
         };
+        // Always first, on every branch: this is the only thing that resets boost
+        // pads and per-car `ball_hit_info`, and the replay branch depends on it
+        // for a default-constructed `CarState` to read-modify-write (the invalid
+        // hit info the touch-tracking loop and `reward::compute` both key off).
         self.arena.pin_mut().reset_to_random_kickoff(Some(self.seed));
-        if use_random {
-            let bounds = self.curriculum.as_ref().unwrap().random.clone();
-            crate::curriculum::random_reset(self.arena.pin_mut(), &mut self.rng, &bounds);
-        } else if self.jitter_enabled {
-            // Only jitter when the kickoff formation survives (a random-scenario
-            // reset above would just overwrite it) — see `jitter_kickoff_spawns`.
-            self.jitter_kickoff_spawns();
+        match kind {
+            ResetKind::Replay(i) => {
+                // Arc clone (refcount bump), not a pool copy — see the `pool`
+                // field's doc comment on why this matters at 192 arenas.
+                let pool = self.curriculum.as_ref().unwrap().pool.clone();
+                self.apply_replay_state(&pool[i]);
+            }
+            ResetKind::Random => {
+                let bounds = self.curriculum.as_ref().unwrap().random.clone();
+                crate::curriculum::random_reset(self.arena.pin_mut(), &mut self.rng, &bounds);
+            }
+            ResetKind::Kickoff => {
+                // Only jitter when the kickoff formation survives (the other two
+                // branches overwrite it) — see `jitter_kickoff_spawns`. A replay
+                // state is already asymmetric, and jitter would corrupt a real
+                // recorded position.
+                if self.jitter_enabled {
+                    self.jitter_kickoff_spawns();
+                }
+            }
         }
         // Advance the kickoff seed AFTER using it, so the constructor's first reset
         // uses the RAW engine seed (bit-identical to the legacy constructor, which
@@ -371,6 +432,57 @@ impl EpisodeArena {
         self.arena.pin_mut().set_ball(ball);
     }
 
+    /// Overwrites the ball and both cars with a recorded human state, on top of
+    /// the kickoff `reset_episode` just performed. Uses the same
+    /// `get -> mutate -> set` idiom as `curriculum::random_reset`, and for the
+    /// same reason: `set_car`/`set_ball` REPLACE the whole struct, so every
+    /// field we don't assign is inherited from the fresh post-kickoff state
+    /// rather than from a `CarState::default()` we'd have to get right by hand.
+    ///
+    /// Six fields per car — exactly the set `random_reset` writes. Everything
+    /// else stays at the post-kickoff default deliberately: `ball_hit_info`
+    /// invalid (a stale hit would falsely reset `last_touch_tick`), `is_demoed`
+    /// false (the pool has no demo flag; filter F3 drops demo-proxy states),
+    /// jump/flip state cleared (so every replay-reset car is granted a flip —
+    /// the pool has no `has_flip` field, and this matches `random_reset`),
+    /// `last_controls` zero, and all boost pads available. That last one is a
+    /// known fidelity gap: a real mid-game state would have several pads on
+    /// cooldown, but the pool carries no pad data.
+    ///
+    /// No unit conversion on positions/velocities — the pool is raw
+    /// RocketSim-native world frame (uu, uu/s, rad/s). Boost is the one
+    /// exception: `0..1` on the wire, `0..100` in `CarState`.
+    fn apply_replay_state(&mut self, st: &ResetState) {
+        let mut ball = self.arena.pin_mut().get_ball();
+        ball.pos = Vec3::new(st.ball.pos[0], st.ball.pos[1], st.ball.pos[2]);
+        ball.vel = Vec3::new(st.ball.vel[0], st.ball.vel[1], st.ball.vel[2]);
+        ball.ang_vel = Vec3::new(st.ball.ang_vel[0], st.ball.ang_vel[1], st.ball.ang_vel[2]);
+        // `rot_mat` left at the kickoff default: the ball is rotationally
+        // symmetric, `random_reset` doesn't set it either, and the pool has no
+        // ball-rotation field by design.
+        self.arena.pin_mut().set_ball(ball);
+
+        // `st.cars[i]` -> `self.car_ids[i]`: the pool is blue-then-orange (filter
+        // F7 enforces it at load) and `car_ids` is blue-asc-then-orange-asc, and
+        // the caller's gate guarantees this is a 1v1 arena.
+        let ids = self.car_ids.clone();
+        for (i, &id) in ids.iter().enumerate() {
+            let sp = &st.cars[i];
+            let mut cs = self.arena.pin_mut().get_car(id);
+            cs.pos = Vec3::new(sp.pos[0], sp.pos[1], sp.pos[2]);
+            cs.vel = Vec3::new(sp.vel[0], sp.vel[1], sp.vel[2]);
+            cs.ang_vel = Vec3::new(sp.ang_vel[0], sp.ang_vel[1], sp.ang_vel[2]);
+            cs.rot_mat = crate::reset_pool::quat_to_rotmat(sp.quat);
+            cs.boost = sp.boost * 100.0;
+            cs.is_on_ground = sp.on_ground;
+            self.arena.pin_mut().set_car(id, cs).expect("car exists (apply_replay_state)");
+        }
+        // The load filters put every accepted state far inside `state_is_sane`'s
+        // limits (pos <=12000 / vel <=20000 / ang_vel <=100 vs. corpus maxima of
+        // 5249 / 6000 / 5.5), so this is a debug-only backstop, not a gate.
+        debug_assert!(state_is_sane(&self.arena.pin_mut().get_game_state()));
+    }
+
     /// Test/debug helper: force an episode reset (through the same curriculum-aware
     /// path `step` uses on termination/truncation).
     pub fn debug_force_reset(&mut self) {
@@ -379,6 +491,13 @@ impl EpisodeArena {
 
     pub fn num_agents(&self) -> usize {
         self.car_ids.len()
+    }
+
+    /// Physics-blowup containments (arena rebuilds) this arena has performed.
+    /// Test-only instrumentation — exposed so integration tests can assert a
+    /// reset flavor doesn't drive the contact solver nonfinite.
+    pub fn blowup_count(&self) -> u64 {
+        self.blowup_count
     }
 
     fn agent_car_index(&self, state: &GameState, agent: usize) -> usize {
@@ -953,6 +1072,349 @@ mod tests {
                  physics-chaos signal (see doc comment above); skipping the hard pinch-rate assertion, bounds+\
                  determinism remain covered unconditionally by the other two kickoff_jitter_* tests"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod replay_reset_tests {
+    use super::*;
+    use crate::curriculum::CurriculumConfig;
+    use crate::reset_pool::{BallSpawn, CarSpawn, ResetState};
+    use std::sync::Arc;
+
+    fn mk(blue: usize, orange: usize, seed: u32, c: Option<CurriculumConfig>) -> EpisodeArena {
+        crate::sim_init::ensure_init(None);
+        let s = crate::schema::Schema::load("../schema/v0.toml").unwrap();
+        let cfg = crate::reward::RewardConfig::load("../configs/reward_v0.toml").unwrap();
+        EpisodeArena::new_with_curriculum(blue, orange, s.tick_skip, cfg, s.normalization, seed, c)
+    }
+
+    fn curr(replay: f32, kickoff: f32, random: f32, pool: Vec<ResetState>) -> CurriculumConfig {
+        let mut c = CurriculumConfig::load("../configs/curriculum_v1.toml").unwrap();
+        c.replay_weight = replay;
+        c.kickoff_weight = kickoff;
+        c.random_weight = random;
+        c.pool = Arc::new(pool);
+        c
+    }
+
+    /// A synthetic-but-legal duel state. `tag` shifts the ball far from both the
+    /// kickoff spot and (in practice) any random-reset draw, so the branch
+    /// classifier below can attribute a reset unambiguously.
+    fn state(tag: usize) -> ResetState {
+        let t = tag as f32;
+        ResetState {
+            ball: BallSpawn {
+                pos: [1000.0 + t, 2000.0 - t, 500.0 + t * 0.5],
+                vel: [10.0 + t, -20.0, 30.0],
+                ang_vel: [0.5, -0.25, 1.0],
+            },
+            cars: [
+                CarSpawn {
+                    pos: [-1500.0 - t, -2500.0, 17.01],
+                    vel: [100.0 + t, 200.0, 0.0],
+                    ang_vel: [0.0, 0.0, 1.5],
+                    quat: [0.0014666612, 0.004585884, -0.32203302, 0.9467162],
+                    boost: 0.42,
+                    team: 0,
+                    on_ground: true,
+                },
+                CarSpawn {
+                    pos: [1500.0 + t, 2500.0, 800.0],
+                    vel: [-300.0, -100.0, 250.0 + t],
+                    ang_vel: [1.0, -2.0, 0.5],
+                    quat: [0.0026252908, 0.004022506, -0.49989405, 0.86607325],
+                    boost: 0.11,
+                    team: 1,
+                    on_ground: false,
+                },
+            ],
+        }
+    }
+
+    fn pool_of(n: usize) -> Vec<ResetState> {
+        (0..n).map(state).collect()
+    }
+
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    enum Kind {
+        Replay,
+        Kickoff,
+        Random,
+    }
+
+    /// RocketSim stores physics state in Bullet units (uu/50) and converts on
+    /// every get/set, so a `set_ball`/`get_ball` round-trip is NOT bit-exact —
+    /// it loses ~1e-7 relative (e.g. 1002.0 -> 1001.99994). Applied-state
+    /// assertions therefore use a tight relative tolerance rather than
+    /// equality; this is a property of the simulator's unit conversion, not of
+    /// `apply_replay_state`. (Arena-vs-arena sequence comparisons stay
+    /// bit-exact: both sides take the identical lossy path.)
+    fn close(got: f32, want: f32, what: &str) {
+        let tol = 1e-4 * want.abs().max(1.0);
+        assert!((got - want).abs() <= tol, "{what}: {got} vs {want}");
+    }
+
+    fn close3(got: [f32; 3], want: [f32; 3], what: &str) {
+        for i in 0..3 {
+            close(got[i], want[i], &format!("{what}[{i}]"));
+        }
+    }
+
+    /// True iff `b` is the round-tripped image of pool ball position `p`. The
+    /// synthetic pool separates entries by >= 0.5 uu per component, so a 1e-2
+    /// window is unambiguous and far wider than the ~1e-4 conversion error.
+    fn same_ball(b: &Vec3, p: &[f32; 3]) -> bool {
+        (b.x - p[0]).abs() < 1e-2 && (b.y - p[1]).abs() < 1e-2 && (b.z - p[2]).abs() < 1e-2
+    }
+
+    /// Attributes an observed post-reset state to the branch that produced it:
+    /// replay iff the ball matches a pool entry, kickoff iff the ball is at
+    /// (jittered) center at rest height, random otherwise.
+    fn classify(gs: &GameState, pool: &[ResetState]) -> Kind {
+        let b = gs.ball.pos;
+        if pool.iter().any(|s| same_ball(&b, &s.ball.pos)) {
+            return Kind::Replay;
+        }
+        if (b.z - 93.15).abs() < 1e-3 && b.x.abs() < 20.0 && b.y.abs() < 20.0 {
+            return Kind::Kickoff;
+        }
+        Kind::Random
+    }
+
+    /// Every float a reset can write, flattened for bit-exact sequence compare.
+    fn snapshot(gs: &GameState) -> Vec<f32> {
+        let mut v = vec![
+            gs.ball.pos.x, gs.ball.pos.y, gs.ball.pos.z,
+            gs.ball.vel.x, gs.ball.vel.y, gs.ball.vel.z,
+            gs.ball.ang_vel.x, gs.ball.ang_vel.y, gs.ball.ang_vel.z,
+        ];
+        let mut cars: Vec<_> = gs.cars.iter().collect();
+        cars.sort_by_key(|c| c.id);
+        for c in cars {
+            let s = &c.state;
+            v.extend_from_slice(&[
+                s.pos.x, s.pos.y, s.pos.z,
+                s.vel.x, s.vel.y, s.vel.z,
+                s.ang_vel.x, s.ang_vel.y, s.ang_vel.z,
+                s.rot_mat.forward.x, s.rot_mat.forward.y, s.rot_mat.forward.z,
+                s.rot_mat.right.x, s.rot_mat.right.y, s.rot_mat.right.z,
+                s.rot_mat.up.x, s.rot_mat.up.y, s.rot_mat.up.z,
+                s.boost,
+            ]);
+        }
+        v
+    }
+
+    fn sequence(a: &mut EpisodeArena, n: usize) -> Vec<Vec<f32>> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(snapshot(&a.game_state()));
+            a.debug_force_reset();
+        }
+        out
+    }
+
+    // ---- T17 ----
+    #[test]
+    fn zero_replay_weight_is_bit_identical_to_legacy() {
+        // A non-empty pool must be completely inert when replay_weight is 0:
+        // no extra rng draw, no branch taken. Proves the legacy stream survives
+        // merely having a pool loaded.
+        let mut a = mk(1, 1, 5150, Some(curr(0.0, 0.4, 0.6, pool_of(16))));
+        let mut b = mk(1, 1, 5150, Some(curr(0.0, 0.4, 0.6, vec![])));
+        assert_eq!(sequence(&mut a, 50), sequence(&mut b, 50));
+    }
+
+    // ---- T18: the "pool file missing on the training box" contract ----
+    #[test]
+    fn empty_pool_degrades_to_legacy_stream() {
+        let mut a = mk(1, 1, 991, Some(curr(0.7, 0.1, 0.2, vec![])));
+        let mut b = mk(1, 1, 991, Some(curr(0.0, 0.1, 0.2, vec![])));
+        assert_eq!(
+            sequence(&mut a, 50),
+            sequence(&mut b, 50),
+            "an empty pool must reproduce the legacy kickoff/random stream exactly"
+        );
+    }
+
+    // ---- T19 ----
+    #[test]
+    fn duel_arena_applies_pool_state_exactly() {
+        let st = state(7);
+        let mut a = mk(1, 1, 3, Some(curr(1.0, 0.0, 0.0, vec![st.clone()])));
+        a.debug_force_reset();
+        let gs = a.game_state();
+
+        close3([gs.ball.pos.x, gs.ball.pos.y, gs.ball.pos.z], st.ball.pos, "ball pos");
+        close3([gs.ball.vel.x, gs.ball.vel.y, gs.ball.vel.z], st.ball.vel, "ball vel");
+        close3(
+            [gs.ball.ang_vel.x, gs.ball.ang_vel.y, gs.ball.ang_vel.z],
+            st.ball.ang_vel,
+            "ball ang_vel",
+        );
+
+        for (i, &id) in a.car_ids.clone().iter().enumerate() {
+            let c = gs.cars.iter().find(|c| c.id == id).unwrap();
+            let sp = &st.cars[i];
+            close3([c.state.pos.x, c.state.pos.y, c.state.pos.z], sp.pos, &format!("car {i} pos"));
+            close3([c.state.vel.x, c.state.vel.y, c.state.vel.z], sp.vel, &format!("car {i} vel"));
+            close3(
+                [c.state.ang_vel.x, c.state.ang_vel.y, c.state.ang_vel.z],
+                sp.ang_vel,
+                &format!("car {i} ang_vel"),
+            );
+            close(c.state.boost, sp.boost * 100.0, &format!("car {i} boost rescaled 0..1 -> 0..100"));
+            assert_eq!(c.state.is_on_ground, sp.on_ground, "car {i} on_ground");
+            let m = crate::reset_pool::quat_to_rotmat(sp.quat);
+            for (got, want) in [
+                (c.state.rot_mat.forward.x, m.forward.x),
+                (c.state.rot_mat.forward.y, m.forward.y),
+                (c.state.rot_mat.forward.z, m.forward.z),
+                (c.state.rot_mat.up.x, m.up.x),
+                (c.state.rot_mat.up.y, m.up.y),
+                (c.state.rot_mat.up.z, m.up.z),
+            ] {
+                assert!((got - want).abs() < 1e-6, "car {i} rot_mat: {got} vs {want}");
+            }
+            // blue-then-orange: pool car i lands on agent i
+            let team_u8 = if c.team == Team::Blue { 0u8 } else { 1u8 };
+            assert_eq!(team_u8, sp.team, "pool car {i} must land on the matching team");
+        }
+    }
+
+    // ---- T20 ----
+    #[test]
+    fn pool_reset_clears_episode_bookkeeping() {
+        let st = state(2);
+        crate::sim_init::ensure_init(None);
+        let s = crate::schema::Schema::load("../schema/v0.toml").unwrap();
+        let cfg = crate::reward::RewardConfig::load("../configs/reward_v0.toml").unwrap();
+        let mut a = EpisodeArena::new_full(
+            1, 1, s.tick_skip, cfg, s.normalization, 11,
+            Some(curr(1.0, 0.0, 0.0, vec![st.clone()])), ObsMode::V1,
+        );
+        a.debug_force_reset();
+        let tick = a.game_state().tick_count;
+        assert_eq!(a.episode_start_tick, tick);
+        assert_eq!(a.last_touch_tick, tick);
+        let p = a.prev_state.ball.pos;
+        assert!(same_ball(&p, &st.ball.pos), "prev_state must latch the applied pool state: {p:?}");
+        for ring in &a.v1.as_ref().unwrap().prev {
+            assert_eq!(*ring, [0; PREV_ACTIONS], "v1 prev-action rings must be zeroed");
+        }
+    }
+
+    // ---- T21 ----
+    #[test]
+    fn pool_reset_preserves_defaults_reward_depends_on() {
+        let mut a = mk(1, 1, 77, Some(curr(1.0, 0.0, 0.0, vec![state(1)])));
+        a.debug_force_reset();
+        let gs = a.game_state();
+        for c in &gs.cars {
+            assert!(!c.state.ball_hit_info.is_valid, "a fresh episode must carry no hit info");
+            assert!(!c.state.is_demoed);
+            assert_eq!(c.state.demo_respawn_timer, 0.0);
+            assert!(c.state.has_flip_or_jump(), "replay-reset cars are granted a flip");
+            assert_eq!(c.state.last_controls.throttle, 0.0);
+            assert_eq!(c.state.last_controls.steer, 0.0);
+            assert!(!c.state.last_controls.jump);
+            assert!(!c.state.last_controls.boost);
+        }
+        assert!(
+            gs.pads.iter().all(|p| p.state.is_active),
+            "reset_to_random_kickoff still runs first, so every pad is available"
+        );
+    }
+
+    // ---- T22 ----
+    #[test]
+    fn non_duel_arena_never_uses_pool() {
+        let pool = pool_of(8);
+        for (blue, orange) in [(2usize, 2usize), (3, 3)] {
+            let mut a = mk(blue, orange, 404, Some(curr(1.0, 0.0, 0.0, pool.clone())));
+            for _ in 0..100 {
+                a.debug_force_reset();
+                let gs = a.game_state();
+                assert_ne!(
+                    classify(&gs, &pool),
+                    Kind::Replay,
+                    "{blue}v{orange} arenas must never draw a duel-only pool state"
+                );
+            }
+        }
+    }
+
+    // ---- T23 ----
+    #[test]
+    fn non_duel_arena_renormalizes_kickoff_and_random() {
+        let pool = pool_of(8);
+        let mut a = mk(2, 2, 8_191, Some(curr(0.7, 0.1, 0.2, pool.clone())));
+        let (mut kick, mut rand) = (0usize, 0usize);
+        let n = 4000;
+        for _ in 0..n {
+            a.debug_force_reset();
+            match classify(&a.game_state(), &pool) {
+                Kind::Kickoff => kick += 1,
+                Kind::Random => rand += 1,
+                Kind::Replay => panic!("non-duel arena drew a replay state"),
+            }
+        }
+        let (k, r) = (kick as f64 / n as f64, rand as f64 / n as f64);
+        // Renormalized over {kickoff, random} = 1:2 — NOT the raw 0.1/0.2.
+        assert!((k - 1.0 / 3.0).abs() < 0.03, "kickoff share {k}");
+        assert!((r - 2.0 / 3.0).abs() < 0.03, "random share {r}");
+    }
+
+    // ---- T24 ----
+    #[test]
+    fn duel_arena_branch_mix_matches_weights() {
+        let pool = pool_of(3);
+        let mut a = mk(1, 1, 20_260_719, Some(curr(0.7, 0.1, 0.2, pool.clone())));
+        let (mut rep, mut kick, mut rand) = (0usize, 0usize, 0usize);
+        let n = 4000;
+        for _ in 0..n {
+            a.debug_force_reset();
+            match classify(&a.game_state(), &pool) {
+                Kind::Replay => rep += 1,
+                Kind::Kickoff => kick += 1,
+                Kind::Random => rand += 1,
+            }
+        }
+        let f = |x: usize| x as f64 / n as f64;
+        assert!((f(rep) - 0.70).abs() < 0.03, "replay share {}", f(rep));
+        assert!((f(kick) - 0.10).abs() < 0.03, "kickoff share {}", f(kick));
+        assert!((f(rand) - 0.20).abs() < 0.03, "random share {}", f(rand));
+    }
+
+    // ---- T25 ----
+    #[test]
+    fn replay_reset_reproducible_for_fixed_seed() {
+        let pool = pool_of(32);
+        let mut a = mk(1, 1, 6_006, Some(curr(0.7, 0.1, 0.2, pool.clone())));
+        let mut b = mk(1, 1, 6_006, Some(curr(0.7, 0.1, 0.2, pool)));
+        assert_eq!(sequence(&mut a, 30), sequence(&mut b, 30));
+    }
+
+    // ---- T26 ----
+    #[test]
+    fn pool_index_covers_range_and_never_oob() {
+        let pool = pool_of(1000);
+        let mut a = mk(1, 1, 13, Some(curr(1.0, 0.0, 0.0, pool.clone())));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..5000 {
+            a.debug_force_reset();
+            let b = a.game_state().ball.pos;
+            let idx = pool.iter().position(|s| same_ball(&b, &s.ball.pos)).expect("pool state");
+            seen.insert(idx);
+        }
+        assert!(seen.len() > 900, "index must cover the pool, saw {}", seen.len());
+
+        // Degenerate single-state pool: modulo must not divide by zero or wrap out.
+        let mut one = mk(1, 1, 14, Some(curr(1.0, 0.0, 0.0, pool_of(1))));
+        for _ in 0..100 {
+            one.debug_force_reset();
         }
     }
 }
