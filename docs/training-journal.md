@@ -346,3 +346,12 @@ Containments frozen at 450 (zero new in 35min/+9.4M steps; pre-fix pace was
 hundreds/hr). Viewer kickoff-loop gone. ep_rew ~2.4 sustained, kl_pri 0.37,
 ent 1.21. The synthetic A/B test's chaos-limits didn't matter — production
 delta was the real experiment, and it's unambiguous.
+
+### 2026-07-19 ~06:30 — jitter v2: REAL win (ball offset was the key)
+Elliot caught the confound: ±50uu car jitter "win" was masked by remote's
+60%-random curriculum; the viewer (100% kickoffs) still pinched every
+episode — the anchored policy course-corrects and re-converges. v2: cars
+±150uu/±10°, BALL ±10uu horizontal (contact geometry can't mirror). Shipped
+both boxes; VIEWER delta over 12min: 0 containments (pre-fix 20+). Lesson
+logged twice tonight: always identify the subpopulation where the bug
+actually fires and measure THERE.
