@@ -427,3 +427,27 @@ Measurement discipline: auto-h2h fires at ~592M (+30M) vs the 562M peak.
 PROCESS NOTE: v4 lived ~30 min. Cheap because the h2h harness caught it in one
 reading — under the old self-play metric this would have looked like the usual
 "transition dip" and burned a day.
+
+### 2026-07-19 ~16:10 (monitor) — v4.1 holds parity; v4 diagnosis confirmed
+h2h vs frozen peak-562M (both side orders, 5400 steps/side):
+| regime | ck | share |
+|---|---|---|
+| v4 (opp_spirit 1.0) | 564.8M (+2.75M) | 31.5% (26-49 / 20-51) |
+| **v4.1 (opp_spirit 0.3)** | **575.9M (+13.8M)** | **49.5% (47-46 / 47-50)** |
+Parity at 5x the step count where v4 had already collapsed — the
+shaping-cancellation diagnosis is confirmed, and v4.1's health markers agree
+(ep_rew 0.79->1.58->1.80 rising vs v4's slide to -7; ent stable 3.61 vs v4's
+climb; v_loss 0.58). Parity is the CORRECT baseline here (it is the peak +
+13.8M steps); the open question is whether it climbs >50% over ~100M, which
+is exactly what v3.1 failed to do (it silently lost share over 800M steps).
+CONTAINMENTS, honest note: ~275/hr this era vs 43/hr during the anchored era
+— jitter-v2 has NOT eliminated pinches for AGGRESSIVE policies (the anchored
+policy was passive, which is why the viewer read 0/12min). Distribution is
+~96% within 800 ticks of an arena rebuild (cascade-shaped). Rate works out to
+~1.4/arena/hr against ~120 episodes/arena/hr = ~1.2% of episodes truncated.
+Accepted: containment is safe (rebuild), and the alternatives are worse
+(bigger jitter distorts kickoff realism; the real bug is upstream RocketSim).
+Escalate only if it exceeds ~5% of episodes.
+Also closed: #53 goldens were stale-not-broken — and the check that mattered
+came back clean, deploy/bot.py + deploy/obs.py already encode demoed cars the
+way obs_v1.rs does, so real-game play was never affected (4334e76).
