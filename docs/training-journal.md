@@ -355,3 +355,37 @@ episode — the anchored policy course-corrects and re-converges. v2: cars
 both boxes; VIEWER delta over 12min: 0 containments (pre-fix 20+). Lesson
 logged twice tonight: always identify the subpopulation where the bug
 actually fires and measure THERE.
+
+### 2026-07-19 ~14:50 — KL-ANCHOR KILL-SWITCH EXECUTED (head-to-head evidence)
+Self-play goals/min had the anchored run oscillating 0.62-1.46 and I read it
+as "climbing out of the dip". Head-to-head (MatchRunner, 5400 steps, sides
+swapped) says otherwise — DECISIVE:
+| matchup | result |
+|---|---|
+| anchored 909M vs unanchored 1.38B | 19-60 / 16-59 (swapped) |
+| anchored 909M vs 562M peak (its own start) | 22-77 |
+| **1.38B unanchored vs 562M peak** | **36-59 / 30-79 (swapped)** |
+So λ_p=0.05 with this prior made the policy ~3.5x weaker over 348M steps —
+the "human defense suppresses self-play goals" confound is REFUTED. Executed
+the pre-agreed kill-switch: remote resumed from ck_000562083840 (strongest
+policy we own), league + v3.1 + jitter-v2, NO anchor; toml [kl_prior]
+re-commented so restarts can't silently re-enable. sps 4.9k→6.8k.
+BIGGER FINDING: 562M beats the 1.38B unanchored tip too — BOTH post-562M
+regimes degraded the policy (anchored severely, unanchored mildly over 800M
+steps). 562M is the high-water mark of the whole project.
+METRIC LESSON (supersedes the 07-18 20:30 one): self-play goals/min is not a
+skill metric — it moves with both sides' defense and hid an 800M-step
+regression. Head-to-head vs frozen reference checkpoints is the real ruler;
+the league ladder already computes exactly this and should be the primary
+signal, with #54 (external bots) as the absolute anchor.
+HYPOTHESIS FOR ELLIOT (needs his call): reward_v3.1's asymmetry (concede -12
+vs goal +10) rewards risk-aversion; over hundreds of M steps it may breed
+passivity — matching v3's trading exploit and v3.1's avoidance equilibrium as
+two faces of hand-tuned asymmetry. Research-backed alternative (Seer /
+Lucy-SKG, levers doc #3): symmetric goal/concede made zero-sum by subtracting
+the opponent's reward, annealed goal weight, multiplicative touch decay. That
+is the next regime change I'd propose — NOT another anchor variant.
+Anchor post-mortem: it did deliver stability (zero degeneracies in 348M steps,
+entropy 1.2 vs 3.5) — the machinery works; λ_p=0.05 with a GC2 prior is just
+too strong a leash for a policy already above GC2 level. If retried: λ_p 0.01,
+or anneal it in, or anchor to our own best checkpoint instead of humans.
