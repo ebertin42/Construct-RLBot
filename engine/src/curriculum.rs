@@ -94,23 +94,58 @@ impl CurriculumConfig {
         // thread before any `thread::spawn`, and it leaves every constructor
         // signature in episode.rs/engine.rs/lib.rs untouched. Path resolves
         // relative to CWD, same as every other config path in the repo.
-        if let Some(rp) = &c.replay_pool {
-            c.pool = Arc::new(reset_pool::load_or_empty(&rp.path, rp.max_states));
-            // Only `load()` knows both the pool size and the weights, so the
-            // effective-mix warning has to live here rather than in the loader.
-            if c.pool.is_empty() && c.replay_weight > 0.0 {
-                let rest = c.kickoff_weight + c.random_weight;
-                let (k, r) = if rest > 0.0 {
-                    (c.kickoff_weight / rest, c.random_weight / rest)
-                } else {
-                    (1.0, 0.0)
-                };
-                eprintln!(
-                    "[curriculum] WARNING: replay pool is EMPTY; replay resets DISABLED, \
-                     effective mix kickoff {k:.3} / random {r:.3}"
-                );
+        // Gated on the weight, not merely on the section being present: the
+        // natural rollback for this lever is `replay_weight = 0`, and paying a
+        // ~2.1 s / 133 MB load (measured on the v5 corpus) for a pool no draw
+        // can ever reach makes that rollback needlessly expensive — the Arc is
+        // then held by every one of 192 arenas for the life of the run.
+        if c.replay_weight > 0.0 {
+            if let Some(rp) = &c.replay_pool {
+                c.pool = Arc::new(reset_pool::load_or_empty(&rp.path, rp.max_states));
+                // Only `load()` knows both the pool size and the weights, so the
+                // effective-mix warning has to live here rather than in the loader.
+                if c.pool.is_empty() {
+                    let rest = c.kickoff_weight + c.random_weight;
+                    let (k, r) = if rest > 0.0 {
+                        (c.kickoff_weight / rest, c.random_weight / rest)
+                    } else {
+                        (1.0, 0.0)
+                    };
+                    eprintln!(
+                        "[curriculum] WARNING: replay pool is EMPTY; replay resets DISABLED, \
+                         effective mix kickoff {k:.3} / random {r:.3}"
+                    );
+                }
             }
         }
+        // Unconditional, and stated as the REALIZED mixture rather than the
+        // configured one. `replay_weight` is `#[serde(default)]` (it has to be,
+        // so curriculum_v1 keeps working), and there is no
+        // `deny_unknown_fields`, so a typo like `replay_weigth = 0.7` parses
+        // fine, silently yields 0.0, and — because the empty-pool warning above
+        // is itself gated on the weight — leaves an operator looking at a clean
+        // startup, concluding the v2 switch took, while the run trains on the v1
+        // distribution. This line is the one place that cannot lie about it.
+        let total = c.replay_weight + c.kickoff_weight + c.random_weight;
+        let eff = if c.pool.is_empty() { 0.0 } else { c.replay_weight };
+        // `> 0.0` is validated for the CONFIGURED sum, but zeroing an empty
+        // pool's share can still leave nothing behind (replay 1.0 / 0 / 0 with
+        // no pool file), which would print NaN. That case degrades to kickoff.
+        let t = if eff + c.kickoff_weight + c.random_weight > 0.0 {
+            eff + c.kickoff_weight + c.random_weight
+        } else {
+            1.0
+        };
+        eprintln!(
+            "[curriculum] {path}: effective mix replay {:.3} / kickoff {:.3} / random {:.3} \
+             (pool {} states, configured replay_weight {:.3} of {:.3})",
+            eff / t,
+            c.kickoff_weight / t,
+            c.random_weight / t,
+            c.pool.len(),
+            c.replay_weight,
+            total,
+        );
         Ok(c)
     }
 }

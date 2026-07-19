@@ -43,11 +43,54 @@ const KICKOFF_JITTER_BALL: f32 = 10.0;
 
 /// Which flavor of state an episode reset starts from. `Replay` carries the
 /// already-drawn pool index so the draw and the apply stay in one place.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResetKind {
     Replay(usize),
     Random,
     Kickoff,
+}
+
+/// The reset draw, extracted from `reset_episode` so the legacy-rng-stream
+/// contract can be tested against the SHIPPED expression instead of a copy of
+/// it. Everything here is a pure function of the rng and the weights.
+///
+/// `replay_eff` is the replay share *after* the caller has zeroed it for a
+/// non-duel arena or an empty pool. Exactly ONE `next_f32` per call, as before
+/// the replay lever existed, plus a `next_u32` on the replay branch only.
+///
+/// Branch order and the threshold expressions are load-bearing: with
+/// `replay_eff == 0.0`, `u < 0.0 / total` is always false (strict `<`, and
+/// `u ∈ [0,1)`), while `(0.0 + random) / (0.0 + kickoff + random)` is
+/// BIT-IDENTICAL to the legacy `random / (random + kickoff)` (`0.0 + x == x`
+/// exactly; IEEE addition is commutative). So every legacy config, every
+/// non-duel arena, and every arena with an empty pool reproduces the old rng
+/// stream and the old sequence of reset states exactly.
+///
+/// That claim is pinned by `zero_replay_weight_matches_legacy_coin`, which
+/// compares this function against an inline transcription of the pre-replay
+/// two-way coin. It is deliberately NOT pinned by comparing two arenas that
+/// both have `replay_eff == 0.0` — those execute identical arithmetic and agree
+/// no matter what this function does.
+fn draw_reset_kind(
+    rng: &mut Pcg32,
+    replay_eff: f32,
+    kickoff_weight: f32,
+    random_weight: f32,
+    pool_len: usize,
+) -> ResetKind {
+    let total = replay_eff + kickoff_weight + random_weight;
+    let u = rng.next_f32();
+    if total > 0.0 && u < replay_eff / total {
+        // Index from `next_u32`, never from `next_f32`: with a ~1.08M pool,
+        // `(next_f32() * len as f32) as usize` can round up to exactly `len` in
+        // f32 (spacing near 1e6 is 0.125) and panic out of bounds. Modulo bias
+        // over 2^32 is ~2.5e-4 relative.
+        ResetKind::Replay((rng.next_u32() as usize) % pool_len)
+    } else if total > 0.0 && u < (replay_eff + random_weight) / total {
+        ResetKind::Random
+    } else {
+        ResetKind::Kickoff
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -322,28 +365,13 @@ impl EpisodeArena {
                 } else {
                     0.0
                 };
-                let total = replay_eff + c.kickoff_weight + c.random_weight;
-                // Exactly ONE draw per reset, as before. Branch order and the
-                // threshold expressions are load-bearing: with `replay_eff ==
-                // 0.0`, `u < 0.0 / total` is always false (strict `<`, and
-                // `u ∈ [0,1)`), while `(0.0 + random) / (0.0 + kickoff + random)`
-                // is BIT-IDENTICAL to the legacy `random / (random + kickoff)`
-                // (`0.0 + x == x` exactly; IEEE addition is commutative). So
-                // every legacy config, every non-duel arena, and every arena
-                // with an empty pool reproduces the old rng stream and the old
-                // sequence of reset states exactly — pinned by T17/T18.
-                let u = self.rng.next_f32();
-                if total > 0.0 && u < replay_eff / total {
-                    // Index from `next_u32`, never from `next_f32`: with a ~1.08M
-                    // pool, `(next_f32() * len as f32) as usize` can round up to
-                    // exactly `len` in f32 (spacing near 1e6 is 0.125) and panic
-                    // out of bounds. Modulo bias over 2^32 is ~2.5e-4 relative.
-                    ResetKind::Replay((self.rng.next_u32() as usize) % c.pool.len())
-                } else if total > 0.0 && u < (replay_eff + c.random_weight) / total {
-                    ResetKind::Random
-                } else {
-                    ResetKind::Kickoff
-                }
+                draw_reset_kind(
+                    &mut self.rng,
+                    replay_eff,
+                    c.kickoff_weight,
+                    c.random_weight,
+                    c.pool.len(),
+                )
             }
             None => ResetKind::Kickoff,
         };
@@ -445,9 +473,29 @@ impl EpisodeArena {
     /// false (the pool has no demo flag; filter F3 drops demo-proxy states),
     /// jump/flip state cleared (so every replay-reset car is granted a flip —
     /// the pool has no `has_flip` field, and this matches `random_reset`),
-    /// `last_controls` zero, and all boost pads available. That last one is a
-    /// known fidelity gap: a real mid-game state would have several pads on
-    /// cooldown, but the pool carries no pad data.
+    /// `last_controls` zero, and all boost pads available.
+    ///
+    /// KNOWN DEPLOY RISK, not a no-op — the last two are a train/finetune obs
+    /// mismatch, and it is bigger than "airborne replay cars" suggests:
+    ///
+    /// - 43.0% of corpus cars (807,859 of 1,877,602) are airborne, and 61.5% of
+    ///   states contain at least one. Every one of them resets with
+    ///   `has_jumped/has_double_jumped/has_flipped = false`, so `f22`
+    ///   (`obs_v1.rs:165`, `has_flip_or_jump()`) reads 1 for a car that in the
+    ///   real frame had already burned its flip.
+    /// - All 34 pads reset available, so `f21`/`timer_norm` (`obs_v1.rs:186`,
+    ///   `:205`) read "full" against a mid-game state that had several on
+    ///   cooldown.
+    ///
+    /// This matters specifically on a BC-pretrain branch: `replay/src/bc_obs.rs`
+    /// builds the SAME features from the SAME corpus with the REAL values
+    /// (`bc_obs.rs:391` sets `has_flipped` from the shard; `:393-397` sets real
+    /// pad `is_active`/`cooldown`). So a BC-pretrained policy learns f21/f22 on
+    /// real values and then meets fabricated ones on the same states during RL
+    /// fine-tuning. Closing it means carrying `has_flip` and pad cooldowns in
+    /// the pool schema (`replay/src/reset_pool.rs`), which is a corpus re-parse,
+    /// not an engine change — tracked as backlog, deliberately not papered over
+    /// here.
     ///
     /// No unit conversion on positions/velocities — the pool is raw
     /// RocketSim-native world frame (uu, uu/s, rad/s). Boost is the one
@@ -477,9 +525,14 @@ impl EpisodeArena {
             cs.is_on_ground = sp.on_ground;
             self.arena.pin_mut().set_car(id, cs).expect("car exists (apply_replay_state)");
         }
-        // The load filters put every accepted state far inside `state_is_sane`'s
-        // limits (pos <=12000 / vel <=20000 / ang_vel <=100 vs. corpus maxima of
-        // 5249 / 6000 / 5.5), so this is a debug-only backstop, not a gate.
+        // `state_is_sane`'s limits are pos <=12000 / vel <=20000 / ang_vel
+        // <=100. Measured maxima over the 938,801 states the filters accept
+        // BEFORE F8 were 5987.9 / 4732.2 / 96.5 — that ang_vel figure is 17.5x
+        // RocketSim's own 5.5 rad/s cap and sat 3.6% under this assert, not the
+        // comfortable margin an earlier version of this comment claimed. F8
+        // (`reset_pool::accept`) now bounds ang_vel at 6.0 and car speed at
+        // 2400, which restores the margin to ~16x and makes this a genuine
+        // debug-only backstop rather than a near-miss.
         debug_assert!(state_is_sane(&self.arena.pin_mut().get_game_state()));
     }
 
@@ -1237,6 +1290,99 @@ mod replay_reset_tests {
             sequence(&mut b, 50),
             "an empty pool must reproduce the legacy kickoff/random stream exactly"
         );
+    }
+
+    // ---- T18b: the test T17/T18 only LOOKED like they were ----
+    #[test]
+    fn zero_replay_weight_matches_legacy_coin() {
+        // T17 and T18 above compare two arenas that both end up with
+        // `replay_eff == 0.0`, so both sides execute literally identical
+        // arithmetic and agree regardless of what `draw_reset_kind` does. A
+        // refactor that reordered the branches (kickoff tested first) diverges
+        // from the legacy stream on ~80% of draws and still passes both. The
+        // legacy coin has to appear on ONE side of the comparison, so here it
+        // is, transcribed from 639561f (the commit before the replay lever):
+        //
+        //     let u = self.rng.next_f32();
+        //     if u < c.random_weight / (c.random_weight + c.kickoff_weight) {
+        //         ResetKind::Random
+        //     } else {
+        //         ResetKind::Kickoff
+        //     }
+        fn legacy(rng: &mut Pcg32, kickoff_weight: f32, random_weight: f32) -> ResetKind {
+            let u = rng.next_f32();
+            if u < random_weight / (random_weight + kickoff_weight) {
+                ResetKind::Random
+            } else {
+                ResetKind::Kickoff
+            }
+        }
+
+        // Part 1: the threshold algebra, bit-exact. `(0.0 + r) / (0.0 + k + r)`
+        // must be the SAME f32 as `r / (r + k)` — not merely close, since a
+        // one-ulp difference flips draws that land in the gap.
+        for (k, r) in [(0.1f32, 0.2f32), (0.4, 0.6), (0.5, 0.5), (0.9, 0.1), (1.0, 0.0), (0.0, 1.0)]
+        {
+            let shipped = (0.0f32 + r) / (0.0f32 + k + r);
+            let legacy_thresh = r / (r + k);
+            assert_eq!(
+                shipped.to_bits(),
+                legacy_thresh.to_bits(),
+                "renormalized threshold must be bit-identical for kickoff={k} random={r}"
+            );
+        }
+
+        // Part 2: the branch SEQUENCE out of the shipped function must equal the
+        // legacy coin's, draw for draw, from the same seed. This is what
+        // actually catches a branch reorder: both consume exactly one next_f32
+        // per call, so any divergence shows up as a different Kind at the same
+        // index rather than as a desynced stream.
+        let cfg = CurriculumConfig::load("../configs/curriculum_v1.toml").unwrap();
+        for &(k, r) in
+            &[(cfg.kickoff_weight, cfg.random_weight), (0.1, 0.2), (0.4, 0.6), (0.7, 0.3)]
+        {
+            let mut shipped_rng = Pcg32::new(0xC0FFEE);
+            let mut legacy_rng = Pcg32::new(0xC0FFEE);
+            let mut n_random = 0usize;
+            for i in 0..20_000 {
+                // `pool_len` is 1 (not 0) on purpose: a zero would make a
+                // buggy replay branch panic on `% 0` instead of silently
+                // producing a wrong Kind, which is a weaker signal.
+                let got = draw_reset_kind(&mut shipped_rng, 0.0, k, r, 1);
+                let want = legacy(&mut legacy_rng, k, r);
+                assert_eq!(got, want, "draw {i} diverged from the legacy coin (k={k} r={r})");
+                if got == ResetKind::Random {
+                    n_random += 1;
+                }
+            }
+            // Guard against the whole comparison being vacuous because both
+            // sides always said Kickoff.
+            let frac = n_random as f64 / 20_000.0;
+            let want = (r / (r + k)) as f64;
+            assert!(
+                (frac - want).abs() < 0.02,
+                "sequence must actually exercise both branches: random={frac:.3} want~{want:.3}"
+            );
+        }
+    }
+
+    // ---- T18c ----
+    #[test]
+    fn nonzero_replay_weight_diverges_from_legacy() {
+        // The negative control for T18b: if `draw_reset_kind` agreed with the
+        // legacy coin even with a live replay share, T18b would be proving
+        // nothing about the replay branch existing at all.
+        let mut a = Pcg32::new(0xC0FFEE);
+        let mut b = Pcg32::new(0xC0FFEE);
+        let mut diffs = 0usize;
+        for _ in 0..2_000 {
+            let with_replay = draw_reset_kind(&mut a, 0.7, 0.1, 0.2, 64);
+            let without = draw_reset_kind(&mut b, 0.0, 0.1, 0.2, 64);
+            if with_replay != without {
+                diffs += 1;
+            }
+        }
+        assert!(diffs > 1_000, "a 0.7 replay share must change most draws, got {diffs}/2000");
     }
 
     // ---- T19 ----

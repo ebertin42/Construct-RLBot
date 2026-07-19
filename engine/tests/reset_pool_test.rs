@@ -77,24 +77,141 @@ fn stepping_after_replay_reset_is_stable() {
         assert!(obs.iter().all(|x| x.is_finite()), "obs went nonfinite at step {i}");
         assert!(fo.iter().all(|x| x.is_finite()), "final obs went nonfinite at step {i}");
     }
-    assert_eq!(a.blowup_count(), 0, "replay states must not drive the solver nonfinite");
+    // NOT `== 0`. Blowups here are contact-solver chaos and depend on heap
+    // layout: repeating an identical 2000-reset run 8 times gave replay
+    // `3 2 0 0 0 0 0 0` and the random branch this displaces `2 2 0 1 0 2 0 0`,
+    // so a hard zero is a coincidence of allocation, not an invariant. What is
+    // worth gating is that replay resets are not a NEW source of instability
+    // relative to the branch they displace, and that containment keeps the run
+    // alive — `episode::step_impl` zeroes rewards and terminates on containment,
+    // so the finite asserts above are what protect the learner.
+    let blowups = a.blowup_count();
+    assert!(
+        blowups <= 8,
+        "replay resets drove {blowups} solver blowups over 600 steps — far above the \
+         handful-per-thousand baseline the random branch also shows"
+    );
 }
 
 // ---- T29 ----
 #[test]
 fn replay_reset_never_terminates_on_first_step() {
-    // Direct proof that filter F2 (ball past the goal line) keeps a replay reset
-    // from firing `is_ball_scored()` on the very first step of the episode.
+    // Direct proof that filter F2 keeps a replay reset from firing
+    // `is_ball_scored()` on the very first step of the episode.
+    //
+    // This test used to be vacuous. F2 rejected only |ball.y| > 5120 (the real
+    // goal line), but `step` advances tick_skip=8 ticks before the policy acts,
+    // so a ball INSIDE the line travelling goalward crossed the 5215.5 score
+    // threshold during that first step. Measured against the full 938,801-state
+    // corpus: 15 first-step terminations in 50,000 resets (~3e-4), each paying a
+    // full ±goal reward — worst observed reward 24.65 — for a state the policy
+    // had zero agency over. It passed anyway because the 64-line fixture topped
+    // out at |ball.y| = 5067.7 and never produced one.
+    //
+    // Two changes make the assertion real. F2's band is now 4800, which is
+    // `BALL_MAX_SPEED * tick_skip / 120 = 400` uu plus margin inside the score
+    // threshold, so a first-step goal is arithmetically unreachable rather than
+    // merely rare (pinned by `f2_band_covers_one_tick_skip_of_travel`). And the
+    // fixture now carries 6 real corpus states sitting AT that boundary with
+    // hard goalward velocity (|y| up to 4800.0, |vy| up to 2750), so the loop
+    // below actually exercises the case it claims to.
+    let pool = reset_pool::load_or_empty(FIXTURE, 0);
+    let hardest = pool
+        .iter()
+        .filter(|s| s.ball.pos[1] * s.ball.vel[1] > 0.0)
+        .map(|s| s.ball.pos[1].abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        hardest > 4700.0,
+        "fixture must contain goalward near-boundary states or this test proves nothing; \
+         hardest |ball.y| with goalward vel = {hardest}"
+    );
+
     let mut a = mk(1, 1, 909, fixture_curriculum(1.0, 0.0, 0.0));
     let mut r = vec![0.0f32; 2];
     let mut f = vec![StepFlags::default(); 2];
     let mut fo = vec![0.0f32; 2 * OBS_SIZE];
-    for i in 0..500 {
+    let mut contained = 0u64;
+    for i in 0..2_000 {
+        let before = a.blowup_count();
         a.debug_force_reset();
         a.step(&[0, 0], &mut r, &mut f, &mut fo);
-        assert!(!f[0].terminated && !f[1].terminated, "instant termination at reset {i}");
+        // A contained physics blowup also terminates the episode, and that is
+        // BY DESIGN — `step_impl` zeroes the rewards, so nothing reaches the
+        // learner. Only a goal termination is the hazard F2 exists to stop, so
+        // separate the two rather than asserting a blanket "never terminates"
+        // that a rebuild would trip.
+        if a.blowup_count() > before {
+            contained += 1;
+            assert!(
+                r.iter().all(|x| *x == 0.0),
+                "containment must zero rewards, got {r:?} at reset {i}"
+            );
+            continue;
+        }
+        assert!(!f[0].terminated && !f[1].terminated, "instant goal termination at reset {i}");
         assert!(!f[0].truncated && !f[1].truncated, "instant truncation at reset {i}");
     }
+    // Guard against the loop passing because every reset blew up and got
+    // `continue`d past.
+    assert!(contained < 20, "{contained}/2000 resets blew up — that is a regression, not noise");
+}
+
+/// Companion to T29: the states F2 now rejects are exactly the ones that used to
+/// score on step 1. Drives them through the engine WITHOUT the filter to show
+/// the hazard is real and that the band is what removes it — otherwise a future
+/// widening of `GOAL_LINE_Y` looks free.
+#[test]
+fn near_goal_states_would_terminate_on_first_step_without_f2() {
+    use construct_engine::reset_pool::{BallSpawn, CarSpawn, ResetState};
+
+    // Hand-built rather than corpus-loaded: `accept` rejects this now, which is
+    // the whole point. The ball figures are a real case observed firing on step
+    // 1 against the pre-fix filter (rewards [24.65, -22.17]): y=5063.5 with
+    // vy=2843.5 reaches 5253 in 8 ticks, past the 5215.5 score threshold. Cars
+    // are parked at midfield and well apart so the episode ends on the GOAL and
+    // not on a contact-solver blowup, which would zero the rewards instead.
+    let car = |team: u8, x: f32| CarSpawn {
+        pos: [x, 0.0, 17.0],
+        vel: [0.0, 100.0, 0.0],
+        ang_vel: [0.0, 0.0, 0.1],
+        quat: [0.0, 0.0, 0.0, 1.0],
+        boost: 0.5,
+        team,
+        on_ground: true,
+    };
+    let st = ResetState {
+        ball: BallSpawn {
+            pos: [-44.2, 5063.5, 98.2],
+            vel: [-1021.2, 2843.5, 56.7],
+            ang_vel: [0.0; 3],
+        },
+        cars: [car(0, -1500.0), car(1, 1500.0)],
+    };
+    assert!(
+        !reset_pool::is_acceptable(&st),
+        "F2 must reject this state — if it doesn't, the band regressed"
+    );
+
+    let mut c = base_curriculum();
+    c.replay_weight = 1.0;
+    c.kickoff_weight = 0.0;
+    c.random_weight = 0.0;
+    c.pool = Arc::new(vec![st]);
+    let mut a = mk(1, 1, 4242, c);
+    let mut r = vec![0.0f32; 2];
+    let mut f = vec![StepFlags::default(); 2];
+    let mut fo = vec![0.0f32; 2 * OBS_SIZE];
+    a.debug_force_reset();
+    a.step(&[0, 0], &mut r, &mut f, &mut fo);
+    assert!(
+        f[0].terminated || f[1].terminated,
+        "the hazard F2 exists to prevent must actually be a hazard"
+    );
+    assert!(
+        r.iter().any(|x| x.abs() > 1.0),
+        "and it must pay a real goal reward: {r:?}"
+    );
 }
 
 // ---- T30: end-to-end gate for the team-size fallback ----

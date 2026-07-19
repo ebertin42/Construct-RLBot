@@ -136,3 +136,40 @@ fn stepping_after_random_reset_is_stable() {
         assert!(r.iter().all(|x| x.is_finite()));
     }
 }
+
+/// The rollback path: `replay_weight = 0` must not pay for a pool it can never
+/// draw from. The section is deliberately left in place — an operator disabling
+/// the lever edits one number, not the whole config.
+#[test]
+fn zero_replay_weight_skips_the_pool_load() {
+    let p = std::env::temp_dir().join("construct_curriculum_replay_off.toml");
+    std::fs::write(
+        &p,
+        "kickoff_weight = 0.4\nrandom_weight = 0.6\nreplay_weight = 0.0\n\n\
+         [replay_pool]\npath = \"tests/fixtures/reset_pool_mini.jsonl\"\n",
+    )
+    .unwrap();
+    let c = CurriculumConfig::load(p.to_str().unwrap()).unwrap();
+    assert!(
+        c.pool.is_empty(),
+        "a zero replay weight must skip the load entirely, got {} states",
+        c.pool.len()
+    );
+    // The section itself is still parsed, so flipping the weight back is a
+    // one-line edit rather than a re-add.
+    assert!(c.replay_pool.is_some(), "the [replay_pool] section must still parse");
+    let _ = std::fs::remove_file(&p);
+
+    // And the same file with a nonzero weight really does load, so the test
+    // above is about the weight and not about a broken fixture path.
+    let q = std::env::temp_dir().join("construct_curriculum_replay_on.toml");
+    std::fs::write(
+        &q,
+        "kickoff_weight = 0.4\nrandom_weight = 0.6\nreplay_weight = 0.1\n\n\
+         [replay_pool]\npath = \"tests/fixtures/reset_pool_mini.jsonl\"\n",
+    )
+    .unwrap();
+    let on = CurriculumConfig::load(q.to_str().unwrap()).unwrap();
+    assert!(!on.pool.is_empty(), "nonzero replay weight must load the same fixture");
+    let _ = std::fs::remove_file(&q);
+}

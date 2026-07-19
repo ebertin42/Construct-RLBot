@@ -22,7 +22,7 @@ random_weight  = 0.2
 # Absent/unreadable file -> warning + empty pool + replay branch disabled.
 # The run continues at renormalized kickoff/random weights. Never fatal.
 path = "data/reset_pool_v5.jsonl"
-max_states = 0   # 0 = load every clean state (1.08M -> ~169 MB, ~1.6 s)
+max_states = 0   # 0 = load every clean state (1.08M read -> 891,720 kept, 133 MB, ~2.1 s)
 
 [random]
 car_speed_max = 1800.0
