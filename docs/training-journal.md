@@ -340,3 +340,9 @@ determinism tests; A/B pinch test documented as physics-chaos-limited).
 Shipped: local .so swap + remote resume 741.1M (ep01 anchor intact, kl_pri
 0.40). Containment baseline 450 — delta watch. Side-benefit expected:
 kickoff-state variety. Run trend pre-ship: 1.16@694M, ep_rew to 5.7@resume.
+
+### 2026-07-19 ~05:40 (monitor) — jitter VERDICT: WIN
+Containments frozen at 450 (zero new in 35min/+9.4M steps; pre-fix pace was
+hundreds/hr). Viewer kickoff-loop gone. ep_rew ~2.4 sustained, kl_pri 0.37,
+ent 1.21. The synthetic A/B test's chaos-limits didn't matter — production
+delta was the real experiment, and it's unambiguous.
