@@ -483,3 +483,37 @@ STATUS: INERT BY DESIGN. train_v1.toml still points at curriculum_v1.toml;
 curriculum_v1.toml untouched. Deploy is a deliberate one-line operator switch,
 held until v4.1 has a second h2h reading >=50% (attribution discipline —
 never stack two regime changes on an unmeasured one again).
+
+### 2026-07-19 ~17:40 — ⚠⚠ MAJOR CORRECTION: PPO SELF-PLAY HAS NEVER IMPROVED THIS POLICY
+I was measuring against the wrong reference. Transitivity test (both sides vs
+a common third party) demolishes the "562M is the high-water mark" claim in
+the 14:50 entry — RETRACTED:
+| matchup (both side orders, 5400 steps/side) | share |
+|---|---|
+| v4.1-592M vs early-320M | **10.8%** (17-126 / 12-114) |
+| peak-562M vs early-320M | **18.5%** (26-90 / 19-108) |
+562M was never a peak — only the least-degraded of a declining family.
+Kickstart-era ladder tournament (3600 steps/side, all pairs):
+| | 100M | 200M | 320M | 440M |
+|---|---|---|---|---|
+| share | ~48 | ~52 | ~48 | ~52 |
+FLAT. 100M ≈ 200M ≈ 320M ≈ 440M, all within 43-54% of each other, and the
+whole family beats everything post-500M by 80-90%.
+CONCLUSION: the entity policy reached the kickstart teacher's level early via
+DISTILLATION, plateaued there for 340M steps, and then decayed once the anneal
+removed the anchor at 500M — under reward v3, v3.1, the BC anchor, v4, and
+v4.1 alike. PPO self-play has never demonstrably improved it. The reward-design
+debate of the last two days was arguing about the wrong variable.
+NOT a PPO coding bug: advantages are normalized (ppo.py:42), loss assembly is
+standard, and pi_loss~0.002 is EXPECTED with mean-zero normalized advantages
+(not a gradient-magnitude signal).
+Entropy is high (3.5-3.8 of ln(92)=4.52 max ~ 80% of uniform) but was ALSO
+high during the good era (3.2-3.3) — so sharpness is not the differentiator;
+the DISTRIBUTION SHAPE was, and the teacher supplied it.
+METRIC LESSON #3 (compounding on the previous two): a single frozen reference
+is not a ruler. Self-play goals/min misled in one direction; a lone h2h
+reference misled in the other. Non-transitivity is real in self-play spaces —
+ALWAYS test both candidates against a common third party, and prefer a diverse
+panel + the league ladder. Note self-play goals/min was ANTI-correlated here:
+562M scored 2.25 (weak defense inflates both sides) vs 320M's 1.79, while
+320M wins the actual match 81.5%.
