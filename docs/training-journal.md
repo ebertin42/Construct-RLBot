@@ -593,3 +593,12 @@ at HIGH opponent_frac (~0.5) against a pool seeded with the equal-strength
 kickstart-era cks (100M/200M/320M/440M), entropy_coef 0.003 (between the
 arms). If h2h holds >=45%, opponent diversity is the missing ingredient and
 the roadmap is league/exploiter work (levers #5/#6), not more reward design.
+
+### 2026-07-19 ~22:00 — h2h NULL CONTROL passes (methodology validated)
+320M vs ITSELF, both side orders: 39-49 / 52-38 -> 51.1% share (expect 50%).
+The pipeline is unbiased to ~1% when both orders are SUMMED. Note the per-side
+swing (~±6 goals from parity, ~10-goal spread between orders): a single-order
+h2h would be unreliable, which is exactly why the harness always plays both.
+Noise floor established => every effect in this journal (10.4 / 18.5 / 25.5 /
+81.5%) is far outside it. All prior conclusions stand, including the
+tournament that retracted the "562M is the high-water mark" claim.
