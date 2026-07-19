@@ -20,8 +20,28 @@ label = "peak-562M"
 
 # Slot for task #54 (external bots) -- the eventual ABSOLUTE anchor. Every
 # reference above this line is still just "our own best checkpoint so far",
-# which can only ever be a relative ruler against itself. Uncomment and
-# point at an external-bot-compatible checkpoint/bridge once #54 lands:
+# which can only ever be a relative ruler against itself.
+#
+# #54 landed (see docs/external-bench.md, scripts/bench_external.py) but
+# this file stays EMPTY of external entries on purpose: h2h_eval.py's
+# --vs-references path (run_vs_references -> checkpoint_meta -> torch.load
+# expecting our {schema_version, config.net.heads, total_steps} checkpoint
+# dict, then MatchRunner rebuilding OUR candle net and playing it inside
+# OUR RocketSim engine) cannot consume an external bot without modification.
+# Nexto/Necto ship a *.pt TorchScript module with a different architecture,
+# observation builder and action space, and only ever run as an independent
+# RLBot v5 agent process against the real Rocket League game -- there is no
+# in-process MatchRunner path for it. checkpoint_meta(nexto-model.pt) would
+# not even load cleanly (it's not our checkpoint dict shape).
+#
+# External-bot results instead flow through a separate side door:
+# scripts/bench_external.py's record-result writes to logs/h2h_history.jsonl
+# via the SAME h2h_eval.append_h2h_history function (imported, not
+# reimplemented) after a REAL match played on Elliot's Windows RLBot v5
+# box -- so they land in the exact same file/schema and the dashboard's
+# "Head-to-head (skill)" panel plots them alongside these internal
+# references with zero changes to dashboard.py. See
+# docs/external-bench.md for the full plan and exact commands.
 #
 # [[reference]]
 # ck = "path/to/external_bot.pt"

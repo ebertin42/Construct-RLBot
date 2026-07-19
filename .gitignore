@@ -17,3 +17,4 @@ checkpoints_v1_archive/
 logs/
 /data/
 replay/target/
+/deploy/external/
