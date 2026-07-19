@@ -602,3 +602,33 @@ h2h would be unreliable, which is exactly why the harness always plays both.
 Noise floor established => every effect in this journal (10.4 / 18.5 / 25.5 /
 81.5%) is far outside it. All prior conclusions stand, including the
 tournament that retracted the "562M is the high-water mark" claim.
+
+### 2026-07-19 ~23:30 — ARM C: league does NOT rescue it either
+Four-way, all from ck_000320471040, 145 iters, seed 777, measured identically
+(I(S;A) on one shared rollout; h2h both side orders vs frozen 320M):
+| arm | config | I(S;A) | h2h share |
+|---|---|---|---|
+| baseline | (no training) | 0.867 / 19.2% | — |
+| A | ent 0.01, league OFF | 0.481 / 10.6% | 22.0-25.5% |
+| B | ent 0.001, league OFF | 1.114 / 24.6% | 10.4-11.4% |
+| C | ent 0.003, league ON 0.5, clean strong pool | 0.906 / 20.0% | **27.1%** |
+Null control (320M vs itself) = 51.1%, rerun variance ~3%. So arm C is NOT
+meaningfully better than arm A: a diverse pool of four equal-strength
+kickstart-era opponents at HALF the arenas did not stop the decay. Branch (c)
+of the pre-registered rule: self-play cycling is not the explanation either.
+CONFOUND I INTRODUCED, stated plainly: all three arms ALSO switched reward
+(v3 -> v4.1) relative to what 320M was trained under, and none had the
+kickstart anchor. So A/B/C measured "change the regime and train 20M steps"
+against "do not train at all" — they cannot separate "PPO is destructive" from
+"switching regimes is destructive".
+ARM D (running): 320M's OWN original regime — reward v3, kickstart teacher
+checkpoints/ck_004956252160.pt at lambda_k 0.36 (its real value at 320M),
+entropy 0.01, league off, same 145 iters/seed. Verified live: kick_kl 0.3546.
+PREDICTIONS ON RECORD before the result: if D holds ~45-55%, then PPO+anchor
+is stable and the destructive ingredient is regime-change/anchor-removal, so
+the fix is "never train unanchored" (self-distillation from the current best,
+periodically refreshed). If D ALSO collapses to 10-30%, then 20M steps of this
+PPO loop degrades the policy under EVERY configuration including its own
+native one — which would mean the loop cannot sustain skill at all and the
+remaining suspects are structural (92-action table expressiveness, obs
+conditioning, tick_skip 8 credit assignment).
