@@ -319,3 +319,14 @@ BC-v3 finished 2 epochs: ep01 probe state-only 0.492 (vs ep00 0.441), copy
 unified CLI landed (ccde06d, 118 tests) — first live status run surfaced the
 run-B-prune/league-registry dead refs (cleaned 17→6) and the ep_rew recovery.
 Dashboard: multi-run panels + hover datetime tooltips (3ddc53a, 021da44).
+
+### 2026-07-19 ~00:45 (monitor) — anchored run accelerating
+| steps | sps | ent | kl_pri | ep_rew | goals/min |
+|---|---|---|---|---|---|
+| 697M | 4,913 | 1.24 | 0.39 | 1.4 | **1.16** (ck 694M) |
+Post-anchor trend: 0.62→0.85→0.78→0.91→1.16; steepest segment is post-ep01-
+swap (+0.25/50M). 135M steps degeneracy-free (record for v3.x rewards),
+entropy/kl_pri stable. Verdict upgraded: trajectory now competitive, not
+just stability. Watch: ~1.5 overnight; 2.14 fallback mark within ~a day at
+slope. ctl.py viewer-on bug found+fixed live (missing CONSTRUCT_VISER_ADDR,
+869bc23). BC-v3 closed: ep01 val top1 64.2/top3 84.4/jump-recall 51.6.
