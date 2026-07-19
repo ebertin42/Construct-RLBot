@@ -677,3 +677,37 @@ ACCEPTANCE TEST (the one that matters): gated arm A — a candidate MEASURED at
 cannot reject a known-bad candidate would be worse than no gate.
 Champion initialized to ck_000320471040 (measured strongest across the whole
 project; beats the former "peak" 562M by 81.5%).
+
+### 2026-07-20 ~01:20 — 2x2 COMPLETE: THE ANCHOR IS CAUSAL
+All arms: from ck_000320471040, 145 iters, seed 777, gated/measured identically.
+| | no anchor | with anchor |
+|---|---|---|
+| reward v4.1 | 22.0-25.5% (A) | — |
+| reward v3 | **29.6% (E)** | **49.2% (D)** |
+Holding reward FIXED at v3: anchor takes 29.6% -> 49.2% (+19.6 points).
+Holding anchor FIXED at none: v4.1 -> v3 gives 22-25% -> 29.6% (+~5 points).
+ANCHOR IS THE DOMINANT CAUSAL FACTOR. Reward design is a minor term. The
+entire reward debate of 2026-07-18/19 (v3 -> v3.1 -> v4 -> v4.1) was tuning a
+~5-point variable while the ~20-point one sat at zero after the anneal ended.
+Also settled: entropy_coef moves I(S;A) but not skill (A vs B); a clean
+4-checkpoint league pool at opponent_frac 0.5 does not rescue it (C 27.1%);
+the 92-action table is expressive enough (BC reaches human behavior through
+it); PPO plumbing is exact (ratio 1.000000, ev 0.88).
+PRODUCTION ARCHITECTURE (starting now, all components already built+tested):
+1. CHAMPION = the gate's reference, the anchor, and the league seed. Starts at
+   ck_000320471040.
+2. TRAIN anchored: resume from champion with --kl-prior pointing at the
+   CHAMPION ITSELF (self-distillation; K1-K3 machinery from the KL-prior plan).
+   KL starts at exactly 0 (student == anchor) so lambda_p is a pure trust
+   region on drift, not a pull toward someone else's policy — which is why the
+   BC-prior failure does not apply here: that anchor was competent-less, this
+   one is the strongest policy we own.
+3. GATE every ~20M steps (champion_gate.py, threshold 0.52, both orders).
+   PASS -> promote, champion advances, anchor advances with it. FAIL -> discard
+   and retry. PPO becomes a mutation operator in a hill-climb that cannot
+   regress.
+ARM F (running): champion 320M, reward v3, --kl-prior <champion>, lambda_p 0.2,
+entropy 0.01, league off — arm D's proven config with the anchor swapped from
+the frozen v0 teacher to the champion itself, because a v0-teacher anchor caps
+us at teacher level while a self-anchor advances on every promotion. Risk is
+bounded BY the gate: if it fails, we discard and fall back to reproducing D.
