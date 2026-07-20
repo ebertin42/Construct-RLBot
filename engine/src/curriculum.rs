@@ -34,7 +34,7 @@ pub struct ReplayPoolConfig {
     pub max_states: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct CurriculumConfig {
     pub kickoff_weight: f32,
     pub random_weight: f32,
@@ -47,6 +47,15 @@ pub struct CurriculumConfig {
     pub random: RandomStateBounds,
     #[serde(default)]
     pub replay_pool: Option<ReplayPoolConfig>,
+    /// Task #56 Phase 1: run FULL MATCHES instead of single episodes. A goal
+    /// updates the score and kicks off again; only clock expiry terminates.
+    ///
+    /// Defaults to false, and that default is load-bearing: with match_mode on,
+    /// goals stop terminating episodes, which changes reset dynamics and would
+    /// make the goal-share gate incomparable with every historical entry in
+    /// logs/champion_history.jsonl. The screen must keep running legacy mode.
+    #[serde(default)]
+    pub match_mode: bool,
     /// Populated by `load()` after the TOML parse. The `Arc` is load-bearing:
     /// `MultiEngine::new` clones this config once per worker AND
     /// `EpisodeArena::new_full` clones it once per arena. By value the full

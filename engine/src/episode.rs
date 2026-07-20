@@ -5,7 +5,7 @@ use crate::{
     obs::{self, OBS_SIZE},
     obs_v1::{self, ENT_FEAT, MAX_ENT, PREV_ACTIONS, Q_FEAT},
     reset_pool::ResetState,
-    reward::{self, RewardConfig},
+    reward::{self, MatchState, RewardConfig},
     sampler::Pcg32,
     schema::Normalization,
 };
@@ -198,6 +198,12 @@ pub struct EpisodeArena {
     seed: u32,
     episode_start_tick: u64,
     last_touch_tick: u64,
+    /// Match score, only meaningful when `curriculum.match_mode` is set.
+    score_blue: u32,
+    score_orange: u32,
+    /// Tick the current MATCH began (distinct from `episode_start_tick`, which
+    /// in match mode restarts at every kickoff within the match).
+    match_start_tick: u64,
     prev_state: GameState,
     curriculum: Option<CurriculumConfig>,
     rng: Pcg32,
@@ -274,6 +280,9 @@ impl EpisodeArena {
             seed,
             episode_start_tick: start,
             last_touch_tick: start,
+            score_blue: 0,
+            score_orange: 0,
+            match_start_tick: 0,
             prev_state,
             curriculum,
             rng: Pcg32::new((seed as u64) * 7919 + 13),
@@ -288,6 +297,7 @@ impl EpisodeArena {
             jitter_enabled: true,
         };
         this.reset_episode();
+        this.start_match(0);
         this
     }
 
@@ -536,6 +546,15 @@ impl EpisodeArena {
         debug_assert!(state_is_sane(&self.arena.pin_mut().get_game_state()));
     }
 
+    /// Begin a NEW match: zero the score and restart the clock. Deliberately
+    /// separate from `reset_episode`, which also runs on every post-goal
+    /// kickoff WITHIN a match and must leave the score alone.
+    fn start_match(&mut self, tick: u64) {
+        self.score_blue = 0;
+        self.score_orange = 0;
+        self.match_start_tick = tick;
+    }
+
     /// Test/debug helper: force an episode reset (through the same curriculum-aware
     /// path `step` uses on termination/truncation).
     pub fn debug_force_reset(&mut self) {
@@ -745,10 +764,31 @@ impl EpisodeArena {
             }
         }
 
-        let terminated = scored.is_some();
-        let truncated = !terminated
-            && (cur.tick_count - self.last_touch_tick >= NO_TOUCH_TICKS
-                || cur.tick_count - self.episode_start_tick >= MAX_TICKS);
+        // MATCH MODE (task #56): a goal is a scoring event INSIDE the
+        // trajectory, not the end of it. Credit therefore flows across the
+        // goal, which is the whole point -- "was that goal worth the
+        // counter-attack it conceded?" is only learnable if the trajectory
+        // continues. Only the clock ends a match.
+        //
+        // LEGACY MODE: unchanged. A goal terminates. The goal-share screen and
+        // every historical gate depend on this exact behavior.
+        let (terminated, truncated) = if self.match_mode() {
+            if let Some(team) = scored {
+                match team {
+                    Team::Blue => self.score_blue += 1,
+                    Team::Orange => self.score_orange += 1,
+                }
+            }
+            let match_over = cur.tick_count - self.match_start_tick >= MAX_TICKS;
+            let stalled = cur.tick_count - self.last_touch_tick >= NO_TOUCH_TICKS;
+            (match_over, !match_over && stalled)
+        } else {
+            let t = scored.is_some();
+            let tr = !t
+                && (cur.tick_count - self.last_touch_tick >= NO_TOUCH_TICKS
+                    || cur.tick_count - self.episode_start_tick >= MAX_TICKS);
+            (t, tr)
+        };
 
         for a in 0..n {
             let ci = self.agent_car_index(&cur, a);
@@ -763,6 +803,11 @@ impl EpisodeArena {
                 self.reward_cfg.team_spirit,
                 self.reward_cfg.opp_spirit,
             );
+        }
+
+        // Match mode: a goal that did NOT end the match still needs a kickoff.
+        if self.match_mode() && scored.is_some() && !terminated && !truncated {
+            self.reset_episode();
         }
 
         if terminated || truncated {
@@ -800,6 +845,9 @@ impl EpisodeArena {
                     }
                 }
             }
+            if self.match_mode() {
+                self.start_match(cur.tick_count);
+            }
             self.reset_episode();
         } else {
             self.prev_state = cur;
@@ -808,6 +856,21 @@ impl EpisodeArena {
 
     pub fn game_state(&mut self) -> GameState {
         self.arena.pin_mut().get_game_state()
+    }
+
+    /// Score and remaining-clock fraction for the current match.
+    pub fn match_state(&self, cur_tick: u64) -> MatchState {
+        let elapsed = cur_tick.saturating_sub(self.match_start_tick);
+        let t_frac = 1.0 - (elapsed as f32 / MAX_TICKS as f32);
+        MatchState {
+            score_blue: self.score_blue,
+            score_orange: self.score_orange,
+            t_frac: t_frac.clamp(0.0, 1.0),
+        }
+    }
+
+    fn match_mode(&self) -> bool {
+        self.curriculum.as_ref().map_or(false, |c| c.match_mode)
     }
 
     /// Test/debug helper: warp the ball.
@@ -1126,6 +1189,125 @@ mod tests {
                  determinism remain covered unconditionally by the other two kickoff_jitter_* tests"
             );
         }
+    }
+
+    // --- Match layer (task #56 Phase 1) ----------------------------------
+
+    fn curr_with_match_mode(on: bool) -> crate::curriculum::CurriculumConfig {
+        let mut c = crate::curriculum::CurriculumConfig {
+            kickoff_weight: 1.0, random_weight: 0.0, ..Default::default()
+        };
+        c.match_mode = on;
+        c
+    }
+
+    /// Builds a real 1v1 `EpisodeArena` with the given curriculum, using the
+    /// v0 schema/reward configs (existing, on disk) rather than
+    /// `configs/reward_v5_winprob.toml` / `configs/curriculum_v3_match.toml`,
+    /// which don't exist yet (they arrive in Task 4). The match layer under
+    /// test here (score bookkeeping, clock, termination) has no dependency on
+    /// the win-prob reward shaping those files configure.
+    fn mk_match_test(curriculum: Option<crate::curriculum::CurriculumConfig>) -> EpisodeArena {
+        crate::sim_init::ensure_init(None);
+        let s = crate::schema::Schema::load("../schema/v0.toml").unwrap();
+        let cfg = crate::reward::RewardConfig::load("../configs/reward_v0.toml").unwrap();
+        EpisodeArena::new_with_curriculum(1, 1, s.tick_skip, cfg, s.normalization, 5150, curriculum)
+    }
+
+    fn mk_match_arena() -> EpisodeArena {
+        mk_match_test(Some(curr_with_match_mode(true)))
+    }
+
+    #[test]
+    fn legacy_mode_still_terminates_on_a_goal() {
+        // The goal-share screen depends on this. If match_mode leaks into the
+        // default path, every historical gate becomes incomparable.
+        //
+        // Strengthened beyond the brief's config-only check (which only
+        // asserted `!c.match_mode`, not termination itself -- a config-default
+        // check would keep passing even if the termination logic silently
+        // stopped honoring that default): this drives a REAL arena to an
+        // actual goal and asserts `terminated == true`, the property the test
+        // name promises. See `match_mode_continues_past_a_goal_and_increments_score`
+        // below for the mirrored match-mode case.
+        let c = curr_with_match_mode(false);
+        assert!(!c.match_mode);
+
+        let mut a = mk_match_test(Some(c));
+        // Warp ball into orange net with velocity, same placement as
+        // episode_test.rs's scored_ball_terminates_and_pays_goal.
+        a.debug_place_ball([0.0, 5200.0, 320.0], [0.0, 2000.0, 0.0]);
+        let mut r = vec![0.0; 2];
+        let mut f = vec![StepFlags::default(); 2];
+        let mut fo = vec![0.0; 2 * OBS_SIZE];
+        let mut terminated = false;
+        for _ in 0..30 {
+            a.step(&[0, 0], &mut r, &mut f, &mut fo);
+            if f[0].terminated {
+                terminated = true;
+                break;
+            }
+        }
+        assert!(terminated, "legacy mode: a goal must terminate the episode");
+    }
+
+    #[test]
+    fn match_mode_continues_past_a_goal_and_increments_score() {
+        // Mirror of the legacy test above: the SAME scoring event, but with
+        // match_mode on, must NOT terminate (nor truncate) -- the score
+        // increments instead and the match continues.
+        let mut a = mk_match_arena();
+        a.debug_place_ball([0.0, 5200.0, 320.0], [0.0, 2000.0, 0.0]);
+        let mut r = vec![0.0; 2];
+        let mut f = vec![StepFlags::default(); 2];
+        let mut fo = vec![0.0; 2 * OBS_SIZE];
+        let mut scored = false;
+        for _ in 0..30 {
+            a.step(&[0, 0], &mut r, &mut f, &mut fo);
+            if a.score_blue > 0 {
+                scored = true;
+                assert!(!f[0].terminated, "match mode: a goal must not terminate the episode");
+                assert!(!f[0].truncated, "match mode: a goal must not truncate the episode either");
+                break;
+            }
+        }
+        assert!(scored, "ball placed in goal mouth must score within 30 steps");
+        assert_eq!(a.score_blue, 1);
+        assert_eq!(a.score_orange, 0);
+    }
+
+    #[test]
+    fn match_mode_is_off_by_default_in_every_shipped_curriculum() {
+        for p in ["../configs/curriculum_v1.toml", "../configs/curriculum_v2.toml"] {
+            let c = crate::curriculum::CurriculumConfig::load(p)
+                .unwrap_or_else(|e| panic!("{p}: {e}"));
+            assert!(!c.match_mode, "{p} must default match_mode to false");
+        }
+    }
+
+    #[test]
+    fn match_state_reports_signed_diff_and_falling_clock() {
+        let mut a = mk_match_arena();
+        a.score_blue = 2;
+        a.score_orange = 1;
+        a.match_start_tick = 0;
+        let half = a.match_state(MAX_TICKS / 2);
+        assert_eq!(half.score_diff(Team::Blue), 1);
+        assert_eq!(half.score_diff(Team::Orange), -1);
+        assert!((half.t_frac - 0.5).abs() < 0.01, "t_frac {}", half.t_frac);
+
+        let start = a.match_state(0);
+        assert!((start.t_frac - 1.0).abs() < 1e-6);
+        let end = a.match_state(MAX_TICKS);
+        assert!((end.t_frac - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn t_frac_never_leaves_unit_range_past_the_whistle() {
+        let mut a = mk_match_arena();
+        a.match_start_tick = 0;
+        let over = a.match_state(MAX_TICKS * 2);
+        assert!((0.0..=1.0).contains(&over.t_frac), "t_frac {}", over.t_frac);
     }
 }
 
