@@ -46,9 +46,13 @@ class FakeRemote:
     """Answers hillclimb's ssh/scp calls without a network.
 
     Defaults describe the happy path: no trainer running, the launch succeeds,
-    the attempt's process is already gone on the first poll, and the checkpoint
-    dir holds a COMPLETE run's worth of checkpoints (7 saves for 145 iters at
-    save_every=20 -- the last at iteration 140, not 145).
+    the attempt's process APPEARS on the first poll and is gone on the second
+    (a real detached trainer needs ~20-30s to reach the process table, so
+    hillclimb waits for it to appear before waiting for it to leave -- see
+    STARTUP_GRACE; on 2026-07-20 the missing appear-phase raced the loop
+    through 12 attempts in 60s and left 13 concurrent trainers running), and
+    the checkpoint dir holds a COMPLETE run's worth of checkpoints (7 saves for
+    145 iters at save_every=20 -- the last at iteration 140, not 145).
     """
 
     def __init__(self, ck_names=None, list_rc=0, busy_line="", launch_rc=0, scp_rc=0):
@@ -60,6 +64,9 @@ class FakeRemote:
         self.busy_line = busy_line
         self.launch_rc = launch_rc
         self.scp_rc = scp_rc
+        # per-attempt-dir poll counter: first poll = "running", then "gone"
+        self._polls = {}
+        self.never_appears = False
 
     def __call__(self, argv, timeout=None):
         argv = [str(a) for a in argv]
@@ -75,7 +82,13 @@ class FakeRemote:
         if "pgrep" in argv and "-af" in argv:          # busy check
             return FakeResult(0 if self.busy_line else 1, self.busy_line)
         if "pgrep" in argv:                            # per-attempt poll
-            return FakeResult(1, "")                   # already finished
+            if self.never_appears:
+                return FakeResult(1, "")               # launch failed: never visible
+            key = joined
+            self._polls[key] = self._polls.get(key, 0) + 1
+            if self._polls[key] == 1:
+                return FakeResult(0, "12345")          # appeared (phase 1 satisfied)
+            return FakeResult(1, "")                   # then finished (phase 2)
         if "mkdir" in argv:
             return FakeResult(0)
         if "ls" in argv:
@@ -828,3 +841,35 @@ def test_help_documents_the_defaults_and_the_evidence(capsys):
     assert "0.5" in out and "0.7" in out
     assert "hillclimb.stop" in out
     assert "145" in out
+
+
+def test_never_concludes_finished_from_a_process_it_never_saw(args):
+    """THE 2026-07-20 REGRESSION: polling immediately after a detached launch
+    saw no process and reported 'trainer exited', so the loop raced ahead and
+    left 13 concurrent trainers thrashing the remote. A process that never
+    appears must be a FAILED launch, never a completed run."""
+    a = args()
+    plan = hillclimb.plan_attempt(1, 1, 0.6, CHAMPION, a.host, a.remote_dir,
+                                  a.iters, a.reward, a.entropy_coef)
+    finished, reason = hillclimb.poll_until_done(
+        lambda argv, timeout=None: FakeResult(1, ""),  # pgrep: never running
+        plan, lambda s: None, 1, 100)
+    assert finished is False
+    assert "never appeared" in reason and "launch failed" in reason
+
+
+def test_full_loop_does_not_stampede_when_launches_never_start(args, tmp_path):
+    """A broken launch must not let the loop fire off attempt after attempt."""
+    a = args("--max-attempts", "3")
+    remote = FakeRemote()
+    remote.never_appears = True
+    # this path DOES sleep -- it is the startup grace period elapsing, which is
+    # exactly the wait that stops the loop from stampeding
+    waited = []
+    hillclimb.run_loop(a, runner=remote, gate_fn=make_gate([0.3] * 3),
+                       sleep=waited.append)
+    assert sum(waited) >= hillclimb.STARTUP_GRACE, (
+        "each failed attempt must burn the full startup grace, not spin")
+    rows = hillclimb.read_rows(a.log)
+    assert all(r["verdict"] == "ERROR" for r in rows)
+    assert all("never appeared" in r["reason"] for r in rows)

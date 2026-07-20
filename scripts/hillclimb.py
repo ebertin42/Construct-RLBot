@@ -130,6 +130,10 @@ SSH_TIMEOUT_DEFAULT = 120
 # is abandoned. Below this we RETRY: a flaky link must never be misread as
 # "training finished".
 SSH_RETRY_LIMIT = 5
+# Launch->visible grace: a detached remote trainer needs ~20-30s before its
+# cmdline is in the process table (python import + RocketSim arena build).
+STARTUP_GRACE = 180
+STARTUP_POLL_SECONDS = 5
 
 # verdict/outcome strings for our own log (champion_gate owns PASS/FAIL)
 PASS = champion_gate.PASS
@@ -440,6 +444,34 @@ def poll_until_done(runner, plan, sleep, poll_seconds, timeout) -> tuple[bool, s
     because a detached job that gets silently killed mid-run also 'leaves the
     process table'.
     """
+    # PHASE 1 -- wait for the trainer to APPEAR before waiting for it to leave.
+    # A detached launch returns immediately while python + engine construction
+    # takes ~20-30s, so polling straight away reads "already finished". On
+    # 2026-07-20 that raced the loop through 12 attempts in 60s and left 13
+    # concurrent trainers thrashing the box. Never conclude "exited" from a
+    # process that was never observed running.
+    startup_waited = 0
+    startup_ssh_failures = 0
+    while startup_waited < STARTUP_GRACE:
+        res = runner(plan["poll_cmd"])
+        if _ssh_broken(res):
+            # an ssh outage during startup is NOT "the launch failed" -- keep
+            # the two diagnoses distinct, they need different human responses
+            startup_ssh_failures += 1
+            if startup_ssh_failures > SSH_RETRY_LIMIT:
+                return False, (f"lost ssh to the trainer box for {startup_ssh_failures} "
+                               f"consecutive polls while waiting for the trainer to start; "
+                               f"abandoning this attempt (training may still be running)")
+        else:
+            startup_ssh_failures = 0
+            if res.returncode == 0:
+                break
+        sleep(STARTUP_POLL_SECONDS)
+        startup_waited += STARTUP_POLL_SECONDS
+    else:
+        return False, (f"trainer never appeared in the process table within {STARTUP_GRACE}s "
+                       f"-- the launch failed (check the remote attempt log)")
+
     waited = 0
     ssh_failures = 0
     while True:
