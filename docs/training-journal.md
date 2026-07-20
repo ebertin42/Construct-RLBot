@@ -1214,3 +1214,67 @@ not confounded by an inert binary.
 
 Baseline for comparison, both vs the same frozen champion, both side orders:
 kickoff/random resets pooled **41.6%** (149-209 over 2 attempts, SE 2.6%).
+
+## 2026-07-20 ~10:25 — REPLAY-STATE RESETS: first upward separation this project has produced
+
+    attempt 16  REPLAY-RESET arm  lambda_p 0.6383  seed 20260736
+    93-86  n=179  share 52.0%  95%CI [.447, .592]
+    verdict FAIL -- 0.51955 < 0.52000 threshold. Champion UNTOUCHED.
+
+**The comparison that matters** (everything held except the reset distribution
+-- same harness, same lambda band, same reward v3, same 145 iters, same frozen
+champion, same gate):
+
+    replay-state resets  (a16)        93- 86  n=179  0.520  [.447,.592]
+    kickoff/random       (a14+a15)   149-209  n=358  0.416  [.366,.468]
+
+    diff +0.103   SE_diff 0.046   z=+2.27   p=0.0232   RESOLVED
+
+**This is the first time in this project that any arm has separated UPWARD
+from its matched control.** Every previous arm either sat below the champion
+(19.8% to 46.4%) or held parity by refusing to change (armH lambda 1.0, 49.2%).
+This one moved, and it moved in the right direction.
+
+It was also **pre-registered**. Before the gate landed I wrote the decision rule
+into the journal and the wakeup: "near 41% = no large effect from replay resets;
+clearly above = the first lever that does something." This is not a result found
+by sifting; it is the answer to a question asked in advance, with a single
+variable manipulated.
+
+**Confound checked and ruled out.** The obvious worry is that a policy trained
+on replay states got evaluated on replay states. It did not.
+`h2h_eval._build_runner` constructs `MatchRunner(num_arenas, seed, mode=1,
+schema_version, net_heads)` and passes **no curriculum config at all** -- the
+gate's environment is fixed, and it is the identical environment that gated
+a14, a15, armG and armH. Only training differed.
+
+### What must NOT be concluded
+
+* **n=1 for this arm.** p=0.023 from a single gate is suggestive, not decisive.
+* **It is NOT better than armH.** a16 - armH = +0.027, z=+0.53, p=0.598 --
+  NOT RESOLVED. The only resolved claim is replay-resets > kickoff/random.
+* **~8 arms have now been examined.** A single p=0.023 among many comparisons
+  is worth less than it looks. Pre-registration helps; it does not exempt this
+  from replication.
+
+### The threshold will NOT be moved
+
+It missed by 0.045 of a percentage point -- 93-86 where 94-85 would have
+promoted. The temptation to nudge 0.52 down is exactly the p-hacking the
+confirmation gates were built to prevent, and it would convert a razor-thin
+single observation into a permanent change of champion. **The answer to a
+near-miss is more samples, not a lower bar.** The gate behaved correctly and
+the champion is untouched.
+
+### Next
+
+Attempt 17 is already running the SAME arm (lambda_p 0.6634, seed 20260737).
+Two or three more samples of this arm is now the highest-value thing the box
+can do -- far above another lambda point. If the arm replicates near 52%, the
+pooled estimate crosses the threshold on its own and promotes honestly.
+
+Note the shape of this: the lever that finally moved is the one that changes
+WHICH STATES the policy trains from, not how it trains. Every arm that tuned
+the optimizer, the reward, the entropy, or the opponent pool held or lost. That
+is the compounding-error story the replay literature tells, and it is the first
+piece of evidence from this project that actually supports it.
