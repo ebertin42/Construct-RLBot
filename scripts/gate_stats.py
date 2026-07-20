@@ -14,7 +14,7 @@ than leaving a suggestive gap for the reader to fill in.
 
     scripts/gate_stats.py list                 # every gate, newest last
     scripts/gate_stats.py list --grep hc_a     # only hill-climb attempts
-    scripts/gate_stats.py pool --grep hc_a     # pool several gates into one estimate
+    scripts/gate_stats.py pool --grep hc_a0016,hc_a0017   # OR: pool these gates
     scripts/gate_stats.py compare armG hc_a    # two-proportion z-test
 
 Stdlib only; reads the same history file champion_gate.py writes.
@@ -47,9 +47,19 @@ def name_of(row) -> str:
 
 
 def select(rows, pattern) -> list:
+    """Substring match, OR-ing over a comma-separated list.
+
+    Comma-separated rather than regex on purpose: the natural thing to reach
+    for is a bracket glob like `hc_a001[45]`, and that dies in zsh before the
+    tool ever sees it (2026-07-20). A comma list has no shell-active characters
+    and needs no quoting.
+    """
     if not pattern:
         return list(rows)
-    return [r for r in rows if pattern in name_of(r)]
+    needles = [p.strip() for p in str(pattern).split(",") if p.strip()]
+    if not needles:
+        return list(rows)
+    return [r for r in rows if any(n in name_of(r) for n in needles)]
 
 
 def counts(row) -> tuple:
@@ -183,11 +193,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     pl = sub.add_parser("list", help="every gate with its interval")
-    pl.add_argument("--grep", default="", help="substring of the candidate name")
+    pl.add_argument("--grep", default="",
+                    help="substring(s) of the candidate name; comma-separated = OR")
     pl.set_defaults(func=cmd_list)
 
     pp = sub.add_parser("pool", help="pool several gates into one estimate")
-    pp.add_argument("--grep", default="", help="substring of the candidate name")
+    pp.add_argument("--grep", default="",
+                    help="substring(s) of the candidate name; comma-separated = OR")
     pp.set_defaults(func=cmd_pool)
 
     pc = sub.add_parser("compare", help="two-proportion z-test between two selections")

@@ -137,3 +137,35 @@ def test_p_value_agrees_with_a_known_normal_tail():
 
 def test_missing_history_file_is_not_a_crash(tmp_path):
     assert gate_stats.load_rows(tmp_path / "nope.jsonl") == []
+
+
+# --- multi-pattern selection ------------------------------------------------
+
+def test_grep_ors_over_a_comma_separated_list(tmp_path, capsys):
+    """Needed to pool a chosen set of attempts. Comma rather than regex because
+    the natural `hc_a001[45]` dies in zsh before the tool sees it."""
+    hist = write_history(tmp_path, [
+        row("hc_a0014_x.pt", 75, 107),
+        row("hc_a0015_x.pt", 74, 102),
+        row("hc_a0016_x.pt", 93, 86),
+    ])
+    gate_stats.main(["--history", hist, "pool", "--grep", "hc_a0014,hc_a0015"])
+    out = capsys.readouterr().out
+    assert "2 gates" in out
+    assert "149- 209" in out.replace("  ", " ").replace("  ", " ") or "149" in out
+
+
+def test_compare_selectors_accept_comma_lists(tmp_path, capsys):
+    hist = write_history(tmp_path, [
+        row("hc_a0014_x.pt", 75, 107),
+        row("hc_a0015_x.pt", 74, 102),
+        row("hc_a0016_x.pt", 93, 86),
+    ])
+    gate_stats.main(["--history", hist, "compare", "hc_a0016", "hc_a0014,hc_a0015"])
+    out = capsys.readouterr().out
+    assert "1 gates" in out and "2 gates" in out
+
+
+def test_whitespace_in_the_comma_list_is_tolerated(tmp_path):
+    rows = [row("armG_x.pt", 77, 89), row("armH_x.pt", 93, 96)]
+    assert len(gate_stats.select(rows, " armG , armH ")) == 2
