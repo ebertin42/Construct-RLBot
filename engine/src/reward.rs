@@ -134,6 +134,22 @@ pub fn compute(
     r
 }
 
+/// Win probability in [0,1] from the perspective of a team leading by
+/// `score_diff`, with `t_frac` of the match clock remaining (1.0 at kickoff,
+/// 0.0 at the final whistle).
+///
+/// The slope sharpens as the clock runs down: a one-goal lead is nearly
+/// meaningless at kickoff and nearly decisive with seconds left. `t_floor`
+/// caps that sharpening so `k` stays finite at t_frac = 0.
+///
+/// This is a POTENTIAL, not a reward. Its accuracy affects only how fast the
+/// policy learns, never what it converges to (Ng, Harada & Russell 1999), so a
+/// crude analytic form is a legitimate starting point.
+pub fn win_prob(score_diff: i32, t_frac: f32, k_base: f32, t_floor: f32) -> f32 {
+    let k = k_base / t_frac.max(t_floor);
+    1.0 / (1.0 + (-k * score_diff as f32).exp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +602,43 @@ mod tests {
             v4_orange_net.abs() < 1e-4,
             "v4 orange should net exactly 0.0/exchange, got {v4_orange_net}"
         );
+    }
+
+    // --- win_prob: pure potential for match-win shaping (Task 1) ---
+    const K: f32 = 0.6;
+    const TF: f32 = 0.05;
+
+    #[test]
+    fn win_prob_is_half_at_level_score_for_every_clock() {
+        // A tied game is a coin flip whatever the clock says. If this drifts,
+        // kickoff carries a bias and the shaped game is no longer zero-sum.
+        for t in [1.0, 0.75, 0.5, 0.25, 0.0] {
+            assert!((super::win_prob(0, t, K, TF) - 0.5).abs() < 1e-6, "t_frac={t}");
+        }
+    }
+
+    #[test]
+    fn win_prob_is_complementary_between_teams() {
+        for d in [-3, -1, 0, 1, 3] {
+            for t in [1.0, 0.5, 0.1] {
+                let a = super::win_prob(d, t, K, TF);
+                let b = super::win_prob(-d, t, K, TF);
+                assert!((a + b - 1.0).abs() < 1e-6, "d={d} t={t}: {a} + {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_lead_is_worth_more_as_the_clock_runs_down() {
+        let early = super::win_prob(1, 0.9, K, TF);
+        let late = super::win_prob(1, 0.1, K, TF);
+        assert!(late > early, "late {late} should exceed early {early}");
+    }
+
+    #[test]
+    fn win_prob_stays_bounded_at_zero_time() {
+        // t_floor is what stops k blowing up in the final tick.
+        let v = super::win_prob(5, 0.0, K, TF);
+        assert!(v.is_finite() && (0.0..=1.0).contains(&v), "got {v}");
     }
 }
