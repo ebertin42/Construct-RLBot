@@ -1618,3 +1618,67 @@ reaches `iter 1` before trusting it. This tests the last unswept dimension --
 every arm ever run here used ~145 iterations -- and it will be gated as a
 LADDER (~145, 300, 450, 600) so the result is a trajectory rather than an
 endpoint. ~5.4 h; rungs get gated as they appear.
+
+## 2026-07-20 ~14:40 — the day's central comparison is CONFOUNDED by the engine deploy
+
+The 600-iter run reached iter 1 with `ep_rew 7.600` -- on **kickoff/random**
+resets. At 09:05 I cited "ep_rew at iter 1 is 7.361 vs 2.437 for kickoff/random"
+as an *independent second signal* that the replay arm was genuinely live. Pulled
+iter-1 ep_rew for every attempt:
+
+    a14  OLD engine  kickoff/random   1.184
+    a15  OLD engine  kickoff/random   2.222
+    a16  NEW engine  replay           7.361
+    a17  NEW engine  replay           6.668
+    a18  NEW engine  replay           7.351
+    a19  NEW engine  replay           7.863
+    long600 NEW engine kickoff/random 7.600   <- the control I never ran
+
+**The split is by ENGINE VERSION, not by reset distribution.** A kickoff/random
+run on the new engine sits squarely in the replay band. My "independent second
+signal" measured the deploy, not the lever.
+
+**And the claim it rested on was worse.** At 09:05 I wrote that
+`zero_replay_weight_is_bit_identical_to_legacy` passing meant "curriculum_v1
+runs are bit-identical on the new engine, so ALL earlier arm measurements and
+the frozen champion remain valid", and I repeated that in several handoffs.
+Reading the test:
+
+    let mut a = mk(1, 1, 5150, Some(curr(0.0, 0.4, 0.6, pool_of(16))));
+    let mut b = mk(1, 1, 5150, Some(curr(0.0, 0.4, 0.6, vec![])));
+    assert_eq!(sequence(&mut a, 50), sequence(&mut b, 50));
+
+It compares two runs of the **same (new) engine** -- pool loaded vs pool empty.
+It proves the replay branch is inert when disabled WITHIN a version. It says
+nothing whatever about old-engine vs new-engine equivalence. I used a passing
+test as evidence for a proposition the test does not make. Three commits landed
+in `engine/src/` between the old build and the new one (kickoff jitter 40b8c4f,
+reward v4 0b3b2b3, the replay lever 96cd7d0/f600fc9), any of which can move
+episode reward.
+
+### What this invalidates, precisely
+
+* **CONFOUNDED: replay arm vs kickoff/random baseline.** a16-a19 trained on the
+  new engine; a14+a15 on the old. That is the comparison the entire day was
+  built around, and reset distribution is entangled with engine version in it.
+  Every "+0.103 / +0.073 / +0.060 / +0.042" figure inherits this.
+* **STILL VALID: every arm-vs-champion gate result.** The gate loads
+  checkpoints and plays them in a fixed LOCAL eval engine
+  (`h2h_eval._build_runner`), so the training engine never enters the
+  measurement. "Replay arm 45.8%, significantly below parity" and "baseline
+  41.6%, significantly below parity" both stand, as do armF/G/H.
+* **STILL VALID: comparisons within an engine version.** armF/G/H and a14/a15
+  are all old-engine; a16-a19 are all new-engine. Each group is internally
+  clean.
+
+Fortunately the correction was already in flight before I noticed the problem:
+**long600 is kickoff/random on the NEW engine**, so its ~145-iter rung is
+exactly the same-engine baseline that was missing. The confounded comparison
+becomes answerable at that rung for free.
+
+Eighth error of the night, and the worst-shaped one yet. The previous seven were
+a broken measurement, a broken measurement, an inert binary, a blind preflight,
+a lucky sample, a sound measurement of the wrong quantity, and one influential
+point. This one is: **a passing test cited for a claim it does not make.** The
+test was green, the reasoning around it was not, and green tests are exactly
+what one stops interrogating.
