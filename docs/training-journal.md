@@ -1820,3 +1820,60 @@ itself -- optimizer state, value-head refit, the first large policy update --
 rather than anything about the training signal. Note `resume_train.py` has a
 `--reset-optimizer` flag ("stale moments belong to the old loss landscape"),
 which is the obvious A/B to run next if the answer points that way.
+
+## 2026-07-20 ~17:00 — the drop is present at ITERATION ONE, and never deepens
+
+Ten checkpoints, one per iteration, from the champion (local OLD engine, so
+comparable to the old-engine arms; the gate instrument was not touched):
+
+    iter  1  76- 83  0.478    iter  6  94- 97  0.492
+    iter  2  89- 94  0.486    iter  7  91- 91  0.500  (exact tie)
+    iter  3  76-108  0.413    iter  8  85- 87  0.494
+    iter  4  78- 86  0.476    iter  9  75- 96  0.439
+    iter  5  70-102  0.407    iter 10  83- 95  0.466
+
+    Cochran-Armitage across 10 rungs: z=+0.22  p=0.824  NO RESOLVED TREND
+    POOLED iters 1-10: 817-939  n=1756  0.465  [0.442,0.489]
+    vs parity 0.500:   z=-2.91  p=0.0036
+
+Set beside the long run:
+
+    fine   iters   1-10   n=1756   0.465  [0.442,0.489]
+    long600 iters 20-180  n=1626   0.453  [0.429,0.477]
+
+**The same level.** The policy steps off the champion, loses ~4 points, and
+then sits there -- flat through iteration 10, flat through iteration 180. There
+is no gradual erosion to find because there is no gradual erosion. The entire
+effect is incurred by the FIRST update.
+
+That is not the "PPO destroys the policy" story I have been carrying all night,
+and it is not the "145 iterations is too short" story either. Both assumed a
+process that unfolds over training. Nothing unfolds.
+
+### The experiment this demands, now running
+
+One PPO iteration moves the weights `||d||=1.7796`, **2.49% of the champion's
+norm**. Two very different explanations fit everything above:
+
+  (a) PPO's update DIRECTION is harmful -- it walks somewhere worse.
+  (b) ANY movement is harmful -- the champion sits at a local optimum of the
+      gate metric and every perturbation loses, whatever the direction.
+
+Under (b) there is nothing wrong with PPO at all, and the night's entire
+framing -- the anchor as "damage control", the lambda ladder, the reset
+distribution -- is a misreading of a metric artefact. Under (a) the direction
+is the problem and the anchor really is doing what I claimed.
+
+`scripts/perturb_null.py` builds the matched control: the champion moved the
+SAME distance in a RANDOM direction. Matching is **per-tensor**, scaling each
+tensor's noise to that tensor's own ||delta|| from the real PPO step, so the
+control reproduces how the update spreads magnitude across layers and differs
+only in direction. A single global scale would have confounded direction with a
+different per-layer profile. Three seeds generated, all matched to ratio 1.0000,
+all three gating now.
+
+Prediction stated BEFORE the result, since that is the only way it counts:
+if random perturbation gates near 0.465 the answer is (b) and the diagnosis
+changes completely; if it gates near 0.500 the answer is (a) and PPO's
+direction is genuinely harmful. I do not have a strong prior between them,
+which is the mark of a worthwhile experiment.
