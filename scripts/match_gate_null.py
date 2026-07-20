@@ -62,6 +62,10 @@ def main(argv=None):
                   f"share={rec['win_share']:.3f}", flush=True)
 
     s = null_summary(shares)
+    if s["mean"] is None:
+        print("\nNULL: no completed matches across any seed "
+              "(match_mode not producing match outcomes -- see G1/G2 deployment gaps).")
+        return 0
     print(f"\nNULL over {s['n']} seeds: mean={s['mean']:.4f}")
     if s["sd"] is not None:
         print(f"  sd={s['sd']:.4f}  95% CI of the mean=[{s['lo']:.4f},{s['hi']:.4f}]")
