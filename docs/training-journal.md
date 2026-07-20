@@ -2317,3 +2317,46 @@ Note both probes are extrapolations: a residual rescaled up to full update
 magnitude is not a step any run actually took, and neither is the shared
 direction. That is unavoidable in a direction-only comparison, and it is why
 the reference levels matter more than the absolute numbers.
+
+## 2026-07-20 ~18:50 — residual behaves like noise; localisation SUPPORTED but not yet direct
+
+Seed-swept decomp_resid1 across 9 match seeds:
+
+    SHARED    (9 seeds)  689- 828  n=1517  0.454  [.429,.479]
+    RESIDUAL1 (9 seeds)  773- 841  n=1614  0.479  [.455,.503]
+    NULL      (35)      2979-3167  n=6146  0.485  [.472,.497]
+    real PPO  (30)      2394-2837  n=5231  0.458  [.444,.471]
+
+    SHARED   vs NULL: -0.0305  z=-2.14  p=0.033   DIFFERS
+    SHARED   vs PPO : -0.0035  z=-0.24  p=0.811   indistinguishable
+    RESIDUAL vs NULL: -0.0058  z=-0.41  p=0.680   indistinguishable
+    RESIDUAL vs PPO : +0.0213  z=+1.50  p=0.134   indistinguishable
+
+**The residual behaves like noise, which is the registered "localised"
+outcome.** The earlier 0.441 reading was three gates at a single seed; with
+nine it is 0.479, sitting on the null level. That is the third time tonight a
+small sample has moved substantially on replication (a16 52.0 -> 45.8; null
+50.1 -> 48.5; residual 44.1 -> 47.9), and every one of them moved toward the
+boring answer.
+
+**But I must not claim localisation yet, for the exact reason I wrote down
+this morning:**
+
+    SHARED vs RESIDUAL: diff=-0.0247  z=-1.39  p=0.165  NOT RESOLVED
+
+"Shared differs from null, residual does not" is two comparisons against a
+threshold, not a comparison between the two -- the difference-of-significance
+fallacy. I flagged it at 17:20 and then committed a neighbouring version of it
+25 minutes later; the discipline is only worth anything if it applies when the
+pattern is one I want to be true. **The pattern is consistent with damage
+localised to the shared component; the direct test has not resolved it.**
+
+Resolving a 0.025 gap needs ~36 seeds per arm and each has 9. Three more
+sweeps launched -- resid2, resid3, and eight further shared seeds -- which
+takes the residual arm to n~4500 and the shared arm to n~2900, enough for
+z~2.1 on the direct comparison.
+
+Worth noting what the shared/residual split has already achieved regardless:
+the shared probe is INDISTINGUISHABLE from a real PPO update (p=0.811) while
+carrying only ~39% of an update's length. Whatever the direct comparison
+concludes, a minority of the update reproduces all of its harm.
