@@ -1395,3 +1395,69 @@ constrains, would settle the freezing question, and would say whether the replay
 arm differs from the kickoff/random arm in DIRECTION rather than magnitude.
 Deliberately not rushed into existence in the 15 minutes before a18 gates --
 a half-verified tool is how five of tonight's six errors happened.
+
+## 2026-07-20 ~13:20 — a18 lands; the replay effect decays, and the whole hill-climb is comparing two ways of losing
+
+    attempt 18  replay arm  lambda_p 0.5461  88-106  n=194  45.4%  [.385,.524]  FAIL
+
+(a18's 45.4% matching a17's 45.4% is coincidence, not a duplicated row -- the
+counts are 88-106 vs 69-83. Checked, because an exact repeat is exactly what a
+stale read looks like.)
+
+**The effect decays under replication:**
+
+    samples   replay pooled            vs baseline
+    n=1       0.520                    p=0.023
+    n=2       0.489                    p=0.053
+    n=3       0.476  [.434,.519]       p=0.077   (250-275, n=525)
+
+    baseline (a14+a15)  149-209  n=358  0.416  [.366,.468]
+    replay vs parity 0.500: p=0.275 -- still indistinguishable from parity
+
+Monotone decay toward the baseline as n grows. That is the signature of a false
+positive, not of a real effect being confirmed. Resolving the remaining +0.060
+would need ~6 gates per arm; we have 3 replay and 2 baseline.
+
+### The reframing that matters more than the p-value
+
+Chasing "replay vs kickoff/random" for another ~9 hours would resolve **which
+of two losing arms loses by less**. Both are below the champion. The champion
+has beaten every one of the 5 real hill-climb attempts and all 8 earlier arms.
+The hill-climb has produced no promotion because there has been nothing to
+promote.
+
+Put the night's whole ladder together and it says something coherent:
+
+    NO anchor      22-30%   PPO self-play actively DESTROYS the policy
+    WITH anchor    41-52%   it holds parity, and never exceeds it
+
+The anchor is not a tuning knob that happens to help -- it is damage control.
+And note what the anchor's objective literally is: reward PLUS stay-close-to-
+the-champion, while the gate asks "do you beat the champion?" **At lambda
+0.5-0.7 the training objective is substantially pulling the policy toward the
+very thing it is being measured against.** It is close to structural that this
+setup can approach parity and not pass it. Removing the anchor does not free
+the policy to improve; it collapses (armE 29.6%, no-anchor v4.1 22-25.5%).
+
+So the finding is not "reset distribution doesn't matter". It is: **on this
+setup the PPO gradient is anti-correlated with skill, and the KL anchor's only
+function is to limit how much damage it does.** Reset distribution, entropy,
+league diversity and lambda are all second-order next to that.
+
+### Recommendation on where the box's time should go
+
+1. **Stop accumulating replay samples.** Diminishing, and it settles a question
+   between two arms that both lose.
+2. **Build the behavioural-distance tool** (KL between candidate and champion
+   action distributions on shared states). Cheap, and it measures what lambda
+   actually constrains -- unlike the weight-space numbers at 13:00.
+3. **Test whether 145 iterations is simply too short.** EVERY arm tonight and
+   every arm in the diagnosis used the same ~145-iter (~24M step) bound, so no
+   data addresses this at all. One 600-iter run costs ~5.4 h -- about the same
+   as four more short attempts -- and tests a hypothesis nothing else has
+   touched. This is a real change of experimental design rather than a config
+   swap, so it is written up here for Elliot rather than started unilaterally;
+   the box is productively occupied meanwhile.
+
+Attempt 19 (replay, lambda_p 0.6634) is already running and will be allowed to
+finish rather than killed mid-flight.
