@@ -99,6 +99,19 @@ pub fn win_prob(score_diff: i32, t_frac: f32, k_base: f32, t_floor: f32) -> f32 
     let k = k_base / t_frac.max(t_floor);
     1.0 / (1.0 + (-k * score_diff as f32).exp())
 }
+
+/// The POTENTIAL used for shaping: `win_prob` recentred to [-0.5, +0.5].
+///
+/// The recentring is load-bearing. A raw sigmoid gives
+/// `PHI_orange = 1 - PHI_blue`, not `-PHI_blue`, so the two teams' shaping sums
+/// to `w*(gamma-1)` rather than zero -- a constant -0.046/step at the live
+/// gamma, -207 across a match, which rewards ending episodes early. Recentring
+/// makes the negation exact and the shaped game zero-sum at ANY gamma, and
+/// costs nothing: a constant shift leaves potential-based shaping
+/// potential-based, so the per-agent Ng guarantee is untouched.
+pub fn win_potential(score_diff: i32, t_frac: f32, k_base: f32, t_floor: f32) -> f32 {
+    win_prob(score_diff, t_frac, k_base, t_floor) - 0.5
+}
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -272,7 +285,9 @@ pub struct MatchState {
 
 impl MatchState {
     /// Goals ahead from `team`'s point of view. Signed, so the two teams'
-    /// values are exact negations and the shaped game stays zero-sum.
+    /// values are exact negations. (Zero-sum of the SHAPED reward additionally
+    /// requires the recentred `win_potential`, not raw `win_prob` -- see its
+    /// doc comment.)
     pub fn score_diff(&self, team: Team) -> i32 {
         let (mine, theirs) = match team {
             Team::Blue => (self.score_blue, self.score_orange),
@@ -300,7 +315,7 @@ pub fn win_prob_shaping(
         return 0.0;
     }
     let phi = |m: &MatchState| {
-        win_prob(m.score_diff(team), m.t_frac, cfg.win_prob_k_base, cfg.win_prob_t_floor)
+        win_potential(m.score_diff(team), m.t_frac, cfg.win_prob_k_base, cfg.win_prob_t_floor)
     };
     cfg.win_prob_weight * (gamma * phi(cur) - phi(prev))
 }

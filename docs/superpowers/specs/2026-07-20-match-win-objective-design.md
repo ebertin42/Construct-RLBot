@@ -120,17 +120,30 @@ there is nothing to interpret:
 ```
 t_frac = time_remaining / MATCH_SECONDS        # 1.0 at kickoff -> 0.0 at final whistle
 k      = K_BASE / max(t_frac, T_FLOOR)         # slope sharpens as the clock runs down
-PHI    = sigmoid(k * score_diff)
+PHI    = sigmoid(k * score_diff) - 0.5         # RECENTRED to [-0.5, +0.5]
 ```
+
+**The `- 0.5` is load-bearing and was missed in the first draft** (caught in
+review of Task 2, 2026-07-20). A raw sigmoid gives
+`PHI_orange = 1 - PHI_blue`, NOT `-PHI_blue`, so the two teams' shaping sums to
+`w*(gamma - 1)` instead of zero — at the live gamma 0.9954 and weight 10 that is
+a constant -0.046 per step, **-207 across a full match**, applied to BOTH teams.
+A constant per-step penalty is an incentive to end episodes early (stall to the
+no-touch truncation), and `opp_spirit` blending propagates the bias.
+
+Recentring costs nothing: shifting a potential by a constant leaves
+potential-based shaping potential-based, so the per-agent Ng guarantee and the
+telescoping property are unchanged, while `PHI_orange = -PHI_blue` becomes exact
+and the shaped game is zero-sum for ANY gamma.
 
 with `K_BASE` and `T_FLOOR` as config constants (`win_prob_k_base`,
 `win_prob_t_floor`). `T_FLOOR` prevents division blow-up in the final seconds
 and caps how sharp PHI can get.
 
 Properties this form guarantees, each of which is a test below:
-* `PHI = 0.5` at 0-0 for any clock, so kickoff carries no bias
-* `PHI(score_diff, t) = 1 - PHI(-score_diff, t)`, so the two teams' potentials
-  are exact complements and the shaped game stays zero-sum
+* `PHI = 0` at 0-0 for any clock, so kickoff carries no bias
+* `PHI(score_diff, t) = -PHI(-score_diff, t)`, an exact NEGATION (this is what
+  the recentring buys), so the shaped game is zero-sum at any gamma
 * a fixed lead is worth strictly more as `t_frac` falls
 
 The gamma in `gamma * PHI(s') - PHI(s)` is the TRAINING gamma
