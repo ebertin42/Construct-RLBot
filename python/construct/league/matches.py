@@ -102,3 +102,41 @@ def play_entries(mr: "MatchRunner", entry_a: dict, entry_b: dict, steps: int = 2
             f"{mr.schema_version}"
         )
     return mr.play(load_sd(entry_a["ck"]), load_sd(entry_b["ck"]), steps=steps)
+
+
+def split_matches(rewards, terminated, threshold=GOAL_THRESHOLD):
+    """Group a reward tape into per-match (goals_a, goals_b) using terminated
+    flags as match boundaries.
+
+    In match mode `terminated` means "the clock expired", so it is exactly the
+    match boundary. A goal is still a reward spike past `threshold` -- matches
+    always run reward_v0 as a neutral scoring tape (see module doc), so this
+    holds whatever the policies trained on.
+
+    A trailing partial match is DISCARDED: it has no outcome, and scoring it as
+    a draw would bias every gate toward 0.5.
+    """
+    rewards = np.asarray(rewards)
+    terminated = np.asarray(terminated)
+    out, a, b = [], 0, 0
+    for t in range(rewards.shape[0]):
+        a += int((rewards[t] >= threshold).sum())
+        b += int((rewards[t] <= -threshold).sum())
+        if bool(terminated[t].any()):
+            out.append((a, b))
+            a, b = 0, 0
+    return out
+
+
+def match_record(matches):
+    """Win/draw/loss counts and win share (draws count 0.5).
+
+    `win_share` is None when no match completed -- 0.0 would read as a total
+    loss and could drive a promotion decision off zero evidence.
+    """
+    wins = sum(1 for a, b in matches if a > b)
+    losses = sum(1 for a, b in matches if a < b)
+    draws = len(matches) - wins - losses
+    share = None if not matches else (wins + 0.5 * draws) / len(matches)
+    return {"wins": wins, "draws": draws, "losses": losses,
+            "matches": len(matches), "win_share": share}
