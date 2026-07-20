@@ -441,9 +441,26 @@ def cmd_status(cfg):
     return 0
 
 
-def gate_one(cfg, candidate, promote_if_pass, quiet=False):
+def confirm_seeds(cfg, n_confirm):
+    """Independent seeds for confirmation gates. The base seed measures; each
+    extra seed must ALSO pass before a promotion is allowed.
+
+    WHY (2026-07-20): the promote threshold (0.52) sits INSIDE the null
+    control's band (an unchanged policy measured 51.1% +/- ~3%), so a single
+    gate promotes an unchanged policy roughly one run in three. Unattended,
+    that is a winner's curse: only upward noise is ever promoted, and because
+    the champion is also the anchor and the league seed, the error compounds
+    into every later attempt. This is the SAME selection error that produced
+    the retracted "562M is the high-water mark" claim. Requiring k independent
+    passes drops the false-promote rate to ~(1/3)^k while costing measurement
+    time only on candidates that already passed once (rare by design)."""
+    return [cfg["seed"] + 1000 * (i + 1) for i in range(max(0, n_confirm))]
+
+
+def gate_one(cfg, candidate, promote_if_pass, quiet=False, n_confirm=0):
     """Measure `candidate` against the champion and record the verdict.
-    Returns the history row. Promotes only on PASS *and* promote_if_pass."""
+    Returns the history row. Promotes only on PASS *and* promote_if_pass
+    *and* n_confirm independent re-gates (different seeds) also passing."""
     champion = cfg["champion_ck"]
     if not quiet:
         print(f"=== GATE: {Path(candidate).name} vs champion {Path(champion).name} ===")
@@ -461,6 +478,28 @@ def gate_one(cfg, candidate, promote_if_pass, quiet=False):
         print(f"verdict: {verdict}  ({reason})")
 
     promoted = should_promote(verdict, promote_if_pass)
+
+    # Confirmation gates: a candidate that passed once must repeat it on
+    # independent seeds before the pointer moves (see confirm_seeds).
+    if promoted and n_confirm:
+        for cseed in confirm_seeds(cfg, n_confirm):
+            cres = run_match(candidate, champion, cfg["steps"], cfg["arenas"], cseed)
+            ctotal = cres["a"] + cres["b"]
+            cverdict, creason = evaluate(cres["share"], ctotal,
+                                         cfg["promote_threshold"], cfg["min_total_goals"])
+            if not quiet:
+                print(f"  confirm seed {cseed}: share {cres['share']:.1%} -> {cverdict}")
+            if cverdict != PASS:
+                promoted = False
+                reason += (f" -- CONFIRMATION FAILED on seed {cseed} "
+                           f"({cres['share']:.1%}); not promoted (winner's-curse guard)")
+                if not quiet:
+                    print("  NOT promoted: confirmation gate failed -- "
+                          "the first pass was most likely measurement noise.")
+                break
+        else:
+            reason += f" -- confirmed on {n_confirm} independent seed(s)"
+
     if verdict == PASS and not promote_if_pass:
         reason += " -- not promoted: --promote-if-pass not given"
         if not quiet:
@@ -496,9 +535,9 @@ def _do_promote(cfg, candidate, meta):
               file=sys.stderr)
 
 
-def cmd_gate(cfg, candidate, promote_if_pass):
+def cmd_gate(cfg, candidate, promote_if_pass, n_confirm=0):
     try:
-        gate_one(cfg, candidate, promote_if_pass)
+        gate_one(cfg, candidate, promote_if_pass, n_confirm=n_confirm)
     except SchemaMismatchError as e:
         print(f"gate refused: {e}", file=sys.stderr)
         return 1
@@ -573,6 +612,11 @@ def build_parser():
 
     g = sub.add_parser("gate", help="play CK vs champion (both side orders) and record a verdict")
     g.add_argument("ck")
+    g.add_argument("--confirm", type=int, default=2,
+                   help="independent confirmation gates (different seeds) a PASS must ALSO "
+                        "win before promotion. Default 2: the threshold sits inside the null "
+                        "control band, so a single gate promotes an unchanged policy ~1 run in "
+                        "3; two confirmations cut that to ~1 in 27. Set 0 to disable.")
     g.add_argument("--promote-if-pass", action="store_true",
                    help="move the champion pointer if the candidate passes (default: measure only)")
 
@@ -601,7 +645,7 @@ def main(argv=None):
     if args.cmd == "status":
         return cmd_status(cfg)
     if args.cmd == "gate":
-        return cmd_gate(cfg, args.ck, args.promote_if_pass)
+        return cmd_gate(cfg, args.ck, args.promote_if_pass, n_confirm=args.confirm)
     if args.cmd == "watch":
         return cmd_watch(cfg, args.auto_promote, once=args.once)
     if args.cmd == "promote":

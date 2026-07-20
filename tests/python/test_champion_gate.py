@@ -539,3 +539,47 @@ def test_status_runs_and_shows_champion_and_threshold(monkeypatch, cfg, capsys):
     assert "52.0%" in out
     assert "armA.pt" in out
     assert "FAIL" in out
+
+
+# --- winner's-curse guard: confirmation gates (added 2026-07-20) ---
+
+def test_confirm_seeds_are_distinct_and_derived_from_base():
+    import champion_gate as cg
+    seeds = cg.confirm_seeds({"seed": 11}, 2)
+    assert seeds == [1011, 2011]
+    assert len(set(seeds)) == 2 and 11 not in seeds
+    assert cg.confirm_seeds({"seed": 11}, 0) == []
+
+
+def test_confirmation_failure_blocks_promotion(monkeypatch, cfg):
+    """A candidate that passes the first gate by NOISE must not be promoted
+    when an independent seed disagrees -- the whole point of the guard."""
+    import champion_gate as cg
+    champ_before = cfg["champion_ck"]
+    shares = iter([0.60, 0.40])  # first gate passes, confirmation fails
+
+    def fake_match(cand, champ, steps, arenas, seed):
+        s = next(shares)
+        return {"a": int(100 * s), "b": int(100 * (1 - s)), "share": s,
+                "meta_candidate": {"steps": 1, "schema_version": 1}}
+
+    monkeypatch.setattr(cg, "run_match", fake_match)
+    row = cg.gate_one(cfg, "cand.pt", promote_if_pass=True, quiet=True, n_confirm=1)
+    assert row["promoted"] is False
+    assert "CONFIRMATION FAILED" in row["reason"]
+    assert cg.load_config(cfg["path"])["champion_ck"] == champ_before
+
+
+def test_confirmation_success_allows_promotion(monkeypatch, cfg):
+    import champion_gate as cg
+    shares = iter([0.60, 0.58])  # both gates pass
+
+    def fake_match(cand, champ, steps, arenas, seed):
+        s = next(shares)
+        return {"a": int(100 * s), "b": int(100 * (1 - s)), "share": s,
+                "meta_candidate": {"steps": 1, "schema_version": 1}}
+
+    monkeypatch.setattr(cg, "run_match", fake_match)
+    row = cg.gate_one(cfg, "cand.pt", promote_if_pass=True, quiet=True, n_confirm=1)
+    assert row["promoted"] is True
+    assert "confirmed on 1 independent seed" in row["reason"]
