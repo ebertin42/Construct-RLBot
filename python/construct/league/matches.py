@@ -25,6 +25,35 @@ GOAL_THRESHOLD = 9.4
 _SCHEMA_PATHS = {0: "schema/v0.toml", 1: "schema/v1.toml"}
 
 
+def _engine_kwargs(num_arenas, seed, reward_config, mode, schema_version, net_heads,
+                    curriculum_config=None):
+    """Assemble the kwargs dict for the Engine constructor.
+
+    Pulled out of MatchRunner.__init__ so it can be unit-tested without
+    constructing a real Engine (expensive, and match_mode support in the
+    local engine build is a separate deployment step -- see matches.py
+    module docstring / deployment-gap G1).
+
+    curriculum_config is only threaded through when explicitly given: the
+    default (None) omits the `curriculum_config_path` key entirely rather
+    than passing None, so legacy single-goal-boundary matches (the existing
+    goal-share gate) stay byte-for-byte unchanged.
+    """
+    engine_kwargs = dict(
+        num_arenas=num_arenas, blue=mode, orange=mode,
+        schema_path=_SCHEMA_PATHS[schema_version], reward_config_path=reward_config,
+        seed=seed,
+    )
+    if schema_version == 1:
+        # candle rebuilds attention from the raw state dict; head count is
+        # not recoverable from tensor shapes alone (same reason Trainer
+        # passes it -- see train.py's engine_kwargs["net_heads"]).
+        engine_kwargs["net_heads"] = net_heads
+    if curriculum_config is not None:
+        engine_kwargs["curriculum_config_path"] = curriculum_config
+    return engine_kwargs
+
+
 def load_sd(ck_path):
     ck = torch.load(ck_path, map_location="cpu", weights_only=False)
     # Generic tensor->numpy conversion: works unchanged for both v0
@@ -36,7 +65,7 @@ def load_sd(ck_path):
 
 class MatchRunner:
     def __init__(self, num_arenas=8, seed=0, reward_config="configs/reward_v0.toml", mode=1,
-                 schema_version=0, net_heads=4):
+                 schema_version=0, net_heads=4, curriculum_config=None):
         # Goal events pay every learner agent on the scoring team in that arena.
         # At mode=1 (1v1) each opponent arena has exactly one learner row (blue),
         # so the GOAL_THRESHOLD count below is exact. 2v2+ would multi-count (both
@@ -48,16 +77,16 @@ class MatchRunner:
             f"got {schema_version}"
         )
         self.schema_version = schema_version
-        engine_kwargs = dict(
-            num_arenas=num_arenas, blue=mode, orange=mode,
-            schema_path=_SCHEMA_PATHS[schema_version], reward_config_path=reward_config,
-            seed=seed,
+        # curriculum_config is None by default: omitting curriculum_config_path
+        # entirely (not passing it as None) keeps legacy construction -- and
+        # therefore the existing goal-share gate's per-goal boundaries --
+        # byte-for-byte unchanged. Passing it enables match_mode (full 300s
+        # matches, deployment-gap G1); the engine build that supports it is a
+        # separate step (G2).
+        engine_kwargs = _engine_kwargs(
+            num_arenas, seed, reward_config, mode, schema_version, net_heads,
+            curriculum_config=curriculum_config,
         )
-        if schema_version == 1:
-            # candle rebuilds attention from the raw state dict; head count is
-            # not recoverable from tensor shapes alone (same reason Trainer
-            # passes it -- see train.py's engine_kwargs["net_heads"]).
-            engine_kwargs["net_heads"] = net_heads
         self.eng = Engine(**engine_kwargs)
         self.assignment = [0] * num_arenas
 
