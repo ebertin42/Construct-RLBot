@@ -562,7 +562,7 @@ with:
         //
         // LEGACY MODE: unchanged. A goal terminates. The goal-share screen and
         // every historical gate depend on this exact behavior.
-        let (terminated, truncated) = if self.match_mode() {
+        let (terminated, truncated, needs_kickoff) = if self.match_mode() {
             if let Some(team) = scored {
                 match team {
                     Team::Blue => self.score_blue += 1,
@@ -571,25 +571,51 @@ with:
             }
             let match_over = cur.tick_count - self.match_start_tick >= MAX_TICKS;
             let stalled = cur.tick_count - self.last_touch_tick >= NO_TOUCH_TICKS;
-            (match_over, !match_over && stalled)
+            // ONLY the clock ends a match (Elliot's ruling, 2026-07-20). A goal
+            // OR a no-touch stall just kicks off again with the score
+            // preserved, so `truncated` is always false in match mode (clean
+            // for GAE -- the trajectory continues across every kickoff, which
+            // is what lets credit flow across a goal). A stall that truncated
+            // instead would fire on `truncated`, which the Task 6 gate does NOT
+            // split on, silently merging two matches into one score.
+            let needs_kickoff = !match_over && (scored.is_some() || stalled);
+            (match_over, false, needs_kickoff)
         } else {
             let t = scored.is_some();
             let tr = !t
                 && (cur.tick_count - self.last_touch_tick >= NO_TOUCH_TICKS
                     || cur.tick_count - self.episode_start_tick >= MAX_TICKS);
-            (t, tr)
+            (t, tr, false)
         };
 ```
 
-Then, at the reset site (`if terminated || truncated { ... self.reset_episode(); }`),
-add a mid-match kickoff for the goal-scored-but-match-continues case. Immediately
-before that block:
+Then, immediately before the `if terminated || truncated { ... }` reset block,
+add the mid-match kickoff. `reset_episode()` sets `prev_state` to the fresh
+post-kickoff state (episode.rs:422-423), so the trailing `else { self.prev_state
+= cur; }` MUST be suppressed after a kickoff -- otherwise it clobbers the fresh
+state with the pre-kickoff goal-mouth `cur`, and the next step's reward diffs
+against the wrong state. Structure the tail as:
 
 ```rust
-        // Match mode: a goal that did NOT end the match still needs a kickoff.
-        if self.match_mode() && scored.is_some() && !terminated && !truncated {
+        // Match mode: a goal or a no-touch stall that did NOT end the match
+        // kicks off again. reset_episode() also resets last_touch_tick
+        // (episode.rs:422), so a post-stall kickoff does not immediately
+        // re-stall, and sets prev_state to the fresh kickoff state.
+        if needs_kickoff {
             self.reset_episode();
         }
+
+        if terminated || truncated {
+            // ... capture final obs (unchanged) ...
+            if self.match_mode() {
+                self.start_match(cur.tick_count);
+            }
+            self.reset_episode();
+        } else if !needs_kickoff {
+            self.prev_state = cur;
+        }
+        // when needs_kickoff: prev_state was already set to the fresh kickoff
+        // by the reset_episode() above; do NOT overwrite it with cur.
 ```
 
 Do NOT touch `reset_episode` — it cannot distinguish a match start from a
