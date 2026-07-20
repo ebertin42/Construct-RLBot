@@ -2230,3 +2230,42 @@ Registering that asymmetry before the gates return, because it is the
 difference between a result and a wish. Four probes gating: the shared
 direction and each of the three residuals, all rescaled to a real update's
 magnitude so only direction differs.
+
+## 2026-07-20 ~18:15 — decomposition probes: inconclusive, and the reason is structural
+
+    SHARED probe    (1 gate)   78- 86  n=164  0.476  [.401,.552]
+    RESIDUAL probes (3 gates) 221-280  n=501  0.441  [.398,.485]
+    NULL reference  (35)      2979-3167 n=6146 0.485  [.472,.497]
+    PPO reference   (30)      2394-2837 n=5231 0.458  [.444,.471]
+
+    SHARED vs NULL  p=0.818 | SHARED vs PPO  p=0.650  -> indistinguishable from both
+    RESID  vs NULL  p=0.059 | RESID  vs PPO  p=0.476  -> indistinguishable from both
+
+Nothing separates. Honouring the asymmetry registered before the gates ran: the
+shared probe at 0.476 is near the noise level, and that is **AMBIGUOUS, not a
+refutation** -- with the probe only 35% true-shared by energy, contamination
+alone predicts exactly this.
+
+One point does cut against the hypothesis rather than merely failing to support
+it: the residuals came in at **0.441**, if anything BELOW the noise level
+(p=0.059) rather than at it. Under "the shared component carries the damage"
+the residuals should have looked like noise. They lean the other way. That is
+weak evidence -- three gates, wide interval -- but it points at the whole update
+direction being harmful rather than one privileged component of it.
+
+**The structural reason the probe is weak, and the fix.** `configs/champion.toml`
+pins `seed = 11`, so the gate is deterministic: re-gating a checkpoint
+reproduces its numbers exactly. That is correct and necessary for a champion
+gate -- a promote decision must not depend on when it was run -- but it means a
+probe cannot be strengthened by repetition, which is why the shared probe sits
+at n=164 while the references have n>5000. I had been treating "more gates" as
+the universal remedy and it simply does not apply to a fixed checkpoint.
+
+For a deterministic checkpoint the match seed is the ONLY source of variance,
+so sweeping seeds is the right way to grow n. Gating decomp_shared across 8
+additional seeds now (n 164 -> ~1400, CI +/-7% -> ~+/-2.6%), which is enough to
+tell 0.476 from 0.485 and 0.458 apart.
+
+Worth noting this is the same shape as the clustering check earlier: both times
+the question was "what is the actual independent unit here?" -- runs rather than
+checkpoints then, match seeds rather than repeat gates now.
