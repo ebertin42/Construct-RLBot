@@ -2419,3 +2419,24 @@ of the update rescues it. The misalignment is between the OBJECTIVES, not
 inside the optimiser's step. Fixing it means changing what is optimised --
 which is the match-win objective work already sitting in the backlog (#56),
 not another tuning pass.
+
+## 2026-07-20 ~18:45 — 24 rungs, 460 iterations, still flat
+
+    iter 360 0.446 | 380 0.404 | 400 0.481 | 420 0.448 | 440 0.464 | 460 0.508 | 480 0.495
+
+    Cochran-Armitage across 24 rungs: z=+0.65  p=0.517   NO RESOLVED TREND
+    POOLED iters 20-480: 2003-2381  n=4384  0.457  [.442,.472]
+    vs parity: z=-5.71  p<1e-6
+    NULL - long600: +0.0278  z=+2.82  p=0.005
+
+Twenty-four checkpoints spanning 460 iterations of training, and the line is
+flat. The pooled estimate is tight (+/-1.5%) and sits ~4.3 points below the
+champion, exactly where the first update put it.
+
+**The "maybe it just needs longer" hypothesis is dead.** Every arm this project
+ever ran used ~145 iterations, and nothing in the data addressed whether that
+bound was the limitation. Now it does: 460 iterations buys nothing. The policy
+drops on the first update and stays there.
+
+That closes the last open question from the trajectory experiment. What remains
+of tonight is the final rungs (500-600) and the consolidated write-up.
