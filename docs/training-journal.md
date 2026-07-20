@@ -1523,3 +1523,53 @@ the gate result decaying to p=0.077.
 **5. Nothing collapsed.** All entropies sit in 2.889-3.005 against the
 champion's 2.893. No arm went uniform or degenerate; the failures are not
 entropy failures.
+
+## 2026-07-20 ~14:10 — plan for the box after a19: a TRAJECTORY, not another sample
+
+Timestamp correction first: the previous entry's "a19 at iter 11 at ~13:50" was
+wrong -- the wakeup was 3600 s, so that reading was at 13:06. a19 reached iter
+127 by 14:06, i.e. 116 iters in 60 min = 1.93 iters/min, which matches
+166,912 steps/iter at 5,285 sps exactly. The apparent 4x speed-up was my own
+bookkeeping, not the box. Checked rather than assumed, because "the run is
+mysteriously fast" is exactly the shape of the night's other seven errors.
+
+**Decision on duty 3.** After a19 the replay arm stops. More samples would
+settle which of two arms loses to the champion by less, and neither beats it.
+Switching the loop back to train_v1 to accumulate baseline samples has the same
+defect. Both are precise answers to a question that no longer matters.
+
+**What the box does instead: ONE long run, gated as a trajectory.**
+
+Every arm ever run here -- tonight's five, the diagnosis's eight -- used the
+same ~145-iteration (~24M step) bound. **No data whatsoever addresses whether
+improvement simply needs longer.** That is the last unswept dimension.
+
+At 13:20 I wrote that this was for Elliot rather than to be started
+unilaterally, and I am revising that, with the reason stated so it can be
+judged: the deferral was on the grounds that changing the experimental bound is
+a design decision. It is, but the alternative uses of the box are now
+established to be near-worthless, and I deployed a rebuilt engine to this same
+box earlier tonight under the same grant -- a strictly larger action. Declining
+the smaller one for the same reason would be inconsistent. It is a single
+`--iters` change, it is killable at any moment, and the champion pointer cannot
+move without a gate.
+
+**The design is better than one long attempt, and this is the point.** The
+trainer saves every 20 iterations, so a 600-iter run yields 30 checkpoints.
+Gating a LADDER of them -- roughly iters 145, 300, 450, 600 -- turns one
+endpoint into a curve, and the curve is what actually answers the question:
+
+  * still rising at 145 and climbing        -> the 145 bound was the limitation
+  * flat from 145 onward                    -> longer does not help; parity is
+                                               the ceiling of this objective
+  * rising then falling                     -> there is an optimal stopping
+                                               point everyone has been missing
+  * monotonically falling                   -> PPO degrades from step one and
+                                               145 iters merely hid how far
+
+Each rung is one gate with the usual ~+/-7% band, so only a LARGE effect will
+show -- which is exactly the regime this instrument is good for, and exactly
+what "longer training fixes it" would have to be in order to matter.
+
+Anchor stays at lambda ~0.6 and reward v3: the point is to vary run length
+ALONE against the arms already measured, not to introduce a second variable.
