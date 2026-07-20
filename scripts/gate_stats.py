@@ -186,6 +186,71 @@ def needed_gates(diff, per_gate_n=180, power_z=2.8) -> float:
     return n_per_arm / per_gate_n
 
 
+def step_of(row) -> int:
+    """Training-step count parsed from the candidate filename (ck_<steps>.pt).
+
+    Used to ORDER a trajectory's rungs. Returns -1 when absent so unparseable
+    names sort first and are visible rather than silently interleaved."""
+    import re
+    m = re.search(r"ck_(\d+)", name_of(row))
+    return int(m.group(1)) if m else -1
+
+
+def cochran_armitage(groups) -> dict:
+    """Trend test for proportions across ORDERED groups.
+
+    `groups` is [(score, successes, total), ...] with `score` the ordering
+    variable (here: training steps). This is the right test for a trajectory:
+    each rung carries a ~+/-7% band so no single pair of rungs is resolvable,
+    but a CONSISTENT DIRECTION across many independent gates is evidence that
+    no pairwise comparison contains. Testing only the endpoints would throw
+    away every rung in between.
+
+    Returns z and a two-sided p. Positive z = share rises with the score.
+    """
+    n = sum(t for _, _, t in groups)
+    if n == 0:
+        return {"z": 0.0, "p": 1.0, "slope_sign": 0}
+    successes = sum(s for _, s, _ in groups)
+    p_bar = successes / n
+    s_mean = sum(sc * t for sc, _, t in groups) / n
+    # T = sum over groups of score * successes, centred under H0
+    t_stat = sum(sc * s for sc, s, _ in groups)
+    e_t = p_bar * sum(sc * tot for sc, _, tot in groups)
+    var_t = p_bar * (1 - p_bar) * sum(tot * (sc - s_mean) ** 2 for sc, _, tot in groups)
+    if var_t <= 0:
+        return {"z": 0.0, "p": 1.0, "slope_sign": 0}
+    z = (t_stat - e_t) / math.sqrt(var_t)
+    return {"z": z, "p": math.erfc(abs(z) / math.sqrt(2)),
+            "slope_sign": 1 if z > 0 else (-1 if z < 0 else 0)}
+
+
+def cmd_trend(args) -> int:
+    rows = select(load_rows(args.history), args.grep)
+    rows = [r for r in rows if counts(r)[0] is not None]
+    if len(rows) < 3:
+        print(f"trend needs at least 3 gates with goal counts; got {len(rows)}")
+        return 1
+    rows.sort(key=step_of)
+    groups = []
+    for r in rows:
+        gc, gh = counts(r)
+        print(fmt(f"{step_of(r):>12d}  {name_of(r)[:24]}", summarize(gc, gh)))
+        groups.append((step_of(r), gc, gc + gh))
+    # rescale steps to millions so the arithmetic stays well-conditioned
+    groups = [(sc / 1e6, s, t) for sc, s, t in groups]
+    t = cochran_armitage(groups)
+    print(f"\nCochran-Armitage trend across {len(groups)} rungs: "
+          f"z={t['z']:+.2f}  p={t['p']:.4f}")
+    if t["p"] < 0.05:
+        direction = "RISES" if t["z"] > 0 else "FALLS"
+        print(f"TREND RESOLVED: goal share {direction} with training steps.")
+    else:
+        print("NO RESOLVED TREND. The rungs are consistent with a flat line at "
+              "this sample size;\ndo not read a slope off the point estimates.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -201,6 +266,11 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--grep", default="",
                     help="substring(s) of the candidate name; comma-separated = OR")
     pp.set_defaults(func=cmd_pool)
+
+    pt = sub.add_parser("trend", help="Cochran-Armitage trend across ordered rungs")
+    pt.add_argument("--grep", default="",
+                    help="substring(s) of the candidate name; comma-separated = OR")
+    pt.set_defaults(func=cmd_trend)
 
     pc = sub.add_parser("compare", help="two-proportion z-test between two selections")
     pc.add_argument("a")

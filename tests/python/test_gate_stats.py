@@ -169,3 +169,73 @@ def test_compare_selectors_accept_comma_lists(tmp_path, capsys):
 def test_whitespace_in_the_comma_list_is_tolerated(tmp_path):
     rows = [row("armG_x.pt", 77, 89), row("armH_x.pt", 93, 96)]
     assert len(gate_stats.select(rows, " armG , armH ")) == 2
+
+
+# --- trajectory trend -------------------------------------------------------
+
+def test_step_of_parses_and_orders_rungs():
+    rows = [row("long600_ck_000340500480.pt", 1, 1), row("long600_ck_000323809280.pt", 1, 1)]
+    assert sorted(gate_stats.step_of(r) for r in rows) == [323809280, 340500480]
+
+
+def test_step_of_returns_minus_one_for_unparseable_names():
+    assert gate_stats.step_of(row("armH_lambda10.pt", 1, 1)) == -1
+
+
+def test_trend_detects_a_clear_decline():
+    """The shape that would mean 'PPO degrades from step one'."""
+    groups = [(1.0, 100, 180), (2.0, 85, 180), (3.0, 70, 180), (4.0, 55, 180)]
+    t = gate_stats.cochran_armitage(groups)
+    assert t["z"] < 0 and t["p"] < 0.05
+
+
+def test_trend_detects_a_clear_rise():
+    groups = [(1.0, 55, 180), (2.0, 70, 180), (3.0, 85, 180), (4.0, 100, 180)]
+    t = gate_stats.cochran_armitage(groups)
+    assert t["z"] > 0 and t["p"] < 0.05
+
+
+def test_trend_reports_nothing_on_a_flat_series():
+    groups = [(float(i), 90, 180) for i in range(1, 6)]
+    t = gate_stats.cochran_armitage(groups)
+    assert t["p"] > 0.5
+
+
+def test_trend_is_not_fooled_by_a_non_monotone_wobble():
+    """Up-down-up-down around a flat mean must not read as a trend -- otherwise
+    the tool would manufacture a slope out of gate noise, which is the whole
+    failure mode it exists to prevent."""
+    groups = [(1.0, 95, 180), (2.0, 85, 180), (3.0, 95, 180), (4.0, 85, 180)]
+    assert gate_stats.cochran_armitage(groups)["p"] > 0.2
+
+
+def test_trend_uses_every_rung_not_just_the_endpoints():
+    """Identical endpoints, different middles: a test that only compared first
+    and last would score these the same. The interior rungs must matter."""
+    a = [(1.0, 90, 180), (2.0, 90, 180), (3.0, 90, 180), (4.0, 60, 180)]
+    b = [(1.0, 90, 180), (2.0, 75, 180), (3.0, 68, 180), (4.0, 60, 180)]
+    za, zb = gate_stats.cochran_armitage(a)["z"], gate_stats.cochran_armitage(b)["z"]
+    assert za != pytest.approx(zb)
+
+
+def test_trend_handles_a_degenerate_all_same_score_series():
+    groups = [(2.0, 90, 180), (2.0, 85, 180)]
+    t = gate_stats.cochran_armitage(groups)
+    assert t["p"] == 1.0 and t["z"] == 0.0
+
+
+def test_trend_command_refuses_fewer_than_three_rungs(tmp_path, capsys):
+    hist = write_history(tmp_path, [row("long600_ck_000323809280.pt", 90, 90),
+                                    row("long600_ck_000330485760.pt", 85, 95)])
+    rc = gate_stats.main(["--history", hist, "trend", "--grep", "long600"])
+    assert rc == 1 and "at least 3" in capsys.readouterr().out
+
+
+def test_trend_command_says_nothing_resolved_on_flat_rungs(tmp_path, capsys):
+    hist = write_history(tmp_path, [
+        row("long600_ck_000323809280.pt", 90, 90),
+        row("long600_ck_000330485760.pt", 89, 91),
+        row("long600_ck_000340500480.pt", 90, 90)])
+    gate_stats.main(["--history", hist, "trend", "--grep", "long600"])
+    out = capsys.readouterr().out
+    assert "NO RESOLVED TREND" in out and "do not read a slope" in out
