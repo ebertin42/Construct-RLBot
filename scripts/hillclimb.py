@@ -498,11 +498,20 @@ def fetch_checkpoint(runner, plan, host, rdir, local_dir) -> tuple[str | None, s
     return str(local_path), f"fetched {newest}"
 
 
-def default_gate(cfg, candidate):
+def default_gate(cfg, candidate, n_confirm=2):
     """Gate via champion_gate, opting IN to promotion. gate_one moves the
     pointer, appends to the league pool, and writes the champion-history row --
-    all three advance together, which is the point of the hill-climb."""
-    return champion_gate.gate_one(cfg, candidate, promote_if_pass=True)
+    all three advance together, which is the point of the hill-climb.
+
+    n_confirm is LOAD-BEARING for an unattended loop: the promote threshold
+    (0.52) sits inside the null control's band (unchanged policy = 51.1% +/-
+    ~3%), so a single gate promotes noise about one run in three. Over a night
+    of attempts that reliably corrupts the champion -- and the champion is also
+    the anchor and league seed, so the error compounds. Confirmation gates on
+    independent seeds cut it to ~(1/3)^n. Do not set this to 0 for unattended
+    runs."""
+    return champion_gate.gate_one(cfg, candidate, promote_if_pass=True,
+                                  n_confirm=n_confirm)
 
 
 # ---------------------------------------------------------------------------
