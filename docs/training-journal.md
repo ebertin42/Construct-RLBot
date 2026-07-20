@@ -761,3 +761,38 @@ IF H lands ~50% (frozen): the production recipe is many BOUNDED attempts at
 lambda ~0.5-0.7 with DIFFERENT SEEDS, each gated, promoting the rare winner —
 an explicit hill-climb where PPO is the mutation operator. That is the honest
 architecture given a loop that is destructive on average.
+
+### 2026-07-20 ~05:45 — ARM H: lambda curve saturates AT PARITY (retention solved, improvement not)
+| self-anchor lambda_p | h2h vs champion | kl drift |
+|---|---|---|
+| 0.2 (F) | 32.8% | 0.148 |
+| 0.5 (G) | 46.4% | 0.094 |
+| **1.0 (H)** | **49.2%** | 0.066 |
+| v0-teacher kickstart 0.36 (D) | 49.2% | — |
+| null control (ck vs itself) | 51.1% | — |
+Monotone and SATURATING AT PARITY. Called in advance and confirmed: strong
+anchoring buys retention by FORBIDDING CHANGE, so it converges to ~50% by
+learning nothing. Three independent configs now HOLD the policy (D, H, and
+G nearly); NONE improve it. Retention is solved. Improvement is not.
+WINNER'S-CURSE GUARD ADDED BEFORE ANY UNATTENDED PROMOTION (993e53f+5509974):
+the 0.52 threshold sits INSIDE the null band, so a single gate promotes an
+unchanged policy ~1 run in 3 — over a night that reliably corrupts the
+champion, and since the champion is also the anchor and league seed the error
+compounds into every later attempt. This is the SAME selection error that
+produced the retracted "562M peak". Gate now requires 2 confirmations on
+independent seeds (~1 in 27). Found and fixed a hole where hillclimb.py called
+gate_one() directly with the n_confirm=0 default, silently skipping the guard
+in exactly the unattended case it exists for.
+OVERNIGHT HILL-CLIMB starting: bounded 145-iter attempts from the champion,
+lambda 0.5-0.7, distinct seeds, every candidate needing 3 independent wins.
+HONEST ODDS, recorded before the run: at lambda 0.5 the MEAN outcome is 46.4%
+— below parity — so the loop is betting on the positive tail of seed variance
+clearing 52% three times. It may promote nothing. That is an acceptable
+overnight cost (compute only, and the gate makes a wrong promotion unlikely),
+but it is NOT a solution to the improvement problem, and I am not going to
+report a quiet night as if it were progress.
+OPEN QUESTION for the morning: every arm here is 20M steps. Seer needed ~1e10
+steps for Platinum; our arms are 0.2% of that. But scale alone does not explain
+our data — the 562M->1.38B stretch was 800M steps and got WORSE, not better.
+So "too short" is not sufficient; something in this loop makes PPO's expected
+effect negative, and anchoring only clamps it to zero.
