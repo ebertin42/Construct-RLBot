@@ -66,6 +66,7 @@ import json
 import random
 import shlex
 import subprocess
+import tomllib
 import sys
 import time
 from pathlib import Path
@@ -588,10 +589,53 @@ def run_attempt(args, plan, cfg, runner, gate_fn, sleep, started) -> dict:
                 bool(gate_row.get("promoted")), gate_row.get("reason", ""), candidate)
 
 
+def replay_pool_requirement(train_config_path) -> str | None:
+    """Remote path of the reset pool this train config NEEDS, or None.
+
+    A train config points at a curriculum config; a curriculum with
+    `replay_weight > 0` points at a `[replay_pool] path`. When that file is
+    absent the engine warns, disables the replay branch, and CONTINUES at
+    renormalized kickoff/random weights -- i.e. a replay-reset arm silently
+    degenerates into a plain train_v1 rerun. The gate would then measure a
+    parity result and we would conclude "replay resets don't help", having
+    never used one. Returning the path lets the caller prove it exists first."""
+    cfg = tomllib.loads(Path(train_config_path).read_text())
+    curriculum_path = cfg.get("curriculum_config_path")
+    if not curriculum_path:
+        return None
+    curriculum = tomllib.loads(Path(curriculum_path).read_text())
+    if float(curriculum.get("replay_weight", 0.0)) <= 0.0:
+        return None
+    return curriculum.get("replay_pool", {}).get("path") or None
+
+
+def preflight_replay_pool(runner, host, rdir, train_config_path) -> None:
+    """Abort before the first launch if the arm's reset pool is missing on the
+    trainer box. Silent degradation is worse than no run: it produces a
+    confident, wrong, unattributable measurement."""
+    pool = replay_pool_requirement(train_config_path)
+    if pool is None:
+        return
+    res = runner(["ssh", host, "test", "-s", f"{rdir}/{pool}"])
+    if _ssh_broken(res):
+        raise HillclimbAbort(
+            f"\n!! cannot verify the reset pool on {host} (ssh failed).\n"
+            f"!! {train_config_path} needs {pool}; refusing to launch blind.")
+    if res.returncode != 0:
+        raise HillclimbAbort(
+            f"\n!! {train_config_path} requires the reset pool {rdir}/{pool} on "
+            f"{host}, which is missing or empty.\n"
+            f"!! The engine would WARN and silently fall back to kickoff/random "
+            f"resets, so every attempt would measure the wrong thing.\n"
+            f"!! Ship it first:  scp {pool} {host}:{rdir}/{pool}")
+    print(f"preflight: reset pool present on {host}:{rdir}/{pool}")
+
+
 def run_loop(args, runner=subprocess_runner, gate_fn=default_gate, sleep=time.sleep) -> int:
     """Attempt -> gate -> promote-or-discard, until a stop file, --max-attempts,
     or too many consecutive failures."""
     log_path = Path(args.log)
+    preflight_replay_pool(runner, args.host, args.remote_dir, args.train_config)
     done = 0
     while args.max_attempts is None or done < args.max_attempts:
         if stop_requested(args.stop_file):

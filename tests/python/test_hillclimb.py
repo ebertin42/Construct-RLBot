@@ -914,3 +914,64 @@ def test_busy_check_pattern_is_quoted(args):
     hillclimb.trainer_busy(runner, a.host)
     pattern = [t for t in seen["argv"] if "[" in t]
     assert pattern and pattern[0].startswith("'") and pattern[0].endswith("'")
+
+
+# --- reset-pool preflight ---------------------------------------------------
+
+def _write_configs(tmp_path, replay_weight, pool_path="data/reset_pool_v5.jsonl"):
+    curriculum = tmp_path / "curr.toml"
+    body = f"replay_weight = {replay_weight}\nkickoff_weight = 0.1\nrandom_weight = 0.2\n"
+    if pool_path is not None:
+        body += f'\n[replay_pool]\npath = "{pool_path}"\n'
+    curriculum.write_text(body)
+    train = tmp_path / "train.toml"
+    train.write_text(f'curriculum_config_path = "{curriculum}"\n')
+    return str(train)
+
+
+def test_no_pool_requirement_when_replay_weight_is_zero(tmp_path):
+    assert hillclimb.replay_pool_requirement(_write_configs(tmp_path, 0.0)) is None
+
+
+def test_pool_requirement_read_through_the_curriculum(tmp_path):
+    train = _write_configs(tmp_path, 0.7)
+    assert hillclimb.replay_pool_requirement(train) == "data/reset_pool_v5.jsonl"
+
+
+def test_preflight_aborts_when_the_pool_is_missing_on_the_box(tmp_path):
+    """A missing pool does not fail the run -- the engine warns and falls back
+    to kickoff/random. The arm would then measure a train_v1 rerun and report
+    parity, and we would wrongly conclude replay resets don't help."""
+    train = _write_configs(tmp_path, 0.7)
+    with pytest.raises(hillclimb.HillclimbAbort) as e:
+        hillclimb.preflight_replay_pool(
+            lambda argv, timeout=None: FakeResult(1, ""), "h", "construct", train)
+    assert "missing or empty" in str(e.value) and "scp" in str(e.value)
+
+
+def test_preflight_aborts_rather_than_guessing_when_ssh_is_down(tmp_path):
+    train = _write_configs(tmp_path, 0.7)
+    with pytest.raises(hillclimb.HillclimbAbort) as e:
+        hillclimb.preflight_replay_pool(
+            lambda argv, timeout=None: FakeResult(255), "h", "construct", train)
+    assert "ssh failed" in str(e.value)
+
+
+def test_preflight_passes_when_the_pool_is_present(tmp_path):
+    train = _write_configs(tmp_path, 0.7)
+    hillclimb.preflight_replay_pool(
+        lambda argv, timeout=None: FakeResult(0, ""), "h", "construct", train)
+
+
+def test_preflight_is_a_noop_for_the_default_train_config(args):
+    """train_v1 uses curriculum_v1 (no replay branch) -- the running loop must
+    not be gated on a pool it does not use."""
+    a = args()
+    calls = []
+
+    def runner(argv, timeout=None):
+        calls.append(argv)
+        return FakeResult(1, "")
+
+    hillclimb.preflight_replay_pool(runner, a.host, a.remote_dir, "configs/train_v1.toml")
+    assert calls == []
