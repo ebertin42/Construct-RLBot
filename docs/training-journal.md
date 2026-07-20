@@ -1922,3 +1922,60 @@ Note too the null arm's spread: 43.0 to 56.3, thirteen points across three
 seeds of PURE NOISE. Any single gate reading in the 43-56 band is consistent
 with a policy that differs from the champion by nothing at all. That is the
 band every arm tonight has been living in.
+
+## 2026-07-20 ~17:45 — 15 null seeds: I over-read the 3-seed null, exactly as I over-read a16
+
+Twelve more matched random-direction controls. All 15 pooled:
+
+    NULL (15 seeds)     1267-1366  n=2633  0.481  [.462,.500]  vs parity p=0.0537
+    PPO fine 1-10        817- 939  n=1756  0.465  [.442,.489]  vs parity p=0.0036
+    PPO long600 20-180   736- 890  n=1626  0.453  [.429,.477]  vs parity p=0.0001
+    ALL PPO pooled      1553-1829  n=3382  0.459  [.442,.476]
+
+    NULL - PPO fine      = +0.016  z=+1.04  p=0.300   NOT RESOLVED
+    NULL - PPO long600   = +0.029  z=+1.82  p=0.069   NOT RESOLVED
+    NULL - ALL PPO       = +0.022  z=+1.70  p=0.090   NOT RESOLVED
+
+**CORRECTION to the 17:20 entry.** I wrote "Random movement of the same size
+costs nothing" and called it explanation (a). That was three seeds giving
+0.501. With fifteen it is **0.481**, and the interval now only just touches
+parity (p=0.054). The null estimate moved two points toward "costs something"
+when n grew 5x -- which is precisely what a small-sample fluctuation does.
+
+**I made that error twenty-five minutes after writing a paragraph warning about
+the difference-of-significance fallacy, in the same entry.** Knowing the failure
+mode in the abstract did not stop me committing a neighbouring version of it:
+I was careful about how I compared two numbers and careless about how much I
+trusted one of them. Ninth of the night, and the one I have least excuse for.
+
+**Where this actually leaves the pre-registered question.** Neither (a) nor (b)
+is established:
+
+  * Random perturbation: 0.481, marginally below parity. It may cost a little.
+  * PPO perturbation:    0.459, clearly below parity.
+  * The gap between them: +0.022, p=0.090 -- **not resolved.**
+
+The data lean toward PPO's direction being worse than random, and they do not
+establish it. Resolving +0.022 needs roughly 45 gates per arm; the null arm has
+15, the PPO arm effectively 19. About 20 further null seeds would bring z to
+~1.95, which is still short of the line, so this is a question that wants ~40
+more seeds rather than a handful.
+
+**What IS established, and it is not nothing:**
+
+1. The drop is fully incurred by the FIRST update and never deepens (fine
+   1-10 = 0.465, long600 20-180 = 0.453, both flat: p=0.824 and p=0.768).
+2. Moving the champion AT ALL -- by any means, in any direction -- lands you in
+   a band around 0.46-0.48 and never above it.
+3. Pure noise spans 42.3% to 56.3% across 15 seeds. **Every arm measured
+   tonight sits inside the noise band of a policy that differs from the
+   champion by nothing meaningful.**
+
+Point 3 is the night's real finding and it subsumes most of the others. The
+lambda ladder, the reset distribution, the entropy sweep, the replay arm --
+all of them produced numbers inside the range that pure random perturbation
+produces. The instrument cannot tell them apart because there may be nothing
+there to tell apart.
+
+Launching 20 more null seeds (they need no training, only gate time) to push
+the decisive comparison as far as one night allows.
