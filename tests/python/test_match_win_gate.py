@@ -40,6 +40,15 @@ def test_trailing_incomplete_match_is_discarded():
     assert split_matches(r, t, TH) == [(1, 0)]
 
 
+def test_multi_arena_produces_one_record_per_arena_not_a_sum():
+    """The whole point of the per-arena split. Two arenas terminate on the same
+    step (the lockstep 300s clock); each must yield its OWN record, not a single
+    summed one. A naive terminated.any()+sum collapses them to [(3, 1)]."""
+    r = np.array([[10.0, -10.0], [10.0, 0.0], [10.0, 0.0]], dtype=np.float32)
+    t = np.array([[False, False], [False, False], [True, True]], dtype=bool)
+    assert sorted(split_matches(r, t, TH)) == [(0, 1), (3, 0)]
+
+
 def test_match_record_counts_wins_draws_losses():
     rec = match_record([(2, 1), (0, 0), (1, 3), (1, 0)])
     assert rec["wins"] == 2 and rec["draws"] == 1 and rec["losses"] == 1
