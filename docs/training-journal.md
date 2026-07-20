@@ -796,3 +796,43 @@ steps for Platinum; our arms are 0.2% of that. But scale alone does not explain
 our data — the 562M->1.38B stretch was 800M steps and got WORSE, not better.
 So "too short" is not sufficient; something in this loop makes PPO's expected
 effect negative, and anchoring only clamps it to zero.
+
+## 2026-07-20 ~06:10 — hill-climb stampede fixed, loop armed and verified
+
+**The misfire.** The first hill-climb launch (attempts 1-12) burned every
+attempt in 60 seconds and left **13 concurrent trainers** on the remote box
+(GPU 0% util, 1713 MiB — every process starving the others). All killed by
+hand.
+
+**Root cause.** `poll_until_done` polled `pgrep` immediately after a detached
+launch. A remote trainer needs ~20-30s of python + engine construction before
+it reaches the process table, so the first poll missed, and a non-zero rc was
+read as *"trainer process exited"*. The loop then found no new checkpoint,
+logged ERROR, and launched the next attempt — on top of the one still starting.
+Attempt 1's remote log proved training HAD started (physics-blowup containment
+lines present) while the loop had already declared it dead.
+
+**Fix (cfab026).** Two-phase poll: wait for the process to APPEAR (bounded by
+`STARTUP_GRACE=180s`), then wait for it to leave. A process that never appears
+is now a *failed launch*, never a completed run. An ssh outage during startup
+keeps its own "lost ssh" diagnosis — the two failures need different human
+responses. 20 tests broke because `FakeRemote` encoded the buggy lifecycle
+("already finished on the first poll"); it now models appear-then-finish, which
+is what let the regression land green in the first place. Two regression tests
+pin the behaviour directly, including a full-loop stampede test. 117 tests pass
+across hillclimb + champion_gate.
+
+**Armed and verified.** Loop restarted at attempt 13 (`--wait-for-idle`).
+Confirmed before leaving it: exactly **1** trainer on the remote, GPU 99% /
+6492 MiB, `iter 1 ... sps 5,148 ... lambda_p 0.667` in the attempt log. The
+appear-phase did its job — no stampede.
+
+**Note on the main run.** Remote had 0 trainers before launch; the main run's
+newest checkpoint is `ck_000683284480.pt` at 07-19 19:51, i.e. it was already
+stopped deliberately before the stampede. The `pkill` did not cost progress.
+
+**Other live work.** SSL pull healthy — 10,497 duel replays / 7.9G, newest
+written seconds before the check. (An earlier "0 files in 2 hours" reading was
+a false alarm: `find` here is `bfs`, which rejects relative `-newermt '-2 hours'`
+and the error was swallowed by `2>/dev/null`. Use ISO timestamps with bfs.)
+Host free on /mnt/c: 145G, above the 130G SSL guard.
