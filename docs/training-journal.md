@@ -711,3 +711,30 @@ entropy 0.01, league off — arm D's proven config with the anchor swapped from
 the frozen v0 teacher to the champion itself, because a v0-teacher anchor caps
 us at teacher level while a self-anchor advances on every promotion. Risk is
 bounded BY the gate: if it fails, we discard and fall back to reproducing D.
+
+### 2026-07-20 ~02:00 — ARM F (self-anchor) FAILS the gate: 32.8%
+Self-distillation at lambda_p 0.2 did NOT hold parity (32.8%, 27-52 / 33-71),
+despite the best training-time numbers of any arm (ep_rew 8.50, ent 3.35,
+kl_pri bounded at 0.148). Another reminder that ep_rew is not skill.
+WHY IT DIFFERS FROM ARM D (49.2%) — four things, not one:
+1. KL DIRECTION. kickstart = KL(teacher||student), MODE-COVERING: penalizes
+   the student for failing to cover the teacher's support. kl_prior =
+   KL(student||prior), mode-seeking — a far weaker constraint (this direction
+   was chosen deliberately in the KL-prior plan for a HUMAN prior, where
+   mode-seeking is right; for an anchor meant to PREVENT DRIFT it is wrong).
+2. VALUE DISTILLATION. kickstart_losses also regresses student value onto the
+   teacher's (lambda_v 0.5). Arm F left the critic unconstrained.
+3. STRENGTH: lambda_k 0.36 vs lambda_p 0.2.
+4. A SELF-ANCHOR LAGS BY CONSTRUCTION: KL(student||self) starts at exactly 0
+   with ~zero gradient, so it only resists drift AFTER the drift; a different
+   competent teacher pulls from step 1.
+ARM G (running): self-anchor at lambda_p 0.5 — isolates (3), the cheapest of
+the four. If 0.5 holds parity, self-distillation is viable and scalable (the
+anchor advances with each promotion). If it fails, (1)+(2) are the essential
+ingredients and the fix is a code change: teach the kickstart path to accept a
+v1 teacher so we can self-distill with mode-covering KL + value distillation.
+STANDING HONEST CAVEAT: no configuration tested so far IMPROVES the policy.
+Arm D HOLDS (49.2% ~ parity). Holding is not progress — but with the gate, a
+holding regime plus rare lucky promotions is a slow hill-climb that cannot
+regress, which is strictly better than every regime this project has run since
+the anneal ended.
