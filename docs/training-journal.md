@@ -1776,3 +1776,47 @@ on the old engine and compare it against the OLD-engine arms (a14+a15, 0.416 at
 "is the loss incurred in the first few iterations?" -- without touching either
 the instrument or the running 600-iter job on the remote. The new-engine version
 of the same question can be asked later on the trainer box once long600 is done.
+
+## 2026-07-20 ~16:35 — nine rungs, still flat; and the engine effect is the same size as the "replay effect"
+
+    iter 140  90- 95  0.486  [0.415,0.558]
+    iter 160  66-102  0.393  [0.322,0.468]
+    iter 180  83-103  0.446  [0.377,0.518]
+
+    Cochran-Armitage across 9 rungs: z=-0.30  p=0.768   NO RESOLVED TREND
+    POOLED iters 20-180: 736-890  n=1626  0.453  [0.429,0.477]
+    vs parity 0.500:     z=-3.82  p=0.00013
+
+The estimate is now tight (+/-2.4%) and the conclusion is firm: **across
+iterations 20-180 the policy sits ~4.7 points below the champion, flat, with no
+trend.** Adjacent rungs 20 iterations apart swing by 9 points (48.6 -> 39.3),
+which bounds how much real signal could be hiding here: the gate noise is
+larger than any plausible drift over this range.
+
+**The engine effect, measured at matched iteration count.** long600's iter-140
+checkpoint has the same step count as every hill-climb attempt's final
+checkpoint, so this is the cleanest available comparison -- same iterations,
+same reward, same lambda band, differing in engine version and seed:
+
+    long600 iter 140 (NEW engine)   90- 95  n=185  0.486  [0.415,0.558]
+    a14+a15 iter ~145 (OLD engine) 149-209  n=358  0.416  [0.366,0.468]
+    difference +0.070  z=+1.56  p=0.119   NOT RESOLVED
+
+Worth stating plainly: **+0.070 is the same magnitude as the "replay effect" I
+chased all morning** (+0.103 at n=1, decaying to +0.042 at n=4). The replay arm
+ran on the new engine and its baseline on the old one. So the entire apparent
+replay effect is quantitatively consistent with having been the engine
+difference the whole time -- which is exactly what the 14:40 confound predicted.
+Consistent with, not proven: at p=0.119 this comparison cannot resolve its own
+effect either, and it would need ~4 more gates per side to try.
+
+**Fine-grained run launched** (local, OLD engine, so comparable only to the
+old-engine arms -- the instrument is not being touched). `configs/train_v1_fine.toml`
+is train_v1 with `save_every_iters = 1`; 10 iterations from the champion, lambda
+0.6, reward v3, seed 20260741, into `checkpoints_fine/`. This resolves the
+region where the entire effect is incurred and where no checkpoint has ever
+existed. If the drop is present at iteration 1-2, the suspect is resumption
+itself -- optimizer state, value-head refit, the first large policy update --
+rather than anything about the training signal. Note `resume_train.py` has a
+`--reset-optimizer` flag ("stale moments belong to the old loss landscape"),
+which is the obvious A/B to run next if the answer points that way.
