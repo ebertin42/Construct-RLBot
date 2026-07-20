@@ -1048,6 +1048,16 @@ def test_trailing_incomplete_match_is_discarded():
     assert split_matches(r, t, TH) == [(1, 0)]
 
 
+def test_multi_arena_produces_one_record_per_arena_not_a_sum():
+    """The whole point of the per-arena split. Two arenas terminate on the same
+    step (the lockstep 300s clock); each must yield its OWN record, not a single
+    summed one. A naive terminated.any()+sum collapses them to [(3, 1)]."""
+    r = np.array([[10.0, -10.0], [10.0, 0.0], [10.0, 0.0]], dtype=np.float32)
+    t = np.array([[False, False], [False, False], [True, True]], dtype=bool)
+    # arena 0: 3 goals for A; arena 1: 1 goal for B
+    assert sorted(split_matches(r, t, TH)) == [(0, 1), (3, 0)]
+
+
 def test_match_record_counts_wins_draws_losses():
     rec = match_record([(2, 1), (0, 0), (1, 3), (1, 0)])
     assert rec["wins"] == 2 and rec["draws"] == 1 and rec["losses"] == 1
@@ -1085,18 +1095,31 @@ def split_matches(rewards, terminated, threshold=GOAL_THRESHOLD):
     always run reward_v0 as a neutral scoring tape (see module doc), so this
     holds whatever the policies trained on.
 
+    Records are PER ARENA: each arena plays its own sequence of matches, and a
+    300s clock makes all arenas terminate on the same step, so a naive
+    `terminated.any()` + arena-summed count would collapse all N arenas' goals
+    into ONE record -- N-fold fewer samples, and an aggregate-goal comparison
+    rather than the per-match W/D/L we want. Accumulate and emit per arena.
+
     A trailing partial match is DISCARDED: it has no outcome, and scoring it as
     a draw would bias every gate toward 0.5.
     """
     rewards = np.asarray(rewards)
     terminated = np.asarray(terminated)
-    out, a, b = [], 0, 0
-    for t in range(rewards.shape[0]):
-        a += int((rewards[t] >= threshold).sum())
-        b += int((rewards[t] <= -threshold).sum())
-        if bool(terminated[t].any()):
-            out.append((a, b))
-            a, b = 0, 0
+    if rewards.ndim == 1:            # a single-arena tape may arrive as (T,)
+        rewards = rewards[:, None]
+        terminated = terminated[:, None]
+    T, n = rewards.shape
+    out = []
+    a = np.zeros(n, dtype=int)       # per-ARENA accumulators -- NOT summed
+    b = np.zeros(n, dtype=int)
+    for t in range(T):
+        a += (rewards[t] >= threshold).astype(int)
+        b += (rewards[t] <= -threshold).astype(int)
+        for arena in np.nonzero(terminated[t])[0]:
+            out.append((int(a[arena]), int(b[arena])))
+            a[arena] = 0
+            b[arena] = 0
     return out
 
 
