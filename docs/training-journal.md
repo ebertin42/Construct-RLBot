@@ -1573,3 +1573,48 @@ what "longer training fixes it" would have to be in order to matter.
 
 Anchor stays at lambda ~0.6 and reward v3: the point is to vary run length
 ALONE against the arms already measured, not to introduce a second variable.
+
+## 2026-07-20 ~14:30 — the replay arm is dead, and it dies cleanly
+
+    attempt 19  replay arm  lambda_p 0.6634  70-103  n=173  40.5%  [.334,.479]  FAIL
+
+Four samples of the replay arm, and the p-value against the kickoff/random
+baseline across replication:
+
+    n=1   0.520   p=0.023      "first upward separation this project has measured"
+    n=2   0.489   p=0.053
+    n=3   0.476   p=0.077
+    n=4   0.458   p=0.189      +0.042, would need ~12 gates/arm to resolve
+
+    replay pooled (a16-a19)   320-378  n=698  0.458  [.422,.496]
+    kickoff/random (a14+a15)  149-209  n=358  0.416  [.366,.468]
+
+And the decisive line, which only became available once n was large enough to
+have a tight interval:
+
+    replay arm      vs parity 0.500:  z=-2.20  p=0.028   BELOW the champion
+    kickoff/random  vs parity 0.500:  z=-3.17  p=0.0015  BELOW the champion
+
+**Both arms are significantly WORSE than the champion.** The question "does the
+replay arm beat the baseline" was never the interesting one; with four samples
+the arm has a tight enough interval to answer the question that matters, and
+the answer is that it loses. The 10:25 headline is now fully retired: there was
+never an upward separation, only a high first draw, and every subsequent sample
+walked it back.
+
+That is a complete worked example of the winner's curse, start to finish, in
+one night: a pre-registered comparison, a single significant result, a
+prominent write-up, and then four samples that dissolve it. The pre-registration
+was real and did not save it -- **nothing protects against a small sample except
+a larger one.**
+
+**Replay arm closed. Hill-climb loop stopped.** 6 real hill-climb attempts, 8
+earlier arms, zero promotions, and the champion never moved. That is the
+harness working, not failing: every one of those FAILs was correct.
+
+**Started: the 600-iteration run** (`checkpoints_hc/long600_s20260740`, seed
+20260740, lambda_p 0.6, reward v3, train_v1 kickoff/random). Verifying it
+reaches `iter 1` before trusting it. This tests the last unswept dimension --
+every arm ever run here used ~145 iterations -- and it will be gated as a
+LADDER (~145, 300, 450, 600) so the result is a trajectory rather than an
+endpoint. ~5.4 h; rungs get gated as they appear.
