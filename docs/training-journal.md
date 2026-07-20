@@ -1115,3 +1115,49 @@ relaunched at lambda_p 0.6383. Verifying the pool actually LOADS before trusting
 anything this arm produces — the engine's documented failure mode on an
 unreadable pool is to warn and silently fall back to kickoff/random, which would
 make the arm a train_v1 rerun wearing a different config name.
+
+## 2026-07-20 ~08:50 — the replay arm was RUNNING INERT: remote engine predates the lever
+
+Verified before trusting attempt 16, and it failed the check.
+
+The attempt log has **zero** `[curriculum]` lines — neither the success line
+(`[curriculum] replay pool <path>: N read, M kept ...`) nor the documented
+failure line (`WARNING: replay pool unreadable; replay resets DISABLED`).
+`load_or_empty` was never called at all. The reason:
+
+    remote /home/elliot/construct/.venv/.../construct/_engine.abi3.so
+      built 2026-07-19 06:13
+      `strings ... | grep -c "replay pool"`  ->  0
+
+**The remote engine binary predates replay-pool support entirely.** The lever
+landed in the repo and the wheel was never rebuilt and shipped — consistent
+with the deploy having been deliberately held while the config stayed pointed
+at curriculum_v1.
+
+So attempt 16 was training on kickoff/random resets while wearing the
+replay-arm config name. Worse than the fallback the config warns about: that
+fallback at least prints a WARNING, but the code that prints it does not exist
+in this build, so the run was silent AND inert. Had I not checked, the arm
+would have gated at ~41% like the others and I would have written "replay-state
+resets don't help" into the journal on the strength of a run that never drew a
+single replay state. That is the exact failure the preflight was supposed to
+prevent, and the preflight could not see it: it verified the FILES, and the
+missing dependency was the BINARY.
+
+Attempt 16 killed, loop stopped, nothing gated. No bad measurement entered the
+record.
+
+**Standing lesson, now three for three tonight.** Every bug this session has
+been a silent one that returned a plausible-looking value: rc=1 read as "no
+such process"; bfs erroring read as "no files"; and now an inert engine read as
+"the arm ran". Each looked like a result. The only thing that has caught any of
+them is checking a positive signal — the poll returning rc=0 against a known
+process, `stat` on a real file, a `[curriculum]` line in the log — rather than
+accepting the absence of an error as success.
+
+**Next: deploying a rebuilt engine wheel to the trainer box.** Backing up the
+current .so first so the box can be reverted in one command. Verifying after
+install that (a) the pool line appears and (b) curriculum_v1 still behaves
+identically — the repo pins that with `zero_replay_weight_matches_legacy_coin`,
+which asserts replay_weight=0 reproduces the legacy rng stream exactly, so the
+existing lineage and the frozen champion stay comparable.
