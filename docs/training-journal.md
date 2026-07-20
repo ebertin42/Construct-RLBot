@@ -836,3 +836,54 @@ written seconds before the check. (An earlier "0 files in 2 hours" reading was
 a false alarm: `find` here is `bfs`, which rejects relative `-newermt '-2 hours'`
 and the error was swallowed by `2>/dev/null`. Use ISO timestamps with bfs.)
 Host free on /mnt/c: 145G, above the 130G SSL guard.
+
+## 2026-07-20 ~06:35 — the stampede had a SECOND cause: ssh + zsh globbing
+
+The 06:10 entry above was premature. The appear-phase fix was correct but it
+exposed a deeper bug rather than curing the stampede, and attempt 13 proved it
+within minutes: the loop logged `ERROR ... trainer never appeared in the
+process table within 180s` for an attempt I had *watched* reach `iter 1` at
+99% GPU. It then launched attempt 14 on top of it — a second trainer, again.
+
+**Root cause.** `ssh host cmd a b c` does not deliver argv. ssh joins the
+arguments and hands the string to the remote LOGIN SHELL, which parses it
+again. The trainer box runs zsh, and zsh aborts a command whose glob matches
+nothing:
+
+    $ ssh box pgrep -f hc_a0013_[s]20260733
+    zsh:1: no matches found: hc_a0013_[s]20260733
+    rc=1
+
+`pgrep` never ran. Every `bracket_proof()` pattern — the self-match-proofing
+this project adopted precisely to make remote pgrep/pkill safe — is a glob to
+that shell. **The safety device and the transport were a trap in combination**:
+rc=1 means "the command did not execute", and every caller read it as "no such
+process". The failure is perfectly silent; there is no traceback, and the only
+tell is one line on stderr that nobody was reading.
+
+Three consequences, all silent:
+  * the per-attempt poll could never match a running trainer, so every attempt
+    was declared a failed launch after the grace period while it trained on;
+  * `--wait-for-idle`'s busy check reported an idle box *unconditionally*,
+    which is what let a second trainer launch on top of the first — the guard
+    that existed specifically to prevent this had never once worked;
+  * `ctl.remote_kill_plan` would have failed to kill anything, reporting rc=1
+    as "nothing to kill".
+
+**Fix (14c19b7).** `ctl.remote_quote()`; every glob-carrying pattern crossing
+ssh goes through it. Verified live against the box: quoted returns rc=0 for a
+running process and rc=1 for an absent one; unquoted fails identically in both
+cases, which is the whole problem. Tests pin the invariant *structurally* — any
+ssh argv token containing `[ ] * ?` must be quoted — rather than pinning the
+call sites I happened to remember.
+
+**Armed, and this time the verification was the right one.** Attempt 14 is
+running: 1 trainer, 5948 MiB, and — the part that actually matters — the loop's
+own poll command now returns rc=0 against it. Confirming "training started" was
+never sufficient; the failure was always that the loop *could not see* what had
+started. Verify the observer, not just the observed.
+
+**Method note.** Both bugs were caught only because the loop's claim was
+checked against the box instead of believed. An unattended loop that reports
+ERROR is not self-evidently correct — ERROR is exactly what a broken observer
+reports.
