@@ -2269,3 +2269,51 @@ tell 0.476 from 0.485 and 0.458 apart.
 Worth noting this is the same shape as the clustering check earlier: both times
 the question was "what is the actual independent unit here?" -- runs rather than
 checkpoints then, match seeds rather than repeat gates now.
+
+## 2026-07-20 ~18:35 — THE SHARED DIRECTION ALONE REPRODUCES THE FULL DAMAGE
+
+Seed-swept the shared probe (9 match seeds, since the gate is deterministic and
+n cannot grow by repetition):
+
+    SHARED probe (9 seeds)   689- 828  n=1517  0.454  [.429,.479]
+    NULL random-direction    2979-3167 n=6146  0.485  [.472,.497]
+    real PPO updates         2394-2837 n=5231  0.458  [.444,.471]
+
+    SHARED vs NULL     : diff=-0.0305  z=-2.14  p=0.033   DIFFERS
+    SHARED vs real PPO : diff=-0.0035  z=-0.24  p=0.811   INDISTINGUISHABLE
+    SHARED vs parity   : z=-3.57  p=0.00036
+
+**The component that every seed agrees on, isolated from all seed-specific
+content and rescaled to a real update's magnitude, is significantly worse than
+random noise and statistically identical to a real PPO update.**
+
+This is the strong-evidence branch of the asymmetry registered at 18:10, and it
+is strong precisely because of the contamination: the probe is only 35%
+true-shared by energy at N=3, and contamination can only pull it TOWARD the
+null level of 0.485. It went the other way, to 0.454. A clean shared direction
+would if anything be worse, not better.
+
+So the damage is not diffuse. It lives in a single, reproducible direction that
+three independently-seeded runs each recovered ~19% of (leave-one-out cosine).
+That direction is an object: it can be computed, inspected, projected out.
+
+### The check that could still overturn this, now running
+
+The residual probes gated 0.441 at seed 11 -- if anything BELOW the null level
+rather than at it. If the residuals are ALSO significantly worse than random,
+then the decomposition localises nothing: the honest conclusion would become
+"any direction derived from a PPO gradient is harmful, shared or not", which is
+a weaker and quite different claim. Seed-sweeping decomp_resid1 now to settle
+it.
+
+Stating the two outcomes before the numbers arrive:
+  * residual indistinguishable from NULL -> the damage is genuinely localised
+    to the shared component. Strongest possible version of tonight's finding.
+  * residual also below NULL -> localisation FAILS; the finding retreats to
+    "PPO-derived directions are harmful, random ones much less so", and the
+    shared/residual split is not the right decomposition.
+
+Note both probes are extrapolations: a residual rescaled up to full update
+magnitude is not a step any run actually took, and neither is the shared
+direction. That is unavoidable in a direction-only comparison, and it is why
+the reference levels matter more than the absolute numbers.
