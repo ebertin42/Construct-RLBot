@@ -9,6 +9,7 @@ download/s) and resumable: `search` pages via the API's `after` cursor,
 """
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,23 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 BASE_URL = "https://ballchasing.com"
+
+
+def load_token() -> str | None:
+    """BALLCHASING_TOKEN from the environment, else parsed from
+    ~/.config/construct/ballchasing.env (a gitignored, mode-600
+    ``export BALLCHASING_TOKEN=<token>`` line). Returns None when neither
+    exists — never raises, never logs the token."""
+    token = os.environ.get("BALLCHASING_TOKEN")
+    if token:
+        return token
+    p = Path.home() / ".config" / "construct" / "ballchasing.env"
+    if not p.is_file():
+        return None
+    for line in p.read_text().splitlines():
+        if "BALLCHASING_TOKEN=" in line:
+            return line.split("BALLCHASING_TOKEN=", 1)[1].strip().strip('"').strip("'")
+    return None
 
 
 class Client:
@@ -64,6 +82,24 @@ class Client:
         """GET /api/replays. Returns (rows, next_cursor); next_cursor is the
         `after` query param parsed out of the response's `next` URL, or None
         when there is no further page."""
+        rows, cursor, _ = self.search_page(
+            min_rank=min_rank, playlist=playlist, count=count, after=after, sort_by=sort_by, **filters
+        )
+        return rows, cursor
+
+    def search_page(
+        self,
+        min_rank: str | None = None,
+        playlist: str | None = None,
+        count: int = 150,
+        after: str | None = None,
+        sort_by: str = "replay-date",
+        **filters: Any,
+    ) -> tuple[list[dict], str | None, int | None]:
+        """Like `search`, but also returns the response's `count` field —
+        the number of replays matching the filters, CAPPED at 10000 by the
+        API (observed live 2026-07: `count` saturates at 10000, so it is only
+        an exact remaining-total once fewer than 10k matches remain)."""
         self._throttle("list")
         params: dict[str, Any] = {"count": count, "sort-by": sort_by}
         if min_rank is not None:
@@ -83,7 +119,7 @@ class Client:
         if next_url:
             qs = parse_qs(urlparse(next_url).query)
             cursor = qs.get("after", [None])[0]
-        return data.get("list", []), cursor
+        return data.get("list", []), cursor, data.get("count")
 
     def download(self, replay_id: str, dest: Path) -> Path:
         """GET /api/replays/{id}/file, streamed to dest/{replay_id}.replay.
@@ -96,9 +132,17 @@ class Client:
 
         dest.mkdir(parents=True, exist_ok=True)
         self._throttle("download")
-        with self._http.stream("GET", f"/api/replays/{replay_id}/file") as resp:
-            resp.raise_for_status()
-            with open(out_path, "wb") as f:
-                for chunk in resp.iter_bytes():
-                    f.write(chunk)
+        # Stream to a .part temp then rename, so a crash mid-download can
+        # never leave a partial file that the skip-if-non-empty check above
+        # would later mistake for a complete replay.
+        part_path = out_path.with_name(out_path.name + ".part")
+        try:
+            with self._http.stream("GET", f"/api/replays/{replay_id}/file") as resp:
+                resp.raise_for_status()
+                with open(part_path, "wb") as f:
+                    for chunk in resp.iter_bytes():
+                        f.write(chunk)
+            part_path.replace(out_path)
+        finally:
+            part_path.unlink(missing_ok=True)
         return out_path

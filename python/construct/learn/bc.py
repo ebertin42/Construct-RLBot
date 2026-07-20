@@ -23,6 +23,17 @@ byte-identical for any thread count (see _iter_shards). Train/val split is
 95/5 by a stable hash of the shard FILENAME (not list order), so the split
 survives re-listing, resharding of other files, and machine moves.
 
+Training batches also get anti-copycat prev-action dropout (train config
+`prev_dropout`, default 0.5): per-sample Bernoulli zeroing of the whole
+5-slot prev ring, applied by `apply_prev_dropout` AFTER batch assembly from
+a dedicated rng seeded off (seed, epoch, 0xD0) -- a separate stream from
+the shuffle/permutation rng above, so dropout never perturbs the shard
+order or in-shard permutation, and `prev_dropout = 0.0` is a true no-op
+(the rng is never even drawn from). It is applied only in `train_epoch`;
+`evaluate()` and any other consumer of `iter_batches` see the real prev
+ring unchanged, and obs_v1's layout is untouched -- deployed/eval-time
+inference always gets real prev actions.
+
 Class weights: one first pass over every shard's `action` array counts the
 92 classes; counts are cached to json next to the data and recomputed only
 if the cache is missing or its shard set (filenames AND byte sizes) no
@@ -40,6 +51,15 @@ env rather than silently training with wrong settings.
 Reference targets (Seer / Rolv BC precedent): val top-1 of ~35-50% on the
 92-way human-action prediction task is NORMAL -- watch per-class recall on
 the rare classes (jump rows, stalls) rather than chasing top-1.
+
+Prev-action dropout exists because of an empirical diagnosis (2026-07-16):
+an epoch-1 net trained without it learned a copycat policy -- 79% of its
+predictions equalled prev[0] (humans repeat their own last action ~70% of
+the time), zeroing the prev ring at eval time collapsed val accuracy from
+69.6% to 19.3%, and closed-loop rollout was barely better than random
+(0.26 touches/min vs a 0.16 random-policy baseline). Randomly blinding the
+net to prev during training (see above) forces it to read entity/query
+game state instead of parroting its own last output.
 """
 
 import glob
@@ -245,6 +265,29 @@ def batch_to_tensors(batch: dict[str, np.ndarray], device) -> dict[str, torch.Te
     }
 
 
+def apply_prev_dropout(batch: dict[str, np.ndarray], p: float,
+                       rng: np.random.Generator) -> dict[str, np.ndarray]:
+    """Anti-copycat regularizer (see module docstring): per-sample
+    Bernoulli(p) zeroing of the whole 5-slot prev-action ring. Training
+    only -- callers must not use this on val/evaluate batches.
+
+    p <= 0.0 is a TRUE no-op: `batch` is returned unchanged and `rng` is
+    never drawn from, so a p=0.0 training run's batch stream is byte-
+    identical to code with no dropout at all. Samples that draw "zero" get
+    a fresh `prev` array (the original batch/shard array is never mutated
+    in place); samples that don't are untouched.
+    """
+    if p <= 0.0:
+        return batch
+    n = batch["action"].shape[0]
+    zero = rng.random(n) < p
+    if not zero.any():
+        return batch
+    prev = batch["prev"].copy()
+    prev[zero] = 0
+    return {**batch, "prev": prev}
+
+
 class BCTrainer:
     def __init__(self, cfg: BCConfig, action_table: np.ndarray):
         self.cfg = cfg
@@ -253,6 +296,13 @@ class BCTrainer:
         self.batch_size = int(t.get("batch_size", 4096))
         self.epochs = int(t.get("epochs", 4))
         self.grad_clip = float(t.get("grad_clip", 1.0))
+        # per-sample prob of zeroing the whole prev ring during TRAINING
+        # only (apply_prev_dropout / train_epoch) -- anti-copycat, see
+        # module docstring. 0.0 disables (byte-identical batch stream).
+        self.prev_dropout = float(t.get("prev_dropout", 0.5))
+        assert 0.0 <= self.prev_dropout <= 1.0, (
+            f"prev_dropout must be in [0, 1], got {self.prev_dropout}"
+        )
         # shard-decompression threads; 1 = synchronous (the old behavior).
         # Any value yields the identical batch stream -- see iter_batches.
         self.loader_threads = max(1, int(t.get("loader_threads", 4)))
@@ -310,11 +360,17 @@ class BCTrainer:
     def train_epoch(self, epoch: int) -> float:
         self.net.train()
         log_every = int(self.cfg.run.get("log_every_batches", 50))
+        # Dedicated stream for prev-action dropout, seeded off (seed, epoch)
+        # like the shuffle rng but salted so it never shares state with it --
+        # drawing from it must not perturb iter_batches' shard/permutation
+        # sequence (see apply_prev_dropout / module docstring).
+        dropout_rng = np.random.default_rng((self.seed, epoch, 0xD0))
         loss_sum = n_sum = 0
         t_last, n_last = time.perf_counter(), 0
         for i, batch in enumerate(iter_batches(
                 self.train_shards, self.batch_size, seed=self.seed, epoch=epoch,
                 loader_threads=self.loader_threads)):
+            batch = apply_prev_dropout(batch, self.prev_dropout, dropout_rng)
             loss, _ = self._loss(batch)
             self.opt.zero_grad()
             loss.backward()

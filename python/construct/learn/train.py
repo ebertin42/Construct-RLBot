@@ -1,6 +1,7 @@
 import os
 import random
 import time
+import tomllib
 
 import numpy as np
 import torch
@@ -70,6 +71,47 @@ def compose_extra_loss(net, batch, *, kickstart, lambda_k, lambda_v,
     return fn
 
 
+def check_win_prob_gamma(reward_cfg, ppo_cfg):
+    """Refuse to train if the shaping gamma differs from the training gamma.
+
+    Potential-based shaping preserves the optimal policy only when the gamma
+    inside `gamma * PHI(s') - PHI(s)` is the SAME gamma the returns are
+    discounted with. A mismatch silently optimises a different objective and
+    produces a run that looks entirely healthy, so this fails loud at startup.
+    """
+    if float(reward_cfg.get("win_prob_weight", 0.0)) == 0.0:
+        return
+    shaping = float(reward_cfg.get("win_prob_gamma", 0.0))
+    training = float(ppo_cfg["gamma"])
+    if abs(shaping - training) > 1e-9:
+        raise ValueError(
+            f"win_prob_gamma ({shaping}) != ppo gamma ({training}). "
+            f"Potential-based shaping only preserves the optimal policy when "
+            f"these are identical; a mismatch trains a different objective and "
+            f"the run will look normal. Fix the reward config."
+        )
+
+
+def check_match_mode_required(reward_cfg, curriculum_cfg):
+    """Refuse win-probability shaping without a match layer.
+
+    PHI is a function of score and remaining clock. With match_mode off there
+    is no score and no clock, PHI is pinned at 0 forever, and the shaping
+    term is identically zero -- so the run trains on nothing at all while every
+    log line looks normal. Fail at startup instead.
+    """
+    if float(reward_cfg.get("win_prob_weight", 0.0)) == 0.0:
+        return
+    if not bool(curriculum_cfg.get("match_mode", False)):
+        raise ValueError(
+            "win_prob_weight is set but the curriculum has match_mode = false. "
+            "Win-probability shaping needs a score and a match clock; without "
+            "them PHI is constant, the shaping term is exactly zero, and the "
+            "run trains on nothing while appearing healthy. "
+            "Use configs/curriculum_v3_match.toml."
+        )
+
+
 class Trainer:
     def __init__(self, cfg: TrainConfig, _state: dict | None = None):
         self.cfg = cfg
@@ -92,6 +134,23 @@ class Trainer:
                     "kickstart teacher ([kickstart].teacher / "
                     "resume_train.py --kickstart-teacher) instead."
                 )
+        # Objective guards (T5): load the reward and curriculum configs as
+        # dicts (cfg only carries their paths -- the engine consumes the
+        # paths directly, nothing on the Python side parsed them before this)
+        # and fail loud on combinations that would silently train the wrong
+        # objective. Both checks are inert (no-op) whenever win-prob shaping
+        # is off, i.e. every historical reward config -- see each function's
+        # docstring for the failure mode it closes. Placed before any
+        # engine/net construction so a bad config never wastes GPU time.
+        with open(cfg.reward_config_path, "rb") as f:
+            reward_cfg = tomllib.load(f)
+        curriculum_cfg = {}
+        if cfg.curriculum_config_path:
+            with open(cfg.curriculum_config_path, "rb") as f:
+                curriculum_cfg = tomllib.load(f)
+        check_win_prob_gamma(reward_cfg, cfg.ppo)
+        check_match_mode_required(reward_cfg, curriculum_cfg)
+
         # Kickstart distillation (T7): only meaningful for a v1-schema run
         # with a [kickstart] block that names a teacher (the config template
         # ships with `teacher` commented out, so a bare `steps=` block stays

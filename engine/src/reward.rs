@@ -1,7 +1,7 @@
 use rocketsim_rs::{sim::Team, GameState};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct RewardConfig {
     pub goal: f32,
     pub touch: f32,
@@ -20,12 +20,50 @@ pub struct RewardConfig {
     pub team_spirit: f32,
     #[serde(default)]
     pub opp_spirit: f32,
+    /// Potential-based match-win shaping (task #56 Phase 1). Zero in every
+    /// pre-v5 config, which is what keeps those configs bit-identical.
+    #[serde(default)]
+    pub win_prob_weight: f32,
+    /// Logistic slope at full clock; see `win_prob`.
+    #[serde(default)]
+    pub win_prob_k_base: f32,
+    /// Lower bound on `t_frac` in the slope denominator, so `k` stays finite.
+    #[serde(default)]
+    pub win_prob_t_floor: f32,
+    /// MUST equal the trainer's `[ppo] gamma`. Any other value breaks the
+    /// potential-based guarantee that the optimum is unchanged. Checked at
+    /// trainer startup — see `python/construct/learn/train.py`.
+    #[serde(default)]
+    pub win_prob_gamma: f32,
 }
 
 impl RewardConfig {
     pub fn load(path: &str) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-        toml::from_str(&text).map_err(|e| format!("{path}: {e}"))
+        let cfg: RewardConfig = toml::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
+        cfg.validate().map_err(|e| format!("{path}: {e}"))?;
+        Ok(cfg)
+    }
+
+    /// Reject half-configured shaping. With `win_prob_weight` set but
+    /// `k_base`/`t_floor` left at their zero defaults, PHI collapses to a
+    /// constant 0.5, the shaping term is identically zero, and the run trains
+    /// on nothing while looking entirely normal.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.win_prob_weight == 0.0 {
+            return Ok(());
+        }
+        if self.win_prob_k_base <= 0.0 {
+            return Err(format!(
+                "win_prob_weight={} but win_prob_k_base={}: PHI would be a \
+                 constant 0.5 and the shaping term identically zero",
+                self.win_prob_weight, self.win_prob_k_base));
+        }
+        if !(0.0..1.0).contains(&self.win_prob_t_floor) || self.win_prob_t_floor <= 0.0 {
+            return Err(format!(
+                "win_prob_t_floor={} must be in (0,1)", self.win_prob_t_floor));
+        }
+        Ok(())
     }
 }
 
@@ -134,6 +172,83 @@ pub fn compute(
     r
 }
 
+/// Win probability in [0,1] from the perspective of a team leading by
+/// `score_diff`, with `t_frac` of the match clock remaining (1.0 at kickoff,
+/// 0.0 at the final whistle).
+///
+/// The slope sharpens as the clock runs down: a one-goal lead is nearly
+/// meaningless at kickoff and nearly decisive with seconds left. `t_floor`
+/// caps that sharpening so `k` stays finite at t_frac = 0.
+///
+/// This is a POTENTIAL, not a reward. Its accuracy affects only how fast the
+/// policy learns, never what it converges to (Ng, Harada & Russell 1999), so a
+/// crude analytic form is a legitimate starting point.
+pub fn win_prob(score_diff: i32, t_frac: f32, k_base: f32, t_floor: f32) -> f32 {
+    let k = k_base / t_frac.max(t_floor);
+    1.0 / (1.0 + (-k * score_diff as f32).exp())
+}
+
+/// The POTENTIAL used for shaping: `win_prob` recentred to [-0.5, +0.5].
+///
+/// The recentring is load-bearing. A raw sigmoid gives
+/// `PHI_orange = 1 - PHI_blue`, not `-PHI_blue`, so the two teams' shaping sums
+/// to `w*(gamma-1)` rather than zero -- a constant -0.046/step at the live
+/// gamma, -207 across a match, which rewards ending episodes early. Recentring
+/// makes the negation exact and the shaped game zero-sum at ANY gamma, and
+/// costs nothing: a constant shift leaves potential-based shaping
+/// potential-based, so the per-agent Ng guarantee is untouched.
+pub fn win_potential(score_diff: i32, t_frac: f32, k_base: f32, t_floor: f32) -> f32 {
+    win_prob(score_diff, t_frac, k_base, t_floor) - 0.5
+}
+
+/// Score and clock for one arena's current match. Phase 1 keeps this out of
+/// the observation entirely (see the spec): it feeds the reward only.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MatchState {
+    pub score_blue: u32,
+    pub score_orange: u32,
+    /// Fraction of the match clock remaining: 1.0 at kickoff, 0.0 at the whistle.
+    pub t_frac: f32,
+}
+
+impl MatchState {
+    /// Goals ahead from `team`'s point of view. Signed, so the two teams'
+    /// values are exact negations of each other -- necessary but not
+    /// sufficient for the shaped game to be zero-sum. That additionally
+    /// requires the potential to satisfy PHI_orange = -PHI_blue, which is
+    /// what `win_potential`'s recentring provides (see its doc comment).
+    pub fn score_diff(&self, team: Team) -> i32 {
+        let (mine, theirs) = match team {
+            Team::Blue => (self.score_blue, self.score_orange),
+            Team::Orange => (self.score_orange, self.score_blue),
+        };
+        mine as i32 - theirs as i32
+    }
+}
+
+/// Potential-based shaping: `w * (gamma * PHI(s') - PHI(s))`.
+///
+/// Summed over a match this telescopes to `w * (PHI(end) - PHI(start))` when
+/// gamma == 1, and to a discounted equivalent otherwise — i.e. it delivers the
+/// match outcome as dense per-step signal, each piece landing at the moment the
+/// game state actually changes rather than 4500 steps later where the discount
+/// would erase it.
+pub fn win_prob_shaping(
+    prev: &MatchState,
+    cur: &MatchState,
+    team: Team,
+    gamma: f32,
+    cfg: &RewardConfig,
+) -> f32 {
+    if cfg.win_prob_weight == 0.0 {
+        return 0.0;
+    }
+    let phi = |m: &MatchState| {
+        win_potential(m.score_diff(team), m.t_frac, cfg.win_prob_k_base, cfg.win_prob_t_floor)
+    };
+    cfg.win_prob_weight * (gamma * phi(cur) - phi(prev))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +266,7 @@ mod tests {
             offensive_potential: 0.0,
             team_spirit: 0.0,
             opp_spirit: 0.0,
+            ..Default::default()
         }
     }
 
@@ -276,6 +392,7 @@ mod tests {
             offensive_potential: 0.3,
             team_spirit: 0.0,
             opp_spirit: 0.0,
+            ..Default::default()
         }
     }
 
@@ -454,5 +571,321 @@ mod tests {
         let v0 = RewardConfig::load("../configs/reward_v0.toml").unwrap();
         assert_eq!(v0.team_spirit, 0.0);
         assert_eq!(v0.opp_spirit, 0.0);
+    }
+
+    // --- reward v4: symmetric zero-sum regime ---
+    // (levers-roadmap-2026-07-19.md lever #3; configs/reward_v4.toml has the full
+    // WHY. v3's +10/-8 asymmetry bred a positive-sum goal-trading exploit; v3.1's
+    // +10/-12 fix bred an avoidance equilibrium instead. v4's fix is symmetric
+    // goal/concede (aggression_bias = 0.0) PLUS full zero-sum opponent-subtraction
+    // (opp_spirit = 1.0) via episode::blend_team_spirit, applied to the whole
+    // per-step reward (goal + shaping), not just the goal term.)
+    use crate::episode::blend_team_spirit;
+
+    #[test]
+    fn v4_toml_matches_documented_design() {
+        // Guards against silent typos in configs/reward_v4.toml: every field must
+        // match the design documented in that file's header comments.
+        let c = RewardConfig::load("../configs/reward_v4.toml").unwrap();
+        assert_eq!(c.goal, 10.0);
+        assert_eq!(c.touch, 0.0);
+        assert_eq!(c.vel_to_ball, 0.05);
+        assert_eq!(c.aggression_bias, 0.0, "symmetric goal/concede is the whole point");
+        assert_eq!(c.touch_accel, 0.0);
+        assert_eq!(c.vel_ball_to_goal, 0.0);
+        assert_eq!(c.offensive_potential, 0.0);
+        assert_eq!(c.team_spirit, 0.3);
+        assert_eq!(c.opp_spirit, 1.0, "full zero-sum opponent subtraction is the fix");
+    }
+
+    // Test 1 (brief): with the real v4 config loaded, a 1v1 step where blue scores
+    // must produce a post-blend reward vector that sums to ~0, and specifically
+    // +20 / -20 (goal scale doubles under opp_spirit=1.0 — see config header).
+    // Composes reward::compute (raw, per-agent) with episode::blend_team_spirit
+    // (team/opponent blending), exactly as EpisodeArena::step does internally.
+    #[test]
+    fn v4_zero_sum_on_goal_event() {
+        ensure_init(None);
+        let cfg = RewardConfig::load("../configs/reward_v4.toml").unwrap();
+        let mut arena = Arena::default_standard();
+        arena.pin_mut().add_car(Team::Blue, CarConfig::octane());
+        arena.pin_mut().add_car(Team::Orange, CarConfig::octane());
+        arena.pin_mut().reset_to_random_kickoff(Some(1));
+        let gs = arena.pin_mut().get_game_state();
+        // Kickoff spawn velocity is 0, so vel_to_ball's shaping term is exactly 0
+        // here (proj = dot(vel, dir)/dist = 0) — the raw per-agent reward below is
+        // driven purely by the goal term, matching the config header's ±10 claim
+        // exactly rather than approximately.
+        let blue_idx = gs.cars.iter().position(|c| c.team == Team::Blue).unwrap();
+        let orange_idx = gs.cars.iter().position(|c| c.team == Team::Orange).unwrap();
+
+        let raw_blue = compute(&gs, &gs, blue_idx, Some(Team::Blue), &cfg);
+        let raw_orange = compute(&gs, &gs, orange_idx, Some(Team::Blue), &cfg);
+        assert_eq!(raw_blue, 10.0, "symmetric score, no shaping at kickoff velocity");
+        assert_eq!(raw_orange, -10.0, "symmetric concede, no shaping at kickoff velocity");
+
+        // blue_count = 1 (agent order: blue then orange, matching EpisodeArena's
+        // car_ids convention documented on that struct).
+        let mut rewards = [raw_blue, raw_orange];
+        blend_team_spirit(&mut rewards, 1, cfg.team_spirit, cfg.opp_spirit);
+
+        assert!((rewards[0] - 20.0).abs() < 1e-4, "scorer should net +20, got {}", rewards[0]);
+        assert!((rewards[1] - (-20.0)).abs() < 1e-4, "conceder should net -20, got {}", rewards[1]);
+        assert!(
+            (rewards[0] + rewards[1]).abs() < 1e-4,
+            "post-blend reward vector must sum to ~0 (zero-sum), got {} + {} = {}",
+            rewards[0],
+            rewards[1],
+            rewards[0] + rewards[1]
+        );
+    }
+
+    // Test 2 (brief): the regression test that pins WHY v4 exists. Simulates the
+    // goal-trading exploit arithmetically for two alternating goal events (blue
+    // scores, then orange scores) under both the real v3 config and the real v4
+    // config.
+    //
+    // v3 side deliberately uses v3's RAW (unblended) goal/concede reward — i.e.
+    // opp_spirit treated as 0 here, NOT v3.toml's actual opp_spirit=0.3 — because
+    // the historical trading-exploit diagnosis (journal 2026-07-18 09:40, commit
+    // aa560ab; "partners alternate goals, each netting +2 per exchange") was the
+    // pure asymmetric goal/concede arithmetic, independent of team-spirit
+    // blending (a separate mechanism: per-teammate reward pooling, orthogonal to
+    // the goal/concede skew that caused the exploit). This isolates the exact
+    // mechanism v4 fixes.
+    //
+    // v4 side uses the REAL config end-to-end, including its opp_spirit=1.0
+    // blend, because the blend IS the fix being tested.
+    #[test]
+    fn trading_is_unprofitable_under_v4_but_not_v3() {
+        let v3 = RewardConfig::load("../configs/reward_v3.toml").unwrap();
+        let v4 = RewardConfig::load("../configs/reward_v4.toml").unwrap();
+
+        // Sanity-pin the raw numbers the brief's design is stated in terms of.
+        assert_eq!(v3.goal, 10.0);
+        assert_eq!(v3.aggression_bias, 0.2);
+        let v3_concede = -v3.goal * (1.0 - v3.aggression_bias);
+        assert!((v3_concede - (-8.0)).abs() < 1e-5, "v3 concede should be -8.0, got {v3_concede}");
+
+        // --- v3: raw (unblended) arithmetic, opp_spirit treated as 0 ---
+        // Event A: blue scores (+goal for blue, concede for orange).
+        // Event B: orange scores (+goal for orange, concede for blue).
+        let v3_blue_net = v3.goal + v3_concede; // score then concede
+        let v3_orange_net = v3_concede + v3.goal; // concede then score
+        assert!((v3_blue_net - 2.0).abs() < 1e-5, "v3 blue should net +2/exchange, got {v3_blue_net}");
+        assert!(
+            (v3_orange_net - 2.0).abs() < 1e-5,
+            "v3 orange should net +2/exchange, got {v3_orange_net}"
+        );
+        // Positive-sum: both sides profit from trading regardless of cooperation.
+        assert!(v3_blue_net > 0.0 && v3_orange_net > 0.0);
+
+        // --- v4: real config end-to-end, including its zero-sum blend ---
+        assert_eq!(v4.goal, 10.0);
+        assert_eq!(v4.aggression_bias, 0.0);
+        let v4_concede = -v4.goal * (1.0 - v4.aggression_bias);
+        assert!((v4_concede - (-10.0)).abs() < 1e-5);
+
+        // Event A: blue scores.
+        let mut event_a = [v4.goal, v4_concede]; // [blue, orange]
+        blend_team_spirit(&mut event_a, 1, v4.team_spirit, v4.opp_spirit);
+        // Event B: orange scores.
+        let mut event_b = [v4_concede, v4.goal]; // [blue, orange]
+        blend_team_spirit(&mut event_b, 1, v4.team_spirit, v4.opp_spirit);
+
+        let v4_blue_net = event_a[0] + event_b[0];
+        let v4_orange_net = event_a[1] + event_b[1];
+        assert!(
+            v4_blue_net.abs() < 1e-4,
+            "v4 blue should net exactly 0.0/exchange, got {v4_blue_net}"
+        );
+        assert!(
+            v4_orange_net.abs() < 1e-4,
+            "v4 orange should net exactly 0.0/exchange, got {v4_orange_net}"
+        );
+    }
+
+    // --- win_prob: pure potential for match-win shaping (Task 1) ---
+    const K: f32 = 0.6;
+    const TF: f32 = 0.05;
+
+    #[test]
+    fn win_prob_is_half_at_level_score_for_every_clock() {
+        // A tied game is a coin flip whatever the clock says. If this drifts,
+        // kickoff carries a bias and the shaped game is no longer zero-sum.
+        for t in [1.0, 0.75, 0.5, 0.25, 0.0] {
+            assert!((super::win_prob(0, t, K, TF) - 0.5).abs() < 1e-6, "t_frac={t}");
+        }
+    }
+
+    #[test]
+    fn win_prob_is_complementary_between_teams() {
+        for d in [-3, -1, 0, 1, 3] {
+            for t in [1.0, 0.5, 0.1] {
+                let a = super::win_prob(d, t, K, TF);
+                let b = super::win_prob(-d, t, K, TF);
+                assert!((a + b - 1.0).abs() < 1e-6, "d={d} t={t}: {a} + {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_lead_is_worth_more_as_the_clock_runs_down() {
+        let early = super::win_prob(1, 0.9, K, TF);
+        let late = super::win_prob(1, 0.1, K, TF);
+        assert!(late > early, "late {late} should exceed early {early}");
+    }
+
+    #[test]
+    fn win_prob_stays_bounded_at_zero_time() {
+        // t_floor is what stops k blowing up in the final tick.
+        let v = super::win_prob(5, 0.0, K, TF);
+        assert!(v.is_finite() && (0.0..=1.0).contains(&v), "got {v}");
+    }
+
+    #[test]
+    fn win_potential_is_zero_at_level_score_for_every_clock() {
+        for t in [1.0, 0.75, 0.5, 0.25, 0.0] {
+            let v = super::win_potential(0, t, K, TF);
+            assert!(v.abs() < 1e-6, "t_frac={t}: got {v}");
+        }
+    }
+
+    #[test]
+    fn win_potential_negates_exactly_between_teams() {
+        // This is the property the recentring buys: PHI(-d) == -PHI(d), so
+        // Team::Orange's potential is the exact negation of Team::Blue's and
+        // the shaped game is zero-sum at any gamma.
+        for d in [-3, -1, 0, 1, 3] {
+            for t in [1.0, 0.5, 0.1, 0.0] {
+                let a = super::win_potential(d, t, K, TF);
+                let b = super::win_potential(-d, t, K, TF);
+                assert!((a + b).abs() < 1e-6, "d={d} t={t}: {a} + {b} != 0");
+            }
+        }
+    }
+
+    // --- MatchState + win_prob_shaping: Task 2 (load-bearing) ---
+
+    fn v5_cfg() -> super::RewardConfig {
+        let mut c = super::RewardConfig {
+            goal: 0.0, touch: 0.0, vel_to_ball: 0.0,
+            ..Default::default()
+        };
+        c.win_prob_weight = 1.0;
+        c.win_prob_k_base = 0.6;
+        c.win_prob_t_floor = 0.05;
+        c.win_prob_gamma = 1.0; // gamma=1 makes the telescoping exact and checkable
+        c
+    }
+
+    fn ms(b: u32, o: u32, t: f32) -> super::MatchState {
+        super::MatchState { score_blue: b, score_orange: o, t_frac: t }
+    }
+
+    #[test]
+    fn shaping_telescopes_to_the_match_outcome() {
+        // THE load-bearing test. Walk a whole match as a sequence of states and
+        // sum the per-step shaped rewards; the total must equal the change in
+        // potential from first state to last. If this fails, the shaping is not
+        // potential-based and the optimum is no longer match-winning.
+        let cfg = v5_cfg();
+        let path = [
+            ms(0, 0, 1.00), ms(0, 0, 0.80), ms(1, 0, 0.80), ms(1, 0, 0.50),
+            ms(1, 1, 0.50), ms(1, 1, 0.20), ms(2, 1, 0.20), ms(2, 1, 0.00),
+        ];
+        let mut total = 0.0f32;
+        for w in path.windows(2) {
+            total += super::win_prob_shaping(&w[0], &w[1], Team::Blue, cfg.win_prob_gamma, &cfg);
+        }
+        let first = super::win_prob(path[0].score_diff(Team::Blue), path[0].t_frac,
+                                   cfg.win_prob_k_base, cfg.win_prob_t_floor);
+        let last = super::win_prob(path[path.len() - 1].score_diff(Team::Blue),
+                                   path[path.len() - 1].t_frac,
+                                   cfg.win_prob_k_base, cfg.win_prob_t_floor);
+        assert!((total - (last - first)).abs() < 1e-5,
+                "sum {total} != PHI(end)-PHI(start) {}", last - first);
+    }
+
+    #[test]
+    fn shaping_is_zero_sum_between_teams() {
+        // Must hold at every gamma, not just gamma=1.0 -- the raw sigmoid
+        // (PHI_orange = 1 - PHI_blue, not -PHI_blue) only telescoped to zero
+        // by coincidence at gamma=1.0, which is not the production value.
+        // 0.9954 is the live gamma; the rest are sanity bracketing.
+        for gamma in [0.9954, 1.0, 0.99, 0.9, 0.5] {
+            let mut cfg = v5_cfg();
+            cfg.win_prob_gamma = gamma;
+            let (a, b) = (ms(0, 0, 0.5), ms(1, 0, 0.5));
+            let blue = super::win_prob_shaping(&a, &b, Team::Blue, gamma, &cfg);
+            let orange = super::win_prob_shaping(&a, &b, Team::Orange, gamma, &cfg);
+            assert!((blue + orange).abs() < 1e-6,
+                    "gamma={gamma}: blue {blue} + orange {orange} != 0");
+        }
+    }
+
+    #[test]
+    fn conceding_pays_negative_and_scoring_pays_positive() {
+        let cfg = v5_cfg();
+        let scored = super::win_prob_shaping(&ms(0, 0, 0.5), &ms(1, 0, 0.5),
+                                             Team::Blue, cfg.win_prob_gamma, &cfg);
+        let conceded = super::win_prob_shaping(&ms(0, 0, 0.5), &ms(0, 1, 0.5),
+                                               Team::Blue, cfg.win_prob_gamma, &cfg);
+        assert!(scored > 0.0, "scoring should pay positive, got {scored}");
+        assert!(conceded < 0.0, "conceding should pay negative, got {conceded}");
+    }
+
+    #[test]
+    fn a_late_goal_pays_more_than_an_early_one() {
+        // The whole point of the clock term: the same 0-0 -> 1-0 transition is
+        // worth more with 10% of the match left than with 90% left.
+        let cfg = v5_cfg();
+        let early = super::win_prob_shaping(&ms(0, 0, 0.9), &ms(1, 0, 0.9),
+                                            Team::Blue, cfg.win_prob_gamma, &cfg);
+        let late = super::win_prob_shaping(&ms(0, 0, 0.1), &ms(1, 0, 0.1),
+                                           Team::Blue, cfg.win_prob_gamma, &cfg);
+        assert!(late > early, "late {late} should exceed early {early}");
+    }
+
+    #[test]
+    fn zero_weight_makes_shaping_inert() {
+        // reward_v0/v3/v4_1 have no win_prob keys -> weight defaults to 0 -> the
+        // term must contribute exactly nothing, so historical configs behave
+        // bit-identically.
+        let mut cfg = v5_cfg();
+        cfg.win_prob_weight = 0.0;
+        let r = super::win_prob_shaping(&ms(0, 0, 0.5), &ms(1, 0, 0.5),
+                                        Team::Blue, cfg.win_prob_gamma, &cfg);
+        assert_eq!(r, 0.0);
+    }
+
+    #[test]
+    fn historical_reward_configs_still_parse_with_defaulted_win_prob_keys() {
+        for p in ["../configs/reward_v0.toml", "../configs/reward_v3.toml",
+                  "../configs/reward_v4_1.toml"] {
+            let c = super::RewardConfig::load(p).unwrap_or_else(|e| panic!("{p}: {e}"));
+            assert_eq!(c.win_prob_weight, 0.0, "{p} must default win_prob_weight to 0");
+        }
+    }
+
+    #[test]
+    fn half_configured_shaping_is_rejected_not_silently_inert() {
+        let mut c = v5_cfg();
+        c.win_prob_k_base = 0.0;
+        assert!(c.validate().is_err(), "must reject weight-without-slope");
+    }
+
+    #[test]
+    fn zero_t_floor_is_rejected() {
+        let mut c = v5_cfg();
+        c.win_prob_t_floor = 0.0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn shaping_off_needs_no_other_keys() {
+        let c = super::RewardConfig { goal: 10.0, touch: 0.0, vel_to_ball: 0.0,
+                                      ..Default::default() };
+        assert!(c.validate().is_ok(), "historical configs must validate");
     }
 }

@@ -70,19 +70,29 @@ fn no_curriculum_means_kickoff_only() {
     let mut a = mk(None, 3);
     for _ in 0..5 {
         let gs = a.game_state();
-        assert!(gs.ball.pos.x.abs() < 1.0 && gs.ball.pos.y.abs() < 1.0, "kickoff ball at center");
+        assert!(gs.ball.pos.x.abs() < 12.0 && gs.ball.pos.y.abs() < 12.0, "kickoff ball near center (±10uu jitter)");
         a.debug_force_reset();
     }
 }
 
-// Legacy bit-identity: a fresh no-curriculum EpisodeArena's constructor kickoff
-// must be byte-for-byte the same as a raw RocketSim arena kicked off with the RAW
-// engine seed (the LCG seed advance happens only between episodes, never before
-// the first). Pins the pre-curriculum behavior against the actual RocketSim
-// reference rather than magic numbers.
+// Kickoff formation + jitter bound: a fresh no-curriculum EpisodeArena's
+// constructor kickoff starts from the SAME RocketSim kickoff formation as a
+// raw arena kicked off with the RAW engine seed (the LCG seed advance
+// happens only between episodes, never before the first) — this was
+// previously bit-identical, but kickoff spawn jitter (episode.rs's
+// `jitter_kickoff_spawns`, added to break the symmetric car-car-ball pinch
+// that was manufacturing solver blowups nearly every kickoff) now adds small
+// independent per-car x/y + yaw noise on top of it. The ball is never
+// jittered (stays bit-identical); car positions must land within the
+// documented jitter bound. Pins the post-jitter behavior against the actual
+// RocketSim reference rather than magic numbers.
 #[test]
-fn constructor_kickoff_bit_identical_to_raw_arena() {
+fn constructor_kickoff_matches_raw_arena_within_jitter_bounds() {
     use rocketsim_rs::sim::{Arena, CarConfig, Team};
+
+    // Mirrors episode.rs's KICKOFF_JITTER_POS (private to that module — kept
+    // in sync here rather than exposed as a public constant just for this).
+    const KICKOFF_JITTER_POS: f32 = 150.0;
 
     ensure_init(None);
     let s = Schema::load("../schema/v0.toml").unwrap();
@@ -96,10 +106,22 @@ fn constructor_kickoff_bit_identical_to_raw_arena() {
     raw.pin_mut().reset_to_random_kickoff(Some(42));
     let gr = raw.pin_mut().get_game_state();
 
-    assert_eq!(gs.ball.pos, gr.ball.pos, "ball pos differs from raw seed-42 kickoff");
+    // Ball spawn now carries ±10uu horizontal jitter (the decisive symmetry
+    // breaker); z stays exact.
+    assert!((gs.ball.pos.x - gr.ball.pos.x).abs() <= 10.0 + 1e-3, "ball x beyond jitter bound");
+    assert!((gs.ball.pos.y - gr.ball.pos.y).abs() <= 10.0 + 1e-3, "ball y beyond jitter bound");
+    assert_eq!(gs.ball.pos.z, gr.ball.pos.z, "ball z must be exact");
     assert_eq!(gs.cars.len(), gr.cars.len());
     for (c, r) in gs.cars.iter().zip(gr.cars.iter()) {
-        assert_eq!(c.state.pos, r.state.pos, "car {} pos differs from raw seed-42 kickoff", c.id);
+        let dx = c.state.pos.x - r.state.pos.x;
+        let dy = c.state.pos.y - r.state.pos.y;
+        assert!(
+            dx.abs() <= KICKOFF_JITTER_POS + 1e-3 && dy.abs() <= KICKOFF_JITTER_POS + 1e-3,
+            "car {} jittered pos too far from raw seed-42 kickoff: dx={dx} dy={dy}",
+            c.id
+        );
+        // z is never jittered (grounded kickoff rest height is untouched).
+        assert_eq!(c.state.pos.z, r.state.pos.z, "car {} z must be untouched by jitter", c.id);
     }
 }
 
@@ -113,4 +135,41 @@ fn stepping_after_random_reset_is_stable() {
         a.step(&[0, 45], &mut r, &mut f, &mut fo);
         assert!(r.iter().all(|x| x.is_finite()));
     }
+}
+
+/// The rollback path: `replay_weight = 0` must not pay for a pool it can never
+/// draw from. The section is deliberately left in place — an operator disabling
+/// the lever edits one number, not the whole config.
+#[test]
+fn zero_replay_weight_skips_the_pool_load() {
+    let p = std::env::temp_dir().join("construct_curriculum_replay_off.toml");
+    std::fs::write(
+        &p,
+        "kickoff_weight = 0.4\nrandom_weight = 0.6\nreplay_weight = 0.0\n\n\
+         [replay_pool]\npath = \"tests/fixtures/reset_pool_mini.jsonl\"\n",
+    )
+    .unwrap();
+    let c = CurriculumConfig::load(p.to_str().unwrap()).unwrap();
+    assert!(
+        c.pool.is_empty(),
+        "a zero replay weight must skip the load entirely, got {} states",
+        c.pool.len()
+    );
+    // The section itself is still parsed, so flipping the weight back is a
+    // one-line edit rather than a re-add.
+    assert!(c.replay_pool.is_some(), "the [replay_pool] section must still parse");
+    let _ = std::fs::remove_file(&p);
+
+    // And the same file with a nonzero weight really does load, so the test
+    // above is about the weight and not about a broken fixture path.
+    let q = std::env::temp_dir().join("construct_curriculum_replay_on.toml");
+    std::fs::write(
+        &q,
+        "kickoff_weight = 0.4\nrandom_weight = 0.6\nreplay_weight = 0.1\n\n\
+         [replay_pool]\npath = \"tests/fixtures/reset_pool_mini.jsonl\"\n",
+    )
+    .unwrap();
+    let on = CurriculumConfig::load(q.to_str().unwrap()).unwrap();
+    assert!(!on.pool.is_empty(), "nonzero replay weight must load the same fixture");
+    let _ = std::fs::remove_file(&q);
 }

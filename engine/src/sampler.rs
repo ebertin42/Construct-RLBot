@@ -13,7 +13,10 @@ impl Pcg32 {
         s
     }
 
-    fn next_u32(&mut self) -> u32 {
+    /// `pub(crate)` for `episode::reset_episode`'s replay-pool index: deriving
+    /// it from `next_f32` instead can round up to exactly `len` in f32 at
+    /// million-element pool sizes and panic out of bounds.
+    pub(crate) fn next_u32(&mut self) -> u32 {
         let old = self.state;
         self.state = old.wrapping_mul(6364136223846793005).wrapping_add(self.inc);
         let xorshifted = (((old >> 18) ^ old) >> 27) as u32;

@@ -11,10 +11,17 @@
 //!
 //! ## Array layout
 //! - `ball` `[T, 13]`: pos3, vel3, ang_vel3, quat4 (`[x,y,z,w]`).
-//! - `cars_state` `[T, P, 17]`: pos3, vel3, ang_vel3, quat4, boost (0..1),
-//!   on_ground (0/1), demoed (0/1), has_flip (0/1, v4). `P` =
-//!   `player_teams.len()`, same car order as `player_teams` and
-//!   `cars_action`.
+//! - `cars_state` `[T, P, 18]`: pos3, vel3, ang_vel3, quat4, boost (0..1),
+//!   on_ground (0/1), demoed (0/1), has_flip (0/1, v4), is_demoed (0/1, v5).
+//!   `P` = `player_teams.len()`, same car order as `player_teams` and
+//!   `cars_action`. `demoed` (col 15) is the SIM car's post-step
+//!   `CarState::is_demoed`; `is_demoed` (col 17) is the authoritative
+//!   replay-frame demolished/absent flag (`Tick::replay_demoed` — the
+//!   player had no frame data and their last-known state was carried
+//!   forward). They agree in practice now that `reconstruct::set_car_state`
+//!   propagates the replay flag into the sim, but col 17 is the one sourced
+//!   directly from the replay and is what BC loaders should use to skip
+//!   dead-car samples.
 //! - `cars_action` `[T, P, 8]`: throttle, steer, pitch, yaw, roll, jump,
 //!   boost, handbrake (jump/boost/handbrake as 0.0/1.0) — the applied
 //!   `CarControls` for that tick's 30 Hz interval (see `Tick::actions`).
@@ -50,14 +57,25 @@
 //!   `(state[i], state[i+1]) -> action[i]` IDM pairs must drop the pair
 //!   whenever `is_boundary[i+1] == 1` — that transition is a fresh step from
 //!   a re-snapped arena, not `action[i]` applied to `state[i]`.
+//! - `episode_marker` `[T]` (`u8`, 0/1, v5): 1 iff this is the first STORED
+//!   tick at/after a goal-reset/kickoff boundary in the source replay, else
+//!   0. Derived from `Tick::episode_marker` (see its doc for the dead-ball
+//!   detection rule: first frame of each maximal run with the ball pinned to
+//!   the center axis and no horizontal motion). Subsampling-safe: a marker
+//!   on a tick that `stride` skips is carried forward (OR-aggregated) onto
+//!   the next stored tick, so no boundary is ever lost to subsampling.
+//!   Consumers (bc-export's prev-action ring, IDM pairing) must treat a
+//!   marker row as a history discontinuity — the cars were teleported to
+//!   kickoff positions somewhere between the previous stored row and this
+//!   one's episode boundary.
 //!
-//! `cars_state`'s column count is 17 as of schema v4 (pos3+vel3+ang_vel3+
-//! quat4 = 13, +boost+on_ground+demoed+has_flip = 17) — every field is kept
-//! because IDM/BC need `demoed` to mask dead-car ticks, `on_ground` for the
-//! aerial-vs-grounded action split, and `has_flip` for the action-projection
-//! context gate (Task B2). The sidecar's `cars_state_columns` is the source
-//! of truth; consumers should assert against its length rather than
-//! hardcoding a column count.
+//! `cars_state`'s column count is 18 as of schema v5 (pos3+vel3+ang_vel3+
+//! quat4 = 13, +boost+on_ground+demoed+has_flip = 17 (v4), +is_demoed = 18)
+//! — every field is kept because IDM/BC need `demoed`/`is_demoed` to mask
+//! dead-car ticks, `on_ground` for the aerial-vs-grounded action split, and
+//! `has_flip` for the action-projection context gate (Task B2). The
+//! sidecar's `cars_state_columns` is the source of truth; consumers should
+//! assert against its length rather than hardcoding a column count.
 //!
 //! `T`/`P` == 0 (empty reconstruction, e.g. a replay with no players or no
 //! usable ticks) is treated as a hard error rather than writing an empty
@@ -105,17 +123,36 @@ use crate::{
 /// every v4 shard written after this change carries the new array. A future
 /// schema change that touches an EXISTING v4 array (rather than adding a
 /// new one) should still bump to v5.
-pub const SHARD_SCHEMA_VERSION: u32 = 4;
+///
+/// v5 (closes task #45 + 2026-07-18 findings, gaps 1–2): added `is_demoed`
+/// to `cars_state` (17 -> 18 columns; the replay-frame demolished/absent
+/// flag, see the module doc — before this, demoed players appeared as
+/// frozen live cars because `reconstruct::set_car_state` never wrote
+/// `is_demoed` to the sim, so the v4 `demoed` column was always 0), plus a
+/// new `episode_marker` `[T]` u8 array marking the first stored tick
+/// at/after each goal-reset/kickoff so BC loaders can reset their
+/// prev-action history instead of carrying pre-goal actions across
+/// kickoffs. Bumped (unlike B2's addition) because v5 also changes an
+/// EXISTING column's values: `cars_state`'s `demoed` (col 15) now actually
+/// carries the sim demoed state.
+pub const SHARD_SCHEMA_VERSION: u32 = 5;
 
 pub const BALL_COLUMNS: [&str; 13] = [
     "pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z", "ang_vel_x", "ang_vel_y", "ang_vel_z",
     "quat_x", "quat_y", "quat_z", "quat_w",
 ];
 
-pub const CARS_STATE_COLUMNS: [&str; 17] = [
+pub const CARS_STATE_COLUMNS: [&str; 18] = [
     "pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z", "ang_vel_x", "ang_vel_y", "ang_vel_z",
-    "quat_x", "quat_y", "quat_z", "quat_w", "boost", "on_ground", "demoed", "has_flip",
+    "quat_x", "quat_y", "quat_z", "quat_w", "boost", "on_ground", "demoed", "has_flip", "is_demoed",
 ];
+
+/// One-line semantics of the v5 `episode_marker` array, recorded in the
+/// sidecar so a shard is self-describing without this crate's docs.
+pub const EPISODE_MARKER_DOC: &str = "u8 [T]; 1 = first stored tick at/after a goal-reset/kickoff \
+    (dead-ball run start: ball pinned to center axis, no horizontal motion; markers on \
+    stride-skipped ticks carry forward to the next stored tick). Consumers must reset any \
+    action-history window at marker rows.";
 
 pub const CARS_ACTION_COLUMNS: [&str; 8] =
     ["throttle", "steer", "pitch", "yaw", "roll", "jump", "boost", "handbrake"];
@@ -157,6 +194,9 @@ struct ShardSidecar {
     ball_pred_columns: Vec<String>,
     /// v4: `ball_pred` array middle-dim horizons, in seconds (ascending).
     ball_pred_horizons_sec: Vec<f64>,
+    /// v5: semantics of the `episode_marker` `[T]` u8 array (see
+    /// `EPISODE_MARKER_DOC`).
+    episode_marker: String,
     /// Task B2: number of rows in the action table `cars_action_idx` was
     /// projected against (`construct_engine::actions::make_lookup_table_v1
     /// ().len()`, currently 92) — every `cars_action_idx` value is in
@@ -209,7 +249,7 @@ pub fn write_shard(
         .map_err(|e| format!("create_dir_all {}: {e}", out_dir.display()))?;
 
     let mut ball = Array2::<f32>::zeros((num_ticks, 13));
-    let mut cars_state = Array3::<f32>::zeros((num_ticks, num_players, 17));
+    let mut cars_state = Array3::<f32>::zeros((num_ticks, num_players, 18));
     let mut cars_action = Array3::<f32>::zeros((num_ticks, num_players, 8));
     let mut cars_action_idx = Array2::<i64>::zeros((num_ticks, num_players));
     let mut pads = Array3::<f32>::zeros((num_ticks, 34, 2));
@@ -224,12 +264,14 @@ pub fn write_shard(
         if tick.cars.len() != num_players
             || tick.actions.len() != num_players
             || tick.has_flip.len() != num_players
+            || tick.replay_demoed.len() != num_players
         {
             return Err(format!(
-                "tick {t}: expected {num_players} cars, got {} cars / {} actions / {} has_flip",
+                "tick {t}: expected {num_players} cars, got {} cars / {} actions / {} has_flip / {} replay_demoed",
                 tick.cars.len(),
                 tick.actions.len(),
-                tick.has_flip.len()
+                tick.has_flip.len(),
+                tick.replay_demoed.len()
             ));
         }
 
@@ -270,6 +312,7 @@ pub fn write_shard(
             cars_state[[t, p, 14]] = if car.on_ground { 1.0 } else { 0.0 };
             cars_state[[t, p, 15]] = if car.demoed { 1.0 } else { 0.0 };
             cars_state[[t, p, 16]] = if tick.has_flip[p] { 1.0 } else { 0.0 };
+            cars_state[[t, p, 17]] = if tick.replay_demoed[p] { 1.0 } else { 0.0 };
 
             let action = tick.actions[p];
             for (k, &v) in action.iter().enumerate() {
@@ -307,6 +350,27 @@ pub fn write_shard(
         player_teams[p] = team as i64;
     }
 
+    // episode_marker (v5): unlike every other column this is aggregated over
+    // ALL surviving ticks, not just the `selected` (stride-kept) ones — a
+    // marker landing on a tick the stride skips is carried (OR-ed) forward
+    // onto the next stored tick, so "1 = first STORED tick at/after the
+    // boundary" holds at every stride. When the marker tick IS stored, the
+    // `pending |=` runs before the store below, giving the "at" case.
+    let mut episode_marker = Array1::<u8>::zeros(num_ticks);
+    {
+        let mut pending = false;
+        let mut stored = 0usize;
+        for (i, tick) in rec.ticks.iter().enumerate() {
+            pending |= tick.episode_marker;
+            if i % stride == 0 {
+                episode_marker[stored] = pending as u8;
+                pending = false;
+                stored += 1;
+            }
+        }
+        debug_assert_eq!(stored, num_ticks);
+    }
+
     let npz_path = out_dir.join(format!("{replay_id}.npz"));
     let file = std::fs::File::create(&npz_path)
         .map_err(|e| format!("create {}: {e}", npz_path.display()))?;
@@ -320,6 +384,7 @@ pub fn write_shard(
     npz.add_array("player_teams", &player_teams).map_err(|e| e.to_string())?;
     npz.add_array("tick_index", &tick_index).map_err(|e| e.to_string())?;
     npz.add_array("is_boundary", &is_boundary).map_err(|e| e.to_string())?;
+    npz.add_array("episode_marker", &episode_marker).map_err(|e| e.to_string())?;
     npz.finish().map_err(|e| e.to_string())?;
 
     let sidecar = ShardSidecar {
@@ -337,6 +402,7 @@ pub fn write_shard(
         pad_columns: PAD_COLUMNS.iter().map(|s| s.to_string()).collect(),
         ball_pred_columns: BALL_PRED_COLUMNS.iter().map(|s| s.to_string()).collect(),
         ball_pred_horizons_sec: BALL_PRED_HORIZONS_SEC.to_vec(),
+        episode_marker: EPISODE_MARKER_DOC.to_string(),
         action_table_size: action_table.len(),
     };
     let sidecar_path = out_dir.join(format!("{replay_id}.json"));

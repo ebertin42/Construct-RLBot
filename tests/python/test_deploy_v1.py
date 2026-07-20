@@ -127,6 +127,26 @@ def _load_shard():
     return npz, sidecar
 
 
+def _sample_index_map(sh) -> tuple[np.ndarray, int]:
+    """Maps (t, p) -> row index into the bc-export arrays, or -1 if bc-export
+    skipped that (t, p) sample. Mirrors replay/src/bc_obs.rs::build_tensors
+    exactly: v5 shards (cars_state has 18 columns) skip a (t, p) row whenever
+    col 17 ("is_demoed", the replay-frame demolished/absent flag) is nonzero
+    — see bc_obs.rs's module doc, "Demoed-car samples" — so `S <= T*P`; v4
+    shards (17 columns, no is_demoed) never skip and `S == T*P`."""
+    t_count, p_count, state_cols = sh["cars_state"].shape
+    has_demoed_col = state_cols >= 18
+    idx = np.full((t_count, p_count), -1, dtype=np.int64)
+    s = 0
+    for t in range(t_count):
+        for p in range(p_count):
+            if has_demoed_col and sh["cars_state"][t, p, 17] != 0.0:
+                continue  # demoed at this tick: bc-export emits no sample
+            idx[t, p] = s
+            s += 1
+    return idx, s
+
+
 def _state_for_tick(sh, t: int) -> dict:
     """Rebuild the plain-dict state deploy/obs.py consumes from shard columns,
     mirroring replay/src/bc_obs.rs's GameState reconstruction (car id = p+1,
@@ -166,16 +186,23 @@ def test_obs_v1_matches_bc_export_golden():
     sh, sidecar = _load_shard()
     bc = np.load(PAIR[1])
     t_count, p_count = sh["cars_state"].shape[:2]
-    assert bc["ents"].shape == (t_count * p_count, MAX_ENT, ENT_FEAT)
+    sample_idx, s_count = _sample_index_map(sh)
+    # v5: demoed-car (t, p) rows are skipped by bc-export, so S <= T*P (see
+    # _sample_index_map / bc_obs.rs's "Demoed-car samples"); the emitted
+    # count must match the skip rule exactly, not just be <=.
+    assert bc["ents"].shape == (s_count, MAX_ENT, ENT_FEAT)
     teams = set(sh["player_teams"].tolist())
     assert teams == {0, 1}, "need a blue AND an orange car to cover the mirror path"
 
     # spread of ticks + the first rows + last row
     ticks = sorted(set([0, 1, 2, 3] + list(range(0, t_count, max(1, t_count // 40))) + [t_count - 1]))
+    compared = 0
     for t in ticks:
         state = _state_for_tick(sh, t)
         for p in range(p_count):
-            s = t * p_count + p
+            s = int(sample_idx[t, p])
+            if s < 0:
+                continue  # car p demoed at tick t: bc-export skipped this row
             ents, mask, query = build_obs_v1(state, car_id=p + 1)
             np.testing.assert_array_equal(
                 mask.astype(np.uint8), bc["mask"][s], err_msg=f"mask t={t} p={p}"
@@ -186,25 +213,47 @@ def test_obs_v1_matches_bc_export_golden():
             np.testing.assert_allclose(
                 query, bc["query"][s], atol=1e-5, err_msg=f"query t={t} p={p}"
             )
+            compared += 1
+    assert compared > 0, "every sampled tick's cars were demoed — picked a bad shard?"
 
 
 @needs_pair
 def test_prev_ring_matches_bc_export_golden():
     """deploy's update_prev_ring, driven with bc_obs.rs's reset rule (zeros at
-    t=0 and on tick_index gaps), reproduces the exported prev array exactly."""
+    t=0, on tick_index gaps, and — v5 only — on episode_marker rows or a
+    car's own demoed->live transition), reproduces the exported prev array
+    exactly. A demoed car emits no row and its ring stays frozen (not
+    shifted) for the ticks it's demoed — see bc_obs.rs's "Demoed-car
+    samples" / "prev-5 window"."""
     sh, sidecar = _load_shard()
     bc = np.load(PAIR[1])
     stride = int(sidecar["stride"])
-    t_count, p_count = sh["cars_action_idx"].shape
+    t_count, p_count, state_cols = sh["cars_state"].shape
+    has_demoed_col = state_cols >= 18
     tick_index = sh["tick_index"]
+    episode_marker = sh["episode_marker"] if "episode_marker" in sh.files else np.zeros(t_count, dtype=np.uint8)
+
     rings = np.zeros((p_count, PREV_ACTIONS), dtype=np.int64)
-    expect = np.zeros((t_count * p_count, PREV_ACTIONS), dtype=np.int64)
+    was_demoed = np.zeros(p_count, dtype=bool)
+    expect_rows = []
     for t in range(t_count):
-        if t > 0 and tick_index[t] - tick_index[t - 1] != stride:
+        gap = t > 0 and tick_index[t] - tick_index[t - 1] != stride
+        if t > 0 and (gap or episode_marker[t] != 0):
             rings[:] = 0
-        expect[t * p_count:(t + 1) * p_count] = rings
+        demoed = np.array(
+            [has_demoed_col and sh["cars_state"][t, p, 17] != 0.0 for p in range(p_count)]
+        )
         for p in range(p_count):
-            update_prev_ring(rings[p], int(sh["cars_action_idx"][t, p]))
+            if not demoed[p] and was_demoed[p]:
+                rings[p] = 0  # respawn (demoed -> live): history discontinuity
+            if demoed[p]:
+                continue  # no sample emitted for a demoed car's row
+            expect_rows.append(rings[p].copy())
+        for p in range(p_count):
+            if not demoed[p]:  # a demoed car's ring stays frozen (no shift)
+                update_prev_ring(rings[p], int(sh["cars_action_idx"][t, p]))
+        was_demoed = demoed
+    expect = np.array(expect_rows, dtype=np.int64).reshape(-1, PREV_ACTIONS)
     np.testing.assert_array_equal(expect, bc["prev"])
 
 

@@ -110,6 +110,35 @@ pub struct Tick {
     /// `has_flip` obs feature, so shard and live-obs semantics agree by
     /// construction.
     pub has_flip: Vec<bool>,
+    /// Per-car replay-frame demolished/absent flag, same order as `cars`
+    /// (schema v5's `is_demoed` column). Sourced straight from the source
+    /// frame's `CarFrame::demoed` (constant across every 120 Hz tick of the
+    /// 30 Hz interval the tick belongs to), NOT from the sim car's post-step
+    /// `is_demoed`. Provenance: subtr-actor's `PlayerFrame` carries no
+    /// explicit demolition field, so `frames.rs` sets `demoed = true` exactly
+    /// when a player has no frame data (`PlayerFrame::Empty`/missing — car
+    /// actor destroyed by demolition, not yet spawned, or torn down during a
+    /// goal reset) and their last-known state was carried forward. That
+    /// absent/carried-forward heuristic is the only demolition signal the
+    /// replay data offers; see `CarFrame::carried_forward`.
+    pub replay_demoed: Vec<bool>,
+    /// True iff this tick is the first surviving tick at/after a goal-reset/
+    /// kickoff boundary in the source replay (schema v5's `episode_marker`).
+    /// Derived from the replay's ball data alone: a frame is "dead-ball" when
+    /// the ball sits on the center axis with no horizontal motion
+    /// (`ball_is_dead` — |pos.x| and |pos.y| <= 1 uu, |vel.x| and |vel.y| <=
+    /// 1 uu/s), which covers the whole goal→kickoff sequence: post-goal ball
+    /// despawn (subtr-actor `BallFrame::Empty`, zeroed by `extract_frames`),
+    /// the fresh ball actor settling vertically onto its kickoff resting
+    /// height (x = y = 0, only vel.z nonzero), and the frozen kickoff
+    /// countdown. The FIRST frame of each maximal dead-ball run raises a
+    /// pending marker, which lands on the first tick that survives the
+    /// sanity-drop check (so a dropped tick can't swallow the marker). A
+    /// mid-play false positive would need the ball resting within 1 uu of
+    /// the center axis with < 1 uu/s horizontal speed — practically only
+    /// kickoffs do that, and a false marker merely resets a downstream
+    /// prev-action window (conservative, not corrupting).
+    pub episode_marker: bool,
     /// Ball-position/velocity prediction at +0.5/1.0/1.5/2.0s, each row
     /// `[pos_x, pos_y, pos_z, vel_x, vel_y, vel_z]`. Computed via
     /// `construct_engine::ballpred::Tracker::predict` on the ball state at
@@ -257,17 +286,63 @@ fn set_ball_state(arena: &mut cxx::UniquePtr<Arena>, rf: &RigidFrame) {
     arena.pin_mut().set_ball(b);
 }
 
+/// RocketSim's standard demolition respawn delay, used as the
+/// `demo_respawn_timer` refreshed at every 30 Hz snap for a replay-absent
+/// (demoed) car — see `set_car_state`.
+const DEMO_RESPAWN_TIMER_SECS: f32 = 3.0;
+
 /// Overwrite car `car_id`'s state with `cf` (frame `t`'s authoritative car
 /// frame). `CarState.boost` is `0..100`; `CarFrame.boost` is `0..1`.
+///
+/// `is_demoed` IS written (schema-v5 fix): before v5 a demoed/absent replay
+/// player's carried-forward `CarFrame` was snapped in as a LIVE car frozen at
+/// its last-known position — a ghost that kept colliding with the ball/other
+/// cars and eating boost pads during reconstruction. Setting `is_demoed`
+/// removes the car from Bullet's simulation for the interval, like a real
+/// demolition would. `demo_respawn_timer` is refreshed to a full
+/// `DEMO_RESPAWN_TIMER_SECS` at every snap (a 30 Hz interval is only ~33 ms)
+/// so RocketSim's own countdown can never auto-respawn the car mid-interval —
+/// the replay's frame data, not the sim, decides when the player is back.
+///
+/// A demoed car's velocities are zeroed rather than snapped: a demolished
+/// car has no physical motion, and the replay's frame data around actor
+/// teardown carries garbage there — observed on the fixture: carried-forward
+/// `ang_vel` magnitudes of ~500 rad/s, 100x RL's real ~5 rad/s cap. A LIVE
+/// car gets that junk clamped by RocketSim's own per-tick car update, but a
+/// demoed car skips simulation entirely, so an unzeroed snap would persist
+/// verbatim into the post-step state and trip `tick_is_sane`'s
+/// `ANG_VEL_LIMIT`, silently dropping every tick of every demo window. The
+/// last-known position/rotation ARE kept (matching live RocketSim, which
+/// freezes a demoed car in place).
 fn set_car_state(arena: &mut cxx::UniquePtr<Arena>, car_id: u32, cf: &CarFrame) -> Result<(), String> {
     let mut cs = arena.pin_mut().get_car(car_id);
     cs.pos = Vec3::new(cf.rb.pos[0], cf.rb.pos[1], cf.rb.pos[2]);
-    cs.vel = Vec3::new(cf.rb.vel[0], cf.rb.vel[1], cf.rb.vel[2]);
-    cs.ang_vel = Vec3::new(cf.rb.ang_vel[0], cf.rb.ang_vel[1], cf.rb.ang_vel[2]);
+    if cf.demoed {
+        cs.vel = Vec3::new(0.0, 0.0, 0.0);
+        cs.ang_vel = Vec3::new(0.0, 0.0, 0.0);
+    } else {
+        cs.vel = Vec3::new(cf.rb.vel[0], cf.rb.vel[1], cf.rb.vel[2]);
+        cs.ang_vel = Vec3::new(cf.rb.ang_vel[0], cf.rb.ang_vel[1], cf.rb.ang_vel[2]);
+    }
     cs.rot_mat = quat_to_rotmat(cf.rb.quat);
     cs.boost = (cf.boost * 100.0).clamp(0.0, 100.0);
     cs.is_on_ground = cf.on_ground;
+    cs.is_demoed = cf.demoed;
+    cs.demo_respawn_timer = if cf.demoed { DEMO_RESPAWN_TIMER_SECS } else { 0.0 };
     arena.pin_mut().set_car(car_id, cs).map_err(|e: rocketsim_rs::NoCarFound| e.to_string())
+}
+
+/// Dead-ball predicate over a source replay frame's ball state — see
+/// `Tick::episode_marker` for the full derivation rule and why the
+/// vertical (z) components are deliberately ignored (the freshly spawned
+/// kickoff ball settles vertically before freezing).
+fn ball_is_dead(rf: &RigidFrame) -> bool {
+    const CENTER_EPS_UU: f32 = 1.0;
+    const VEL_EPS_UU_S: f32 = 1.0;
+    rf.pos[0].abs() <= CENTER_EPS_UU
+        && rf.pos[1].abs() <= CENTER_EPS_UU
+        && rf.vel[0].abs() <= VEL_EPS_UU_S
+        && rf.vel[1].abs() <= VEL_EPS_UU_S
 }
 
 /// `0.0` if the pad is active/available, else `cooldown / 10.0`. Mirrors
@@ -365,8 +440,24 @@ pub fn reconstruct_120hz(frames: &ReplayFrames, stride: usize) -> Result<Reconst
     // survives the sanity check -- this is what lets a dropped tick leave a
     // visible gap in `tick_index` for surviving ticks.
     let mut tick_counter: i64 = 0;
+    // Raised when frame `t` starts a maximal dead-ball run (goal-reset/
+    // kickoff — see `Tick::episode_marker`), consumed by the first tick that
+    // survives the sanity check, so drops can't swallow a marker.
+    let mut pending_marker = false;
 
     for t in 0..(num_frames - 1) {
+        // Goal-reset/kickoff detection: the first frame of each maximal
+        // dead-ball run raises the pending episode marker (t == 0 counts as
+        // a run start when the recording opens on a kickoff/dead ball).
+        if ball_is_dead(&frames.ball[t]) && (t == 0 || !ball_is_dead(&frames.ball[t - 1])) {
+            pending_marker = true;
+        }
+
+        // Per-car replay-frame demoed/absent flags for this interval —
+        // constant across all its 120 Hz sub-steps, straight from the source
+        // frame (see `Tick::replay_demoed`).
+        let replay_demoed: Vec<bool> = frames.cars[t].iter().map(|c| c.demoed).collect();
+
         // 1. Snap ball + all cars to frame t's authoritative state.
         set_ball_state(&mut arena, &frames.ball[t]);
         for (p, &car_id) in car_ids.iter().enumerate() {
@@ -502,10 +593,15 @@ pub fn reconstruct_120hz(frames: &ReplayFrames, stride: usize) -> Result<Reconst
                 is_boundary,
                 pads,
                 has_flip,
+                replay_demoed: replay_demoed.clone(),
+                episode_marker: pending_marker,
                 ball_pred,
             };
             if tick_is_sane(&tick) {
                 ticks.push(tick);
+                // Consumed only on survival — a dropped marker-carrying tick
+                // hands the marker to the next surviving one.
+                pending_marker = false;
             }
         }
     }

@@ -102,3 +102,54 @@ def play_entries(mr: "MatchRunner", entry_a: dict, entry_b: dict, steps: int = 2
             f"{mr.schema_version}"
         )
     return mr.play(load_sd(entry_a["ck"]), load_sd(entry_b["ck"]), steps=steps)
+
+
+def split_matches(rewards, terminated, threshold=GOAL_THRESHOLD):
+    """Group a reward tape into per-match (goals_a, goals_b) using terminated
+    flags as match boundaries.
+
+    In match mode `terminated` means "the clock expired", so it is exactly the
+    match boundary. A goal is still a reward spike past `threshold` -- matches
+    always run reward_v0 as a neutral scoring tape (see module doc), so this
+    holds whatever the policies trained on.
+
+    Records are PER ARENA: each arena plays its own sequence of matches, and a
+    300s clock makes all arenas terminate on the same step, so a naive
+    `terminated.any()` + arena-summed count would collapse all N arenas' goals
+    into ONE record -- N-fold fewer samples, and an aggregate-goal comparison
+    rather than the per-match W/D/L we want. Accumulate and emit per arena.
+
+    A trailing partial match is DISCARDED: it has no outcome, and scoring it as
+    a draw would bias every gate toward 0.5.
+    """
+    rewards = np.asarray(rewards)
+    terminated = np.asarray(terminated)
+    if rewards.ndim == 1:            # a single-arena tape may arrive as (T,)
+        rewards = rewards[:, None]
+        terminated = terminated[:, None]
+    T, n = rewards.shape
+    out = []
+    a = np.zeros(n, dtype=int)       # per-ARENA accumulators -- NOT summed
+    b = np.zeros(n, dtype=int)
+    for t in range(T):
+        a += (rewards[t] >= threshold).astype(int)
+        b += (rewards[t] <= -threshold).astype(int)
+        for arena in np.nonzero(terminated[t])[0]:
+            out.append((int(a[arena]), int(b[arena])))
+            a[arena] = 0
+            b[arena] = 0
+    return out
+
+
+def match_record(matches):
+    """Win/draw/loss counts and win share (draws count 0.5).
+
+    `win_share` is None when no match completed -- 0.0 would read as a total
+    loss and could drive a promotion decision off zero evidence.
+    """
+    wins = sum(1 for a, b in matches if a > b)
+    losses = sum(1 for a, b in matches if a < b)
+    draws = len(matches) - wins - losses
+    share = None if not matches else (wins + 0.5 * draws) / len(matches)
+    return {"wins": wins, "draws": draws, "losses": losses,
+            "matches": len(matches), "win_share": share}

@@ -40,6 +40,12 @@ p.add_argument("--kl-prior", default=None,
                help="v1 BC checkpoint to use as a frozen KL prior anchor")
 p.add_argument("--kl-prior-lambda", type=float, default=None,
                help="KL(student‖prior) coefficient (default 0.05)")
+p.add_argument("--entropy-coef", type=float, default=None,
+               help="override PPO entropy_coef. The resumed CHECKPOINT's ppo block "
+                    "normally wins over the toml, so this is the only way to change it "
+                    "on a resume (see the 2026-07-19 state-blindness diagnosis).")
+p.add_argument("--max-iterations", type=int, default=None,
+               help="stop after N iterations (for bounded A/B experiments); default: run forever")
 args = p.parse_args()
 
 state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
@@ -65,6 +71,8 @@ if args.reset_optimizer:
     state["optimizer"] = None
 if args.league:
     cfg.league = {**cfg.league, "enabled": True}
+if args.entropy_coef is not None:
+    cfg.ppo = {**cfg.ppo, "entropy_coef": args.entropy_coef}
 if args.kickstart_teacher:
     cfg.kickstart = {**cfg.kickstart, "teacher": args.kickstart_teacher}
     if args.kickstart_steps is not None:
@@ -77,4 +85,4 @@ if args.kl_prior_lambda is not None:
 t = Trainer(cfg, _state=state)
 print(f"resumed at {t.total_steps:,} steps | arenas={cfg.env['num_arenas']} "
       f"agents={t.engine.num_agents} device={t.device}", flush=True)
-t.run()
+t.run(max_iterations=args.max_iterations)

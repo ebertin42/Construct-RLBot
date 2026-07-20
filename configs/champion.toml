@@ -1,0 +1,92 @@
+# CHAMPION POINTER -- the single reference this project trusts.
+#
+# WHY THIS FILE EXISTS (docs/training-journal.md, 2026-07-19 ~17:40 through
+# 2026-07-20 ~00:30): five controlled 20M-step arms were run from
+# ck_000320471040, identical but for one variable each. Measured head-to-head
+# against their own starting checkpoint (both side orders, 5400 steps/side):
+#
+#   arm A  ent .01,  no league, v4.1            22.0-25.5%
+#   arm B  ent .001, no league, v4.1            10.4-11.4%
+#   arm C  ent .003, league 0.5, clean pool     27.1%
+#   arm D  ent .01,  no league, v3 + ANCHOR     49.2%   <- only survivor
+#
+# PPO self-play in this project has never been shown to improve the policy;
+# unanchored training reliably destroys 73-89% of it. So a checkpoint does not
+# become the reference by being newer or by having a better ep_rew -- it has to
+# BEAT the incumbent in a measured match. That is what scripts/champion_gate.py
+# enforces, and this file is the thing it guards.
+#
+# The champion is used for three things at once:
+#   (a) the KL / self-distillation anchor  (arm D says: never train unanchored)
+#   (b) the league opponent-pool seed
+#   (c) the deploy candidate
+# All three read champion_ck. Do not point it at something unmeasured.
+#
+# Hand edits are allowed and expected -- Elliot hand-picks. Use
+# `champion_gate.py promote CK --reason "..."` rather than editing in place
+# when you can, so the override lands in the audit trail as manual=true.
+
+schema_version = 1
+
+# --- the champion -----------------------------------------------------------
+# Seeded with ck_000320471040: the MEASURED strongest checkpoint in the project.
+# The kickstart-era family (100M/200M/320M/440M) is flat within 43-54% of each
+# other and beats everything post-500M by 80-90% (journal ~17:40 tournament);
+# 320M is the one every controlled arm was launched from and measured against,
+# so it is the reference with the most evidence attached to it.
+champion_ck = "checkpoints_entity/ck_000320471040.pt"
+
+# --- the bar ----------------------------------------------------------------
+# 0.52 = candidate must take >= 52% of combined goals across BOTH side orders.
+#
+# Justification, from the null control (journal 2026-07-19 ~22:00):
+# ck_000320471040 played against ITSELF, both side orders, scored 39-49 / 52-38
+# -> 51.1% share where the true answer is exactly 50.0%. Rerun variance on this
+# harness is ~3% (journal ~23:30). So the measurement floor is not 0.50 -- it is
+# 0.511 +/- ~0.03 for two IDENTICAL policies.
+#
+# 0.52 sits above the null point estimate (51.1%) but inside its noise band,
+# which is the deliberate choice: at this sample size a threshold that clears
+# the full +3% band would be 0.54+, and a real +2-3% improvement would then be
+# rejected forever. 0.52 accepts that a coin-flip candidate passes maybe ~1 run
+# in 3, and leans on two other guards instead of a bigger number: both side
+# orders are ALWAYS summed (a single order swings +/-6 goals, ~10 goals between
+# orders), and promotion is opt-in (--promote-if-pass) so a human still sees
+# every PASS before it moves the pointer. Raise this to 0.55 if the gate ever
+# starts promoting drift; every arm this project has actually produced scored
+# 10-27%, nowhere near either number.
+promote_threshold = 0.52
+
+# --- how much match to require ----------------------------------------------
+# Matches the existing h2h harness (scripts/h2h_eval.py defaults) so gate
+# results are directly comparable to every number in the journal.
+[min_games]
+steps = 5400            # engine steps PER SIDE ORDER; both orders always played
+arenas = 8
+seed = 11
+# A promotion needs a real sample behind it. The null control produced 178
+# goals total at these settings; a match that ends with a handful of goals is a
+# broken match (engine hiccup, policy that never touches the ball), not a
+# verdict. Refuse to promote below this many combined goals -- and note that
+# a 0-0 match has no share at all, which is always a FAIL.
+min_total_goals = 20
+
+# --- candidate discovery (watch) --------------------------------------------
+[watch]
+candidate_dir = "checkpoints_entity"
+poll_seconds = 300
+# After this many consecutive FAILs, `watch` and `status` shout. Given the arm
+# A-E results, a run producing 3 rejects in a row is not unlucky -- it is
+# degrading, and someone should stop it.
+consecutive_rejects_before_alert = 3
+
+# --- where promotions are recorded ------------------------------------------
+[league]
+# New champions are appended here so the opponent pool tracks the champion
+# lineage (construct.league.registry.Registry.add, schema_version=1).
+registry = "league/registry_armc.jsonl"
+run = "champion"
+reward_config = "configs/reward_v3.toml"   # the regime arm D held parity under
+
+[history]
+path = "logs/champion_history.jsonl"
