@@ -2181,3 +2181,52 @@ both. If the shared component alone reproduces the ~4-point loss while the
 residual behaves like noise (~1.5), the damage is localised to a specific,
 inspectable direction in weight space -- which can then be read against what it
 does to behaviour. Everything needed is already on disk.
+
+## 2026-07-20 ~18:10 — decomposing the update; the noise model checks out exactly
+
+17 long600 rungs now (iters 20-340): Cochran-Armitage z=-0.13, p=0.899. Still
+flat. That experiment is finished as a question.
+
+Built `scripts/decompose_update.py` (11 tests) to split a PPO update into the
+direction every seed agrees on and the part only one seed did:
+
+    3 updates, mean ||u||=1.8294, ||shared mean||=1.2054
+    residual cos with shared: -0.031, +0.054, -0.025   (clean split)
+
+**First reported number was biased and I caught it.** The script printed
+`cos(u_i, shared) = +0.65`, which looks like each update being two-thirds the
+common direction. It is inflated: each u_i contributes a third of the mean it
+is being correlated against. Leave-one-out is the unbiased measure:
+
+    cos(u1, mean of others) = +0.209
+    cos(u2, mean of others) = +0.181
+    cos(u3, mean of others) = +0.207     (pairwise: 0.140, 0.176, 0.138)
+
+So the honest alignment is ~0.19, not 0.65.
+
+**The contamination arithmetic, and it validates the model.** Treating an
+update as u = s + n with independent n, pairwise cosine 0.151 gives
+||s||/||u|| = 0.389, and the mean of N runs has
+
+    N= 3: ||mean||/||u|| = 0.659, mean is 35% true-shared by energy
+    N=10: ||mean||/||u|| = 0.486, 64% true-shared
+    N=23: ||mean||/||u|| = 0.433, 80% true-shared
+
+The predicted 0.659 for N=3 matches the measured 1.2054/1.8294 = 0.659 exactly.
+The model of "shared direction plus independent noise" is not an assumption
+here; it reproduces the observed norm to three decimals.
+
+**Which means the probe is 65% noise, and that is fine in ONE direction.**
+Contamination pulls the shared probe TOWARD the noise baseline (0.485), never
+away from it. So:
+
+  * shared probe lands near 0.46 (PPO-like) despite being mostly noise
+        -> strong evidence the shared direction carries the damage;
+  * shared probe lands near 0.485
+        -> AMBIGUOUS, since contamination alone could produce that, and a
+           clean test would need ~23 seeded runs.
+
+Registering that asymmetry before the gates return, because it is the
+difference between a result and a wish. Four probes gating: the shared
+direction and each of the three residuals, all rescaled to a real update's
+magnitude so only direction differs.
