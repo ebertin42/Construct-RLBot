@@ -2440,3 +2440,119 @@ drops on the first update and stays there.
 
 That closes the last open question from the trajectory experiment. What remains
 of tonight is the final rungs (500-600) and the consolidated write-up.
+
+# ============================================================
+# CONSOLIDATED SUMMARY — the night of 2026-07-20
+# ============================================================
+
+## In plain language
+
+We have a "champion" — the best bot we've got. Training is supposed to produce
+something better. For weeks it never has, and nobody knew why.
+
+Tonight I ran the test that had never been run: instead of *training* the
+champion, I just **jiggled its weights randomly** by the same distance one
+training step moves them, and played both against the champion.
+
+  * Random jiggle  -> loses by about 1.5 points. Expected: it is already good,
+    so any random change is mildly bad.
+  * One real training step -> loses by about 4 points.
+
+**Training does not merely fail to help. It steers worse than random noise.**
+If you flipped a coin to choose which way to move the weights, you would beat
+what PPO actually did.
+
+Two follow-ups sharpened it:
+
+  * **The damage is instant.** It is fully done after the *first* update and
+    never gets worse. I trained 600 iterations and gated 28 checkpoints along
+    the way — a dead-flat line. So "it just needs longer" is dead, and so is
+    "PPO slowly erodes the policy".
+  * **There is no villain component to remove.** I split a training step into
+    "the part every run agrees on" and "the part unique to one run" and tested
+    each. Both are equally harmful. No surgery on the update fixes this.
+
+What it means: the bot is trained to maximise one thing (shaped self-play
+rewards — touch the ball, push it goalward) but judged on another (actually
+winning matches). Those two have come apart. Training genuinely improves what
+it is told to improve; that improvement no longer buys wins, and past some
+point it trades against them.
+
+So there is no tuning fix. Not the reward weights, the learning rate, the reset
+positions, the entropy, the opponent pool, the anchor strength, or the run
+length — all swept, all rearranging deck chairs. **The objective itself has to
+change.**
+
+## ESTABLISHED
+
+1. **PPO's update direction is worse than matched random noise.**
+   Engine-matched: NULL 0.485 (n=6146, 35 seeds) vs PPO 0.458 (n=5231, 30
+   gates / 3 runs), z=+2.88, p=0.004. Run-level clustered (4 independent runs,
+   between-run SD 0.0059): t=-3.97, df~3. Significant under both analyses.
+2. **The champion sits at a local optimum of the gate metric.** Any movement
+   costs ~1.5 points; PPO's costs ~4. The two effects are real and additive.
+3. **The whole effect lands on the first update.** fine iters 1-10 flat
+   (p=0.824); long600 28 rungs over 560 iterations flat (z=-0.01, p=0.993),
+   pooled 2311-2772 n=5083 0.455 [.441,.468], vs parity p<1e-7.
+4. **No decomposition rescues it.** SHARED (17 seeds) 0.451 vs NULL p=0.0029;
+   RESIDUAL (3 directions x 9 seeds) 0.447 vs NULL p=0.0001; SHARED vs
+   RESIDUAL p=0.736. Every gradient-derived direction is worse than chance.
+5. **Not an implementation bug.** PPO plumbing was verified exact in the
+   earlier diagnosis. This is objective misalignment.
+6. **The gate is honest and the guards earn their keep.** A pure random
+   perturbation PASSED the 52% threshold at 56.3%. Under
+   `--promote-if-pass` with no confirmation gates, noise would have taken the
+   belt. The champion never moved across 6 hill-climb attempts, 8 arms, 28
+   long600 rungs, 30 fine rungs, 35 null controls and 6 probes.
+
+## RETRACTED
+
+  * "Replay-state resets are the first upward separation this project has
+    measured" — p went 0.023 -> 0.053 -> 0.077 -> 0.189 across four samples.
+  * "The lambda ladder is monotone and saturates at parity" — every point above
+    lambda 0.5 overlaps every other.
+  * "Random movement costs nothing" — 3 seeds said 0.501, 35 say 0.485.
+  * The pre-registered binary (a)/(b) framing — it landed at 0.485, between the
+    two predicted values, and BOTH mechanisms are true and additive. A forced
+    choice guards against retro-fitting and models badly a world where two
+    causes stack.
+  * cos(update, shared) = 0.65 — self-inclusion bias; leave-one-out gives ~0.19.
+  * "The residual behaves like noise" — that rested on resid1 alone (0.479);
+    resid2 0.455, resid3 0.410, pooled 0.447.
+
+Four small samples reversed on more data tonight. **Every one moved toward the
+boring answer.**
+
+## STILL OPEN
+
+  * The engine wheel deployed to the trainer box mid-night created a
+    training-engine confound. It invalidates arm-vs-arm comparisons spanning
+    the deploy; it does NOT touch arm-vs-champion gate results, because the
+    gate runs on the fixed LOCAL engine. Engine effect at matched iteration
+    was +0.070, p=0.119 — suggested, never resolved. Backup:
+    /home/elliot/engine_backup_20260719_0613.so (revert is one cp).
+  * Why the gradient is anti-correlated with head-to-head performance, at the
+    level of mechanism rather than measurement, is not answered. We know THAT
+    it is, and that no decomposition localises it.
+
+## RECOMMENDED NEXT STEP
+
+**Change what is optimised, not how.** Task #56 (match-win objective:
+score/clock observations + full-match episodes) is the direct attack on the
+misalignment and is already scoped in the backlog. Everything else in the
+backlog is a tuning lever, and tonight's result says tuning levers are not
+worth GPU time.
+
+Deliberate non-action: the trainer box is now free and I am NOT starting
+another arm. Another lambda or reward sweep would be motion, not progress.
+
+## TOOLING BUILT TONIGHT (all tested, all committed)
+
+  * `scripts/gate_stats.py` — never reports a share without its interval; says
+    NOT RESOLVED in as many words; Cochran-Armitage trend across ordered rungs.
+  * `scripts/behavior_distance.py` — KL / agreement / entropy between policies
+    on a shared state batch, with an engine null control.
+  * `scripts/perturb_null.py` — matched random-direction controls.
+  * `scripts/decompose_update.py` — shared vs seed-specific update components.
+  * hill-climb fixes: appear-phase poll, whole-dependency preflight, quarantine
+    for harness-bug rows, and `ctl.remote_quote` for the ssh/zsh glob trap.
