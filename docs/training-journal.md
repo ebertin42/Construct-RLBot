@@ -1080,3 +1080,38 @@ Switching the loop to configs/train_v2_replayreset.toml now.
 This is the pre-registered condition being met, not a whim: "arm it once the
 baseline failure rate is established". Baseline established = 41-42%, tight,
 binomial-dominated.
+
+## 2026-07-20 ~08:35 — replay-reset arm armed; the preflight I just wrote was too narrow
+
+Switched the loop to configs/train_v2_replayreset.toml. First launch died
+instantly:
+
+    FileNotFoundError: [Errno 2] No such file or directory:
+    'configs/train_v2_replayreset.toml'
+
+The config existed only on the laptop. I had shipped the 584 MB reset pool and
+written a preflight for it, then pointed the loop at a config I never shipped —
+and the preflight I wrote *specifically to catch silent launch failures* checked
+the pool and nothing else. **Checking the one dependency that happened to bite
+last time is not a preflight.** The lesson generalizes past this bug: I guarded
+the failure I had just experienced rather than the class it belonged to.
+
+Worth noting what worked: the appear-phase fix (cfab026) behaved exactly as
+designed. The trainer never reached the process table, so the loop declared a
+FAILED LAUNCH rather than a completed run. Before this morning that same
+situation produced "trainer exited" and a stampede. The harness caught its own
+next bug.
+
+**Fix (e9eedba).** remote_files_required() resolves the whole dependency set
+from the train config — itself, reward config, curriculum, schema, and the
+reset pool when the curriculum has a replay branch — and the abort names every
+missing file with the scp to fix it. Preflight now reports "5 launch
+dependencies present". Two ordering bugs fell out, both caught by pre-existing
+tests: a stop file must short-circuit before preflight touches the network, and
+an unreachable host must report "cannot reach" whichever check notices first.
+
+curriculum_v2.toml and train_v2_replayreset.toml shipped to the box. Attempt 16
+relaunched at lambda_p 0.6383. Verifying the pool actually LOADS before trusting
+anything this arm produces — the engine's documented failure mode on an
+unreadable pool is to warn and silently fall back to kickoff/random, which would
+make the arm a train_v1 rerun wearing a different config name.
