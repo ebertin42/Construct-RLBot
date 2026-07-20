@@ -738,3 +738,26 @@ Arm D HOLDS (49.2% ~ parity). Holding is not progress — but with the gate, a
 holding regime plus rare lucky promotions is a slow hill-climb that cannot
 regress, which is strictly better than every regime this project has run since
 the anneal ended.
+
+### 2026-07-20 ~04:30 — ARM G: self-anchor strength is the knob (46.4%)
+| config | h2h vs champion 320M |
+|---|---|
+| F: self-anchor lambda_p 0.2 | 32.8% |
+| **G: self-anchor lambda_p 0.5** | **46.4%** (38-49 / 39-40) |
+| D: v0-teacher kickstart, lambda_k 0.36 + value distill | 49.2% |
+| (null control, ck vs itself) | 51.1% |
+Monotone in trust-region strength: 0.2 -> 0.5 moved retention 32.8 -> 46.4,
+nearly closing the gap to arm D. The lambda_p 0.05 default was designed for a
+HUMAN prior (mode-seeking, meant to allow specialization); as a drift brake it
+was an order of magnitude too weak. Gate correctly FAILED it at 46.4 < 52 —
+still marginally below the champion, so not promotable, which is the gate
+behaving conservatively rather than a bug.
+ARM H (running): lambda_p 1.0, maps the top of the curve. EXPECTED TENSION,
+stated before the result: as lambda_p -> infinity the policy cannot move, so
+share -> 50% with ZERO progress. High lambda buys retention by forbidding
+change. So the useful setting is the largest lambda that still permits
+improvement, and the gate is what makes a wrong guess cheap.
+IF H lands ~50% (frozen): the production recipe is many BOUNDED attempts at
+lambda ~0.5-0.7 with DIFFERENT SEEDS, each gated, promoting the rare winner —
+an explicit hill-climb where PPO is the mutation operator. That is the honest
+architecture given a loop that is destructive on average.
