@@ -990,3 +990,42 @@ died with 255: the `rm` argument put the literal string in the shell's own
 cmdline, so pkill matched and killed the shell running it. Bracket-proofing
 protects the pattern against ITSELF, not against a sibling command in the same
 compound string. Minimal one-purpose ssh calls, every time.
+
+## 2026-07-20 ~07:55 — duty-7 decision: do NOT arm the replay-reset arm tonight
+
+Attempt 15 running (lambda_p 0.6196, iter 40/145). Loop healthy on
+quarantine-aware code, streak 1. SSL 10,801 replays. Host free 145G.
+
+Considered arming configs/train_v2_replayreset.toml tonight, in parallel, on
+the idle laptop 4060. Rejected, for two reasons that are worth writing down
+because the first one is the interesting one.
+
+**1. The lambda scatter is not "sampling a known ceiling" — it is calibrating
+the instrument, and everything downstream needs it.** My first read was that
+the remote loop is wasting the night re-sampling a band already measured at
+46.4% and 49.2%, while the replay-reset arm tests the one dimension never
+varied. That reasoning is wrong, and it inverts the actual dependency. One gate
+carries a ~+/-7% band (07:10 entry). Until I know the SEED-TO-SEED spread, a
+single replay-arm gate at, say, 48% is exactly as uninterpretable as attempt
+14's 41.2% is now. **The noise floor is a prerequisite for reading the replay
+arm at all**, not a competing use of the night. Spending attempts on it is the
+cheapest thing available, and it can retract the "monotone, saturating lambda
+ladder" claim from 06:50 if the spread turns out to swamp the ordering.
+
+**2. A local trainer would endanger the gate it depends on.** The gate runs
+LOCALLY (champion_gate -> MatchRunner). The laptop has 8188 MiB total with
+1357 MiB already in use; a trainer sized like the remote's takes ~6500 MiB.
+A local arm would therefore be holding nearly all free VRAM at the exact
+moments the remote loop needs to gate, risking OOM-failed gates. That would
+corrupt the very baseline being measured — and it is the same shape of mistake
+as tonight's stampede: a second process quietly contending for a resource the
+first one assumed it owned. Right after spending a session fixing that, adding
+an unattended concurrent trainer is not the move.
+
+**Plan.** Let the loop accumulate lambda samples across distinct seeds against
+the frozen champion. Arm the replay-reset arm on the REMOTE box (one trainer,
+no new contention) once the spread is known — it is prepared, pool shipped and
+md5-verified, preflight guarding the silent-fallback failure mode.
+
+**Push unblocked.** Elliot granted it; 3e07b5e..2833738 pushed to
+origin/bc-pretrain (7 commits). Nothing outstanding.
