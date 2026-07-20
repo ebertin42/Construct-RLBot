@@ -1278,3 +1278,65 @@ WHICH STATES the policy trains from, not how it trains. Every arm that tuned
 the optimizer, the reward, the entropy, or the opponent pool held or lost. That
 is the compounding-error story the replay literature tells, and it is the first
 piece of evidence from this project that actually supports it.
+
+## 2026-07-20 ~11:55 — the replay-arm headline does NOT survive replication
+
+    attempt 17  REPLAY-RESET arm  lambda_p 0.6634  seed 20260737
+    69-83  n=152  share 45.4%  95%CI [.377,.533]   FAIL
+
+Pooled with a16, and measured against everything that matters:
+
+    replay pooled (a16+a17)   162-169  n=331  0.489  [.436,.543]
+    kickoff/random (a14+a15)  149-209  n=358  0.416  [.366,.468]
+    armH lambda 1.0            93- 96  n=189  0.492  [.422,.563]
+
+    replay - baseline  +0.073  z=+1.93  p=0.053  NOT RESOLVED
+    replay - armH      -0.003  z=-0.06  p=0.954  NOT RESOLVED
+    replay vs parity 0.500     z=-0.38  p=0.700  INDISTINGUISHABLE FROM PARITY
+
+**RETRACTION of the 10:25 headline.** I wrote "REPLAY-STATE RESETS PRODUCED THE
+FIRST UPWARD SEPARATION THIS PROJECT HAS EVER MEASURED" on the strength of a16
+alone (52.0%, p=0.023). With one replication the p-value went 0.023 -> 0.053 and
+the pooled arm is now **statistically indistinguishable from parity, and from
+armH**. The sober statement is: the replay arm reaches parity. It is not
+established to beat the kickoff/random baseline, and it is certainly not
+established to beat armH.
+
+**This is textbook regression to the mean, and I walked straight into it.** At
+07:10 I wrote, about a14: "n=1 cannot order these points... writing an ordering
+on this evidence is exactly the selection error that produced the retracted
+'562M is the high-water mark' claim." Three hours later I did that very thing
+with a16 -- and the caveats I attached ("n=1", "needs replication") did not stop
+the headline from being too strong. **A correct caveat under an overstated
+headline is still an overstated claim**; the headline is what gets remembered
+and what I carried forward into three wakeup prompts.
+
+Note a16 and a17 do NOT disagree with each other: z=+1.19, p=0.233, consistent
+with a single underlying value. Nothing is unstable. a16 was simply the high
+draw of two, which is what a high draw looks like from the inside -- indeed
+this is precisely the winner's-curse mechanism the confirmation gates were
+built to catch on the promote side, doing its work on the analysis side.
+
+**Nothing was promoted, and nothing needs undoing.** The gate ruled FAIL on both
+attempts independently and the champion never moved. The damage was confined to
+a journal entry, which is why the entry is being corrected in place rather than
+quietly amended.
+
+### What is actually true now
+
+* Replay-state resets reach parity with the champion (48.9%, CI spans 0.50).
+* So does armH (lambda 1.0). The two are indistinguishable.
+* The baseline comparison is marginal (p=0.053) and unresolved. Resolving
+  +0.073 needs ~4 gates per arm; we have 2. **a18 is running the same arm
+  (lambda_p 0.5461) as sample 3.**
+
+### The one distinction still worth chasing
+
+armH reaches parity by FREEZING -- lambda 1.0 buys retention by forbidding
+change. The replay arm reaches parity at lambda ~0.6, which permits change.
+"Parity while still moving" and "parity by refusing to move" are different in
+kind even when they gate identically, and only the first can compound. But that
+is a HYPOTHESIS, not a measurement: it needs a direct check that the replay-arm
+policy actually diverged from the champion (behavioural distance, or the
+training kl_pri trace) where armH's did not. Until that check exists, the honest
+summary is two arms that both hold parity.
