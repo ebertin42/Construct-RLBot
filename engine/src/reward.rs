@@ -188,6 +188,19 @@ pub fn win_prob(score_diff: i32, t_frac: f32, k_base: f32, t_floor: f32) -> f32 
     1.0 / (1.0 + (-k * score_diff as f32).exp())
 }
 
+/// The POTENTIAL used for shaping: `win_prob` recentred to [-0.5, +0.5].
+///
+/// The recentring is load-bearing. A raw sigmoid gives
+/// `PHI_orange = 1 - PHI_blue`, not `-PHI_blue`, so the two teams' shaping sums
+/// to `w*(gamma-1)` rather than zero -- a constant -0.046/step at the live
+/// gamma, -207 across a match, which rewards ending episodes early. Recentring
+/// makes the negation exact and the shaped game zero-sum at ANY gamma, and
+/// costs nothing: a constant shift leaves potential-based shaping
+/// potential-based, so the per-agent Ng guarantee is untouched.
+pub fn win_potential(score_diff: i32, t_frac: f32, k_base: f32, t_floor: f32) -> f32 {
+    win_prob(score_diff, t_frac, k_base, t_floor) - 0.5
+}
+
 /// Score and clock for one arena's current match. Phase 1 keeps this out of
 /// the observation entirely (see the spec): it feeds the reward only.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -200,7 +213,10 @@ pub struct MatchState {
 
 impl MatchState {
     /// Goals ahead from `team`'s point of view. Signed, so the two teams'
-    /// values are exact negations and the shaped game stays zero-sum.
+    /// values are exact negations of each other -- necessary but not
+    /// sufficient for the shaped game to be zero-sum. That additionally
+    /// requires the potential to satisfy PHI_orange = -PHI_blue, which is
+    /// what `win_potential`'s recentring provides (see its doc comment).
     pub fn score_diff(&self, team: Team) -> i32 {
         let (mine, theirs) = match team {
             Team::Blue => (self.score_blue, self.score_orange),
@@ -228,7 +244,7 @@ pub fn win_prob_shaping(
         return 0.0;
     }
     let phi = |m: &MatchState| {
-        win_prob(m.score_diff(team), m.t_frac, cfg.win_prob_k_base, cfg.win_prob_t_floor)
+        win_potential(m.score_diff(team), m.t_frac, cfg.win_prob_k_base, cfg.win_prob_t_floor)
     };
     cfg.win_prob_weight * (gamma * phi(cur) - phi(prev))
 }
@@ -727,6 +743,28 @@ mod tests {
         assert!(v.is_finite() && (0.0..=1.0).contains(&v), "got {v}");
     }
 
+    #[test]
+    fn win_potential_is_zero_at_level_score_for_every_clock() {
+        for t in [1.0, 0.75, 0.5, 0.25, 0.0] {
+            let v = super::win_potential(0, t, K, TF);
+            assert!(v.abs() < 1e-6, "t_frac={t}: got {v}");
+        }
+    }
+
+    #[test]
+    fn win_potential_negates_exactly_between_teams() {
+        // This is the property the recentring buys: PHI(-d) == -PHI(d), so
+        // Team::Orange's potential is the exact negation of Team::Blue's and
+        // the shaped game is zero-sum at any gamma.
+        for d in [-3, -1, 0, 1, 3] {
+            for t in [1.0, 0.5, 0.1, 0.0] {
+                let a = super::win_potential(d, t, K, TF);
+                let b = super::win_potential(-d, t, K, TF);
+                assert!((a + b).abs() < 1e-6, "d={d} t={t}: {a} + {b} != 0");
+            }
+        }
+    }
+
     // --- MatchState + win_prob_shaping: Task 2 (load-bearing) ---
 
     fn v5_cfg() -> super::RewardConfig {
@@ -771,11 +809,19 @@ mod tests {
 
     #[test]
     fn shaping_is_zero_sum_between_teams() {
-        let cfg = v5_cfg();
-        let (a, b) = (ms(0, 0, 0.5), ms(1, 0, 0.5));
-        let blue = super::win_prob_shaping(&a, &b, Team::Blue, cfg.win_prob_gamma, &cfg);
-        let orange = super::win_prob_shaping(&a, &b, Team::Orange, cfg.win_prob_gamma, &cfg);
-        assert!((blue + orange).abs() < 1e-6, "blue {blue} + orange {orange} != 0");
+        // Must hold at every gamma, not just gamma=1.0 -- the raw sigmoid
+        // (PHI_orange = 1 - PHI_blue, not -PHI_blue) only telescoped to zero
+        // by coincidence at gamma=1.0, which is not the production value.
+        // 0.9954 is the live gamma; the rest are sanity bracketing.
+        for gamma in [0.9954, 1.0, 0.99, 0.9, 0.5] {
+            let mut cfg = v5_cfg();
+            cfg.win_prob_gamma = gamma;
+            let (a, b) = (ms(0, 0, 0.5), ms(1, 0, 0.5));
+            let blue = super::win_prob_shaping(&a, &b, Team::Blue, gamma, &cfg);
+            let orange = super::win_prob_shaping(&a, &b, Team::Orange, gamma, &cfg);
+            assert!((blue + orange).abs() < 1e-6,
+                    "gamma={gamma}: blue {blue} + orange {orange} != 0");
+        }
     }
 
     #[test]
