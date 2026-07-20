@@ -975,3 +975,19 @@ def test_preflight_is_a_noop_for_the_default_train_config(args):
 
     hillclimb.preflight_replay_pool(runner, a.host, a.remote_dir, "configs/train_v1.toml")
     assert calls == []
+
+
+def test_quarantined_rows_do_not_count_toward_the_abort_tripwire():
+    """Rows whose verdict came from a harness bug are evidence about the
+    harness, not the search -- counting them trips the abort early (2026-07-20:
+    13 phantom ERRORs from a blind poll)."""
+    rows = [{"promoted": False, "verdict": "ERROR", "quarantined": True} for _ in range(13)]
+    rows += [{"promoted": False, "verdict": "FAIL"}] * 2
+    assert hillclimb.consecutive_failures(rows) == 2
+
+
+def test_quarantine_does_not_hide_a_real_promotion():
+    rows = [{"promoted": True, "verdict": "PASS"},
+            {"promoted": False, "verdict": "ERROR", "quarantined": True},
+            {"promoted": False, "verdict": "FAIL"}]
+    assert hillclimb.consecutive_failures(rows) == 1

@@ -887,3 +887,54 @@ started. Verify the observer, not just the observed.
 checked against the box instead of believed. An unattended loop that reports
 ERROR is not self-evidently correct — ERROR is exactly what a broken observer
 reports.
+
+## 2026-07-20 ~06:50 — night-autonomy duties, and quarantining the phantom rows
+
+**Duty 1 (arm H) — done, journaled 3e07b5e.** λ_p 1.0 gated **49.2%**
+(93-96 over both side orders) against champion ck_000320471040. Threshold 52%,
+null control 51.1%: this is the FROZEN reading set out in advance, not a fix.
+High λ buys retention by forbidding change. The λ curve now reads
+0.2 → 32.8% | 0.5 → 46.4% | 1.0 → 49.2% | v0-teacher kickstart → 49.2%:
+monotone, saturating at parity. Nothing in the band improves; the ceiling is
+"don't get worse". Arm G (self-anchor 0.5) confirmed at 46.4%.
+
+**Duty 2 (hill-climb) — running, after two harness bugs.** See the 06:10 and
+06:35 entries. Attempt 14 is live and healthy: 1 trainer, GPU 100%, 3 saves.
+
+**Phantom rows quarantined.** The two bugs left 13 ERROR rows in
+logs/hillclimb.jsonl. Those verdicts were produced by a blind poll, not by the
+search — every one of them was training normally when it was logged dead. Left
+counting, they would have tripped the 20-consecutive-failure abort about
+**7 real attempts** into the night, and the abort message would have blamed the
+search.
+
+Added a `quarantined` flag that `consecutive_failures` skips, and marked the 13
+rows with the reason and the fixing commits. Deliberately an additive, auditable
+act: the rows stay in the log with their original ERROR verdict — no silent
+delete, no rewritten verdict. A log that can be quietly edited to say what the
+run needed it to say is worth nothing. Counter now reads 0.
+
+All 13 stampede checkpoint dirs are empty, so no orphaned checkpoint can be
+picked up and gated as if it were a real attempt.
+
+**Caveat.** The running loop process holds the pre-quarantine code in memory;
+the flag takes effect on its next restart, which I will do once attempt 14
+gates rather than killing ~30 min of training now.
+
+**Duty 3 (monitoring).** SSL pull healthy (10,497 duel replays / 7.9G, actively
+writing). Host free 145G on /mnt/c, above the 130G guard. Remote 170G free.
+Full python suite green: 566 passed.
+
+**Duty 5 (push) — BLOCKED, not done.** `git push origin bc-pretrain` was denied
+twice by the permission classifier. 5 commits sit local and unpushed
+(cfab026, 2a54f0f, 14c19b7, dc049b9, 22c757a, plus this one). Not worked
+around; Elliot needs to either push or grant the permission. Nothing is lost —
+the work is committed locally.
+
+**Prepared, not armed.** configs/train_v2_replayreset.toml — replay-state
+resets, the one structural lever no arm has varied (every arm so far changed
+HOW the policy trains, none changed WHICH STATES it trains from). The 584 MB
+pool is now on the box, md5 verified. A preflight (22c757a) refuses to launch
+that arm if the pool is missing, because the engine's failure mode is to warn
+and quietly fall back to kickoff/random — which would have measured a train_v1
+rerun, reported parity, and taught us the opposite of the truth.

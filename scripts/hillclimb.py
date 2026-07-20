@@ -318,9 +318,21 @@ def next_attempt_number(rows) -> int:
 
 def consecutive_failures(rows) -> int:
     """Trailing non-promotions. A FAIL and an ERROR both count: 20 attempts
-    that never produced a checkpoint is just as broken as 20 that lost."""
+    that never produced a checkpoint is just as broken as 20 that lost.
+
+    Rows marked `quarantined` are skipped. That flag is for attempts whose
+    verdict was produced by a bug in THIS harness rather than by the search --
+    e.g. the 13 rows from 2026-07-20, where an unquoted pgrep pattern made the
+    poll blind and every attempt was logged ERROR while it trained. Such rows
+    are evidence about the harness, not about the policy, and letting them
+    count would trip the abort tripwire ~7 real attempts into the next run.
+    Quarantining is deliberately a WRITTEN, AUDITABLE act -- the rows stay in
+    the log with their original verdict and a reason -- never a silent delete
+    and never a rewritten verdict."""
     n = 0
     for row in reversed(rows):
+        if row.get("quarantined"):
+            continue
         if row.get("promoted"):
             break
         n += 1
