@@ -2075,3 +2075,40 @@ matched the pattern. Third distinct form of this trap tonight (after the
 compound pkill+rm that died 255, and the hillclimb `--status` false count).
 Bracket-proofing defends a pattern against ITSELF; it does nothing about a
 sibling clause in the same command line.
+
+## 2026-07-20 ~17:10 — the three fine runs are genuinely independent, and they share a direction
+
+Before pooling fine runs #1-#3 into one arm, checked that different seeds
+actually produced different updates -- if they had not, pooling would add no
+information and the "n=5300" would be a fiction:
+
+    each moved from champion:  1.7796  1.9195  1.7891
+    between runs:  a-b=2.4277  a-c=2.2905  b-c=2.4372
+    cosine of update directions:  a.b=0.140  a.c=0.176  b.c=0.138
+
+The between-run distances EXCEED each run's distance from the champion, so the
+three went to substantially different places. Pooling is valid; they are
+independent draws from "a PPO update".
+
+**But cosine ~0.15 is not zero.** Two random directions in a 488k-dimensional
+space have cosine ~0.001; 0.14-0.18 is a large, real shared component. Three
+independently-seeded single-iteration PPO updates agree on roughly 15% of their
+direction. (For contrast, the 145-iteration arms measured at 13:00 shared ~25%
+-- the shared fraction grows with training, as one would expect if it is
+systematic rather than noise.)
+
+That matters for interpreting the null-control result. If PPO's updates were
+harmful because each happened to land somewhere bad, different seeds would
+disagree and the harm would average out across the pooled arm. They do not
+disagree: **every seed loses ~4 points while random directions of identical
+magnitude lose ~1.5, and the seeds share a common direction.** The natural
+reading is that the shared component is the harmful part -- a systematic
+gradient bias, not update noise.
+
+**Proposed follow-up, not run tonight:** decompose an update into its
+seed-shared component and its seed-specific residual, perturb the champion
+along each separately, and gate them. If the shared component alone reproduces
+the ~4-point loss while the residual costs ~1.5 like noise, that localises the
+damage precisely and would be the most actionable result this line of work
+could produce. It needs only checkpoints already on disk plus gate time -- no
+training.
