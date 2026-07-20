@@ -1161,3 +1161,56 @@ install that (a) the pool line appears and (b) curriculum_v1 still behaves
 identically — the repo pins that with `zero_replay_weight_matches_legacy_coin`,
 which asserts replay_weight=0 reproduces the legacy rng stream exactly, so the
 existing lineage and the frozen champion stay comparable.
+
+## 2026-07-20 ~09:05 — engine wheel deployed; replay-reset arm is REAL this time
+
+**DEPLOY (trainer box).** Rebuilt and shipped the engine wheel to enable the
+replay-state-reset lever. Recorded in full because this touched the training
+box:
+
+  * `cargo test --lib` green: **83 passed**. Critically
+    `zero_replay_weight_is_bit_identical_to_legacy` passes, so curriculum_v1
+    runs are bit-identical on the new engine — the existing lineage and the
+    frozen champion stay comparable, and every earlier arm's measurement
+    remains valid.
+  * `maturin build --release` -> construct-0.1.0-cp311-abi3-manylinux_2_39.whl.
+    Verified BEFORE shipping: new .so has 4 occurrences of "replay pool", the
+    old one had 0.
+  * **Backup taken first**: /home/elliot/engine_backup_20260719_0613.so.
+    Revert is one cp.
+  * `pip install --force-reinstall --no-deps` -> "Successfully installed".
+    Installed .so 5,126,112 bytes (was 5,043,816), imports clean.
+
+**Positive confirmation, which is the whole point:**
+
+    [curriculum] replay pool data/reset_pool_v5.jsonl: 1081088 read,
+      891720 kept (82.5%), rejected: origin_ball 107741, ball_past_goal 70696,
+      frozen_car 9332, cars_overlap 1555, implausible 44, malformed 0
+      (132.7 MB, 1.64 s)
+    [curriculum] configs/curriculum_v2.toml: effective mix
+      replay 0.700 / kickoff 0.100 / random 0.200 (pool 891720 states)
+
+**Independent second signal.** Episode reward at iter 1, same champion, same
+reward config, same lambda:
+
+    train_v1 kickoff/random (a14)      ep_rew 2.437
+    "replay" arm on the OLD engine     ep_rew 1.313   <- inert, kickoff/random
+    replay arm on the NEW engine       ep_rew 7.361   <- 3x
+
+Replay states start mid-play — ball near the action, cars already positioned —
+so reward accrues far faster per episode than from a kickoff. The reset
+distribution demonstrably changed. Throughput unaffected: 5,160 sps vs 5,148
+for the kickoff/random arm, and the pool costs 1.64 s once at startup.
+
+Attempt 16 running: 1 trainer, lambda_p 0.6383, seed 20260736.
+
+**What this arm can and cannot tell us.** It is one gate, so it inherits the
++/-7% band. It cannot resolve a 5-point effect and I will not claim one from it.
+What it CAN do is what the loop is actually good for: detect a LARGE effect. If
+replay-state resets matter the way the compounding-error literature suggests,
+this should not land at 41% with the others. If it does land at 41%, that is a
+real (if disappointing) datum about the lever, and the FIRST such datum that is
+not confounded by an inert binary.
+
+Baseline for comparison, both vs the same frozen champion, both side orders:
+kickoff/random resets pooled **41.6%** (149-209 over 2 attempts, SE 2.6%).
