@@ -1,0 +1,49 @@
+# Hill-climb arm: replay-state resets (levers doc #1), the one STRUCTURAL lever
+# no arm has tested yet.
+#
+# Every arm so far (anchor strength, reward, entropy, league diversity, action
+# table, lambda sweep) trained from kickoff/random resets only. Those arms
+# established that a competent anchor dominates (~20 points), that the other
+# levers are minor or inert, and that the best configs merely HOLD parity --
+# high lambda buys retention by forbidding change. What none of them varied is
+# WHICH STATES the policy trains from. Replay-state resets put it in
+# human-visited states, which is exactly where the BC prior is competent and
+# where self-play rollouts never go (the compounding-error / DAgger argument).
+#
+# SINGLE VARIABLE: this file is train_v1.toml with curriculum_v2 swapped in and
+# NOTHING else changed. team_size_weights deliberately stays [0.5, 0.3, 0.2]
+# even though the reset pool is duels-only -- 2v2/3v3 arenas renormalize over
+# {kickoff, random} and never draw a replay state, so the realized fleet-wide
+# replay share is ~0.35, not curriculum_v2's nominal 0.7. Raising the 1v1 share
+# to get the full dose would change two things at once and make a gate result
+# unattributable. Half a dose of a clean arm beats a full dose of a confound.
+#
+# Requires data/reset_pool_v5.jsonl (584 MB) present on the training box. If the
+# file is missing the engine warns, disables the replay branch, and continues at
+# renormalized kickoff/random weights -- i.e. it silently degenerates into a
+# train_v1 rerun. VERIFY THE POOL LOADED before believing any gate result from
+# this config.
+schema_path = "schema/v1.toml"
+reward_config_path = "configs/reward_v3.toml"
+curriculum_config_path = "configs/curriculum_v2.toml"
+
+[env]
+num_arenas = 192
+blue = 1
+orange = 1
+seed = 0
+team_size_weights = [0.5, 0.3, 0.2]   # identical to train_v1 -- see note above
+
+[net]
+d_model = 128
+layers = 2
+heads = 4
+ff = 512
+
+[ppo]
+rollout_steps = 256
+gamma = 0.9954
+lam = 0.95
+lr = 2e-4
+clip = 0.2
+entropy_coef = 0.01

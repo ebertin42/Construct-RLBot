@@ -353,10 +353,10 @@ def plan_attempt(attempt, seed, lam, champion, host, rdir, iters, reward,
         "local_dir": str(local_dir),
         "expected_saves": expected_saves(iters, save_every),
         "pattern": pgrep_pattern(tag),
-        "busy_cmd": ["ssh", host, "pgrep", "-af", trainer_pattern()],
+        "busy_cmd": ["ssh", host, "pgrep", "-af", ctl.remote_quote(trainer_pattern())],
         "mkdir_cmd": ["ssh", host, "mkdir", "-p", f"{rdir}/{ck_dir}"],
         "launch_cmd": ["ssh", host, cmd],
-        "poll_cmd": ["ssh", host, "pgrep", "-f", pgrep_pattern(tag)],
+        "poll_cmd": ["ssh", host, "pgrep", "-f", ctl.remote_quote(pgrep_pattern(tag))],
         "list_cmd": ["ssh", host, "ls", "-1", f"{rdir}/{ck_dir}"],
     }
 
@@ -411,7 +411,7 @@ def trainer_busy(runner, host) -> str | None:
     Checked before EVERY attempt: a live arm on the box is the normal state of
     this project, and launching on top of one would fight it for the GPU and
     corrupt both measurements."""
-    res = runner(["ssh", host, "pgrep", "-af", trainer_pattern()])
+    res = runner(["ssh", host, "pgrep", "-af", ctl.remote_quote(trainer_pattern())])
     if _ssh_broken(res):
         raise HillclimbAbort(
             f"cannot reach {host} to check for a running trainer -- refusing to launch "

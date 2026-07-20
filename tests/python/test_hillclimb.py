@@ -873,3 +873,44 @@ def test_full_loop_does_not_stampede_when_launches_never_start(args, tmp_path):
     rows = hillclimb.read_rows(a.log)
     assert all(r["verdict"] == "ERROR" for r in rows)
     assert all("never appeared" in r["reason"] for r in rows)
+
+
+def _ssh_cmds(plan):
+    return [v for k, v in plan.items() if isinstance(v, list) and v[:1] == ["ssh"]]
+
+
+def test_every_glob_char_crossing_ssh_is_quoted_for_the_remote_shell(args):
+    """THE 2026-07-20 SILENT-POLL BUG: ssh does not deliver argv -- it joins the
+    arguments and the remote LOGIN SHELL re-parses them. The trainer box runs
+    zsh, which ABORTS on a glob that matches nothing, so an unquoted
+    bracket_proof pattern made pgrep never run and rc=1 read as "no such
+    process". The poll and the busy check both reported an idle box while a
+    trainer held the GPU at 99%, and a second trainer was launched on top."""
+    a = args()
+    plan = hillclimb.plan_attempt(1, 1, 0.6, CHAMPION, a.host, a.remote_dir,
+                                  a.iters, a.reward, a.entropy_coef)
+    checked = 0
+    for cmd in _ssh_cmds(plan):
+        for token in cmd[2:]:
+            if any(c in token for c in "[]*?"):
+                checked += 1
+                assert token.startswith("'") and token.endswith("'"), (
+                    f"{token!r} carries a glob char across ssh unquoted; "
+                    f"remote zsh will abort the command instead of running it")
+    assert checked, "expected at least one bracket_proof pattern in the plan"
+
+
+def test_busy_check_pattern_is_quoted(args):
+    """--wait-for-idle shares the bug: an unquoted pattern makes the busy check
+    report 'idle' unconditionally, which is exactly how the second trainer got
+    launched on top of the first."""
+    a = args()
+    seen = {}
+
+    def runner(argv, timeout=None):
+        seen["argv"] = argv
+        return FakeResult(1, "")
+
+    hillclimb.trainer_busy(runner, a.host)
+    pattern = [t for t in seen["argv"] if "[" in t]
+    assert pattern and pattern[0].startswith("'") and pattern[0].endswith("'")

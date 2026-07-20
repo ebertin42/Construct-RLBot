@@ -67,6 +67,31 @@ CK_SWEEP_DEFAULT_DIRS = ["checkpoints_entity", "checkpoints_bc", "checkpoints_b"
 # self-match-proof pgrep/pkill pattern helper (pure, tested)
 # ---------------------------------------------------------------------------
 
+def remote_quote(arg: str) -> str:
+    """Single-quote an argument so it survives the REMOTE shell's re-parse.
+
+    `ssh host cmd a b c` does NOT deliver argv -- ssh joins the arguments with
+    spaces and hands the result to the remote LOGIN SHELL, which parses it
+    again. The trainer box runs zsh, and zsh (unlike bash) ABORTS a command
+    whose glob matches nothing:
+
+        $ ssh box pgrep -f hc_a0013_[s]20260733
+        zsh:1: no matches found: hc_a0013_[s]20260733
+        rc=1
+
+    pgrep never ran. Every bracket_proof() pattern is a glob to the remote
+    shell, so the two are a trap in combination: the caller reads rc=1 as
+    "no such process" when the truth is "the command never executed".
+
+    On 2026-07-20 that cost a hill-climb run -- the per-attempt poll and the
+    --wait-for-idle busy check BOTH silently reported an idle box while a
+    trainer was running at 99% GPU, and the loop launched a second trainer on
+    top of the first. Anything containing [ ] * ? that crosses ssh must go
+    through here.
+    """
+    return "'" + arg.replace("'", "'\\''") + "'"
+
+
 def bracket_proof(needle: str) -> str:
     """Turn a literal string into a pgrep/pkill -f (extended-regex) pattern
     that still matches the literal, but does NOT appear as a literal
@@ -643,7 +668,8 @@ def remote_discover_trainer_plan(host: str) -> dict:
 
 
 def remote_kill_plan(host: str, bracketed_pattern: str) -> dict:
-    return remote_ssh(host, "pkill", "-f", bracketed_pattern)
+    # quoted: the brackets are a glob to the remote zsh -- see remote_quote
+    return remote_ssh(host, "pkill", "-f", remote_quote(bracketed_pattern))
 
 
 def remote_launch_command(

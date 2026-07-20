@@ -733,7 +733,9 @@ def test_remote_discover_trainer_plan():
 def test_remote_kill_plan_uses_given_bracketed_pattern():
     pattern = ctl.bracket_proof("ck_000313794560.pt")
     plan = ctl.remote_kill_plan(HOST, pattern)
-    assert plan["argv"] == ["ssh", HOST, "pkill", "-f", pattern]
+    # quoted for the remote shell: the brackets are a glob to the trainer
+    # box's zsh, which aborts the command rather than running pkill
+    assert plan["argv"] == ["ssh", HOST, "pkill", "-f", ctl.remote_quote(pattern)]
 
 
 def test_remote_launch_command_minimal():
@@ -1057,3 +1059,23 @@ def test_main_remote_restart_trainer_dry_run_does_not_execute(capsys, monkeypatc
     out = capsys.readouterr().out
     assert "[dry-run] not executing" in out
     assert "checkpoints_entity/ck_000313794560.pt" in out
+
+
+def test_remote_quote_wraps_for_the_remote_shell():
+    assert ctl.remote_quote("hc_a13_[s]999") == "'hc_a13_[s]999'"
+
+
+def test_remote_quote_survives_an_embedded_single_quote():
+    # the close-reopen dance is the only portable way to get a literal ' inside
+    # a single-quoted shell word
+    assert ctl.remote_quote("it's") == "'it'\\''s'"
+
+
+def test_remote_kill_plan_quotes_the_bracketed_pattern():
+    """pkill -f with an unquoted bracket pattern is aborted by the remote zsh
+    before pkill ever runs -- the process survives and rc=1 reads as 'nothing
+    to kill' (2026-07-20)."""
+    plan = ctl.remote_kill_plan("elliot@host", ctl.bracket_proof("resume_train.py"))
+    pattern = plan["argv"][-1]
+    assert pattern.startswith("'") and pattern.endswith("'")
+    assert "[.]" in pattern
