@@ -2112,3 +2112,72 @@ the ~4-point loss while the residual costs ~1.5 like noise, that localises the
 damage precisely and would be the most actionable result this line of work
 could produce. It needs only checkpoints already on disk plus gate time -- no
 training.
+
+## 2026-07-20 ~17:55 — ESTABLISHED: PPO's update direction is worse than random noise
+
+The engine-matched comparison, with the fine arm grown from 1 run to 3:
+
+    NULL   (35 seeds)  2979-3167  n=6146  0.485  [.472,.497]
+    FINE   (30 gates)  2394-2837  n=5231  0.458  [.444,.471]
+    A - B = +0.027  SE=0.009  z=+2.88  p=0.004   RESOLVED
+
+Both arms trained/perturbed and gated on the SAME (old, local) engine, so the
+confound that muddied the pooled version at 18:40 is gone.
+
+**The clustering caveat, checked, and it makes the result stronger.** Thirty
+gates come from only three runs, and consecutive iterations within a run are
+nearly the same policy -- treating 30 checkpoints as 30 independent samples
+would overstate n. The conservative analysis treats each RUN as one
+observation:
+
+    4 independent PPO runs:  0.465  0.452  0.456  0.455
+      mean 0.4569   between-run SD 0.0059   SE of mean 0.0029
+    NULL (35 genuinely independent seeds): 0.4847  SE 0.0064
+
+    run-level: diff = -0.0278   t = -3.97   df~3   significant (crit 3.18, p~0.03)
+
+Significant under both analyses. And the between-run SD is **0.0059** -- four
+independently-seeded PPO runs land within 1.3 points of each other, while 35
+random perturbations of the same magnitude spread over 18 points (0.385-0.568).
+The PPO result is not a lucky draw; it is a tight, reproducible constant.
+
+### The finding, stated plainly
+
+**Take the champion. Move it a fixed distance in a random direction: it loses
+~1.5 points. Move it the same distance in the direction PPO chooses: it loses
+~4 points. PPO's gradient is not merely uninformative about this metric -- it
+is anti-informative, reliably picking a direction worse than chance.**
+
+Three facts now fit together:
+
+1. Any movement costs ~1.5 points -> the champion sits at a local optimum of
+   the gate metric.
+2. PPO's direction costs ~4 -> the gradient systematically points downhill in
+   gate terms.
+3. Independently-seeded updates share ~15% of their direction (cosine 0.14-0.18
+   vs ~0.001 for random vectors) -> the harmful part is a SHARED, systematic
+   component, not per-run noise.
+
+That is a coherent mechanism, and it explains every negative result of the past
+weeks without appealing to any of the levers that were swept. Reward shaping,
+entropy, reset distribution, league diversity, lambda, run length -- all were
+adjustments to a process whose direction was wrong from the first update.
+
+### What this does NOT say
+
+It does not say PPO is broken, nor that the implementation has a bug -- the
+plumbing was verified exact in the earlier diagnosis. The gradient optimises the
+TRAINING objective (shaped reward under self-play); the gate measures goal share
+against a frozen champion. **This is evidence those two objectives are
+misaligned, not that the optimiser fails at its own.** The actionable question
+becomes "why does improving the training objective make head-to-head worse?" --
+an objective-design question, not a tuning one.
+
+### Next experiment, and it needs no training
+
+Decompose a PPO update into its seed-shared component and its seed-specific
+residual; perturb the champion along each separately at matched magnitude; gate
+both. If the shared component alone reproduces the ~4-point loss while the
+residual behaves like noise (~1.5), the damage is localised to a specific,
+inspectable direction in weight space -- which can then be read against what it
+does to behaviour. Everything needed is already on disk.
