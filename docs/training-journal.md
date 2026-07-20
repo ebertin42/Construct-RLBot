@@ -1741,3 +1741,38 @@ saving every 2 iterations would localise it -- and if the drop is at iteration
 1-2, the suspect is the resumption itself (optimizer state, value-head
 re-fitting, the first large policy update) rather than anything about the
 training signal.
+
+## 2026-07-20 ~16:00 — the local engine is the INSTRUMENT, and it must not be touched
+
+While scoping the fine-grained follow-up I checked the local engine:
+
+    python/construct/_engine.abi3.so   built 07-19 06:13
+    strings ... | grep -c "replay pool"  ->  0
+
+**The local box still runs the OLD engine.** I only ever deployed the rebuilt
+wheel to the trainer box. Two consequences, one reassuring and one a trap I
+nearly walked into.
+
+**Reassuring:** the gate runs LOCALLY, so every gate all night -- armA through
+armH, a14-a19, all six long600 rungs -- has been scored in one fixed
+environment. That is precisely why the arm-vs-champion results survive the
+14:40 training-engine confound. The measuring instrument never moved.
+
+**The trap:** my next thought was to run the fine-grained experiment locally,
+notice it would use the old engine while long600 uses the new one, and "fix"
+that by installing the new wheel locally. That would have **changed the gate
+environment mid-trajectory** -- every rung gated after the upgrade silently
+incomparable with every rung gated before, including the six already recorded.
+It is the same confound as 14:40 with the sign flipped, and it would have been
+introduced deliberately, in the name of consistency.
+
+**Rule, now explicit: the local engine is the instrument. It does not get
+upgraded while measurements are in flight.** If it ever must change, every
+comparison spanning the change needs re-gating, not reasoning.
+
+**Consequence for the fine-grained experiment, which is fine.** Run it LOCALLY
+on the old engine and compare it against the OLD-engine arms (a14+a15, 0.416 at
+145 iters). That is internally consistent and answers the question as posed --
+"is the loss incurred in the first few iterations?" -- without touching either
+the instrument or the running 600-iter job on the remote. The new-engine version
+of the same question can be asked later on the trainer box once long600 is done.
