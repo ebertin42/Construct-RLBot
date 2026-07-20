@@ -2556,3 +2556,33 @@ another arm. Another lambda or reward sweep would be motion, not progress.
   * `scripts/decompose_update.py` — shared vs seed-specific update components.
   * hill-climb fixes: appear-phase poll, whole-dependency preflight, quarantine
     for harness-bug rows, and `ctl.remote_quote` for the ssh/zsh glob trap.
+
+## 2026-07-20 ~19:40 — the 600-iteration run is complete; closing the trajectory experiment
+
+    iter 580  0.453 | iter 600  0.461
+
+    FINAL: 30 rungs, iterations 20-600
+    Cochran-Armitage trend: z=+0.02  p=0.980   NO RESOLVED TREND
+    POOLED: 2464-2954  n=5418  0.455  [.442,.468]   vs parity z=-6.66
+
+Thirty checkpoints across 600 iterations of training — 100M environment steps
+past the champion — and the line does not move. The final estimate is 4.5
+points below the champion with a +/-1.3% interval, which is precisely where the
+FIRST update put it.
+
+The trajectory experiment set out to test whether the ~145-iteration bound
+every previous arm used was the limitation. It was not. There is no rise to
+find at 300 iterations, no late collapse at 500, no optimal stopping point in
+between. The policy steps off the champion once and then holds station for as
+long as anyone cares to pay for.
+
+Run completed cleanly: 600/600, `iter 600 steps 420,618,240 sps 5,276`, trainer
+exited on its own. The trainer box is now idle and is being left that way — see
+the consolidated summary (a3c440a) for why starting another tuning arm would be
+motion rather than progress.
+
+**Nothing was promoted tonight.** Champion ck_000320471040 is unchanged after 6
+hill-climb attempts, 8 arms, 30 long600 rungs, 30 fine-grained rungs, 35 null
+controls and 6 decomposition probes. Every one of those FAIL verdicts was
+correct, and the one PASS that did occur came from pure random noise at 56.3% —
+caught by the confirmation gates rather than by luck.
