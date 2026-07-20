@@ -927,7 +927,7 @@ def check_match_mode_required(reward_cfg, curriculum_cfg):
     """Refuse win-probability shaping without a match layer.
 
     PHI is a function of score and remaining clock. With match_mode off there
-    is no score and no clock, PHI is pinned at 0.5 forever, and the shaping
+    is no score and no clock, PHI is pinned at 0 forever, and the shaping
     term is identically zero -- so the run trains on nothing at all while every
     log line looks normal. Fail at startup instead.
     """

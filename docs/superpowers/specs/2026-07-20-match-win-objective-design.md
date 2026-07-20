@@ -255,13 +255,18 @@ Rust (engine):
 * a goal does NOT set `terminated`; score increments; kickoff reset occurs
 * clock expiry DOES set `terminated`
 * score resets to 0-0 at match start, not at kickoff
-* PHI is complementary: `PHI(d, t) == 1 - PHI(-d, t)` for all d, t
-* PHI at 0-0 is exactly 0.5 for EVERY clock value, not just kickoff
+* PHI NEGATES exactly: `PHI(d, t) == -PHI(-d, t)` for all d, t. This is what
+  the recentring buys and it is stronger than the complementarity a raw
+  sigmoid gives (`1 - PHI(-d,t)`), which is NOT the same thing and does not
+  yield a zero-sum shaped game.
+* PHI at 0-0 is exactly 0 for EVERY clock value, not just kickoff
 * PHI sharpens monotonically: a +1 lead is worth strictly more at 30 s
   remaining than at 270 s
 * `T_FLOOR` holds: PHI stays finite and bounded at t_remaining = 0
 * the shaped game is zero-sum: blue's shaped reward equals -orange's on every
-  transition (follows from complementarity, but assert it directly)
+  transition, AT EVERY GAMMA. Assert it across a gamma sweep including the
+  production value 0.9954 -- a test pinned at gamma=1.0 passes even when the
+  property is broken, which is exactly how the original defect survived.
 * v5 config parses; historical reward_v0/v3/v4_1 configs still parse
 
 Python:
