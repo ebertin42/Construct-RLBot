@@ -296,6 +296,20 @@ impl EpisodeArena {
             blowup_count: 0,
             jitter_enabled: true,
         };
+        // Positive confirmation, mirroring the "[curriculum] replay pool ..."
+        // line. On 2026-07-20 an arm ran fully INERT because a missing
+        // capability degraded to a silent no-op and the run looked normal.
+        // "Is the objective live?" must be answerable from the log, never
+        // inferred from the absence of an error.
+        if this.curriculum.as_ref().map_or(false, |c| c.match_mode) {
+            eprintln!(
+                "[match] match_mode ON: full matches of {} s, win_prob_weight={}, \
+                 k_base={}, t_floor={}, gamma={}",
+                MAX_TICKS / TICKS_PER_SEC,
+                this.reward_cfg.win_prob_weight, this.reward_cfg.win_prob_k_base,
+                this.reward_cfg.win_prob_t_floor, this.reward_cfg.win_prob_gamma,
+            );
+        }
         this.reset_episode();
         this.start_match(0);
         this
@@ -772,6 +786,11 @@ impl EpisodeArena {
         //
         // LEGACY MODE: unchanged. A goal terminates. The goal-share screen and
         // every historical gate depend on this exact behavior.
+        //
+        // Captured BEFORE the block below increments score_blue/score_orange:
+        // this is the match state as of `self.prev_state`, i.e. the score
+        // going INTO this step, which `ms_prev` (below) needs.
+        let (prev_score_blue, prev_score_orange) = (self.score_blue, self.score_orange);
         let (terminated, truncated, needs_kickoff) = if self.match_mode() {
             if let Some(team) = scored {
                 match team {
@@ -798,9 +817,25 @@ impl EpisodeArena {
             (t, tr, false)
         };
 
+        // Match state BEFORE this step's goal was applied, and after. The
+        // shaping term is the change in potential between them.
+        let ms_prev = MatchState {
+            score_blue: prev_score_blue,
+            score_orange: prev_score_orange,
+            t_frac: self.match_state(self.prev_state.tick_count).t_frac,
+        };
+        let ms_cur = self.match_state(cur.tick_count);
+
         for a in 0..n {
             let ci = self.agent_car_index(&cur, a);
-            rewards[a] = reward::compute(&self.prev_state, &cur, ci, scored, &self.reward_cfg);
+            let mut r = reward::compute(&self.prev_state, &cur, ci, scored, &self.reward_cfg);
+            if self.match_mode() {
+                r += reward::win_prob_shaping(
+                    &ms_prev, &ms_cur, cur.cars[ci].team,
+                    self.reward_cfg.win_prob_gamma, &self.reward_cfg,
+                );
+            }
+            rewards[a] = r;
             flags[a] = StepFlags { terminated, truncated };
         }
 

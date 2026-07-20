@@ -282,3 +282,59 @@ fn zero_spirit_is_bit_identical_to_unblended() {
         assert_eq!(ra, rb, "step {step}");
     }
 }
+
+#[test]
+fn match_mode_run_accumulates_shaped_reward_and_ends_on_the_clock() {
+    // End-to-end: a match-mode arena must (a) not terminate on a goal,
+    // (b) eventually terminate on the clock, (c) produce nonzero shaped
+    // reward once a goal has been scored.
+    let curriculum = construct_engine::curriculum::CurriculumConfig::load(
+        "../configs/curriculum_v3_match.toml").expect("curriculum_v3_match");
+    assert!(curriculum.match_mode, "v3 must enable match mode");
+
+    let cfg = construct_engine::reward::RewardConfig::load(
+        "../configs/reward_v5_winprob.toml").expect("reward_v5");
+    assert!(cfg.win_prob_weight > 0.0, "v5 must enable win-prob shaping");
+    assert_eq!(cfg.goal, 0.0, "v5 must not double-pay a raw goal term");
+    assert!((cfg.win_prob_gamma - 0.9954).abs() < 1e-9,
+            "v5 gamma must match configs/train_v1.toml [ppo] gamma");
+
+    // (a)/(b)/(c): drive a real 1v1 match-mode arena. Force an immediate goal
+    // by warping the ball into the net, then keep stepping with a no-op
+    // action until the clock ends the match (300s @ tick_skip from schema).
+    ensure_init(None);
+    let s = Schema::load("../schema/v0.toml").unwrap();
+    let mut a = EpisodeArena::new_with_curriculum(
+        1, 1, s.tick_skip, cfg, s.normalization, 7, Some(curriculum));
+
+    let mut r = vec![0.0; 2];
+    let mut f = vec![StepFlags::default(); 2];
+    let mut fo = vec![0.0; 2 * OBS_SIZE];
+
+    // Force a goal early: a match-mode episode must NOT terminate on it.
+    // 300s of match clock at tick_skip=8/120Hz is 4500 steps; a termination
+    // any earlier than that would mean the goal (not the clock) ended it.
+    a.debug_place_ball([0.0, 5200.0, 320.0], [0.0, 2000.0, 0.0]);
+    let mut goal_seen = false;
+    let mut nonzero_shaped_seen = false;
+    let mut terminated_at = None;
+    for step in 0..6_000 {
+        a.step(&[0, 0], &mut r, &mut f, &mut fo);
+        if !goal_seen && (r[0].abs() > 1e-6 || r[1].abs() > 1e-6) {
+            // First nonzero reward after the goal-scoring warp is the win-prob
+            // shaping term (goal = 0.0 in v5, so it can't be a raw goal payout).
+            goal_seen = true;
+            nonzero_shaped_seen = true;
+            assert!(step < 4400, "goal must land well before the clock runs out, got step {step}");
+        }
+        if f[0].terminated || f[0].truncated {
+            terminated_at = Some(step);
+            break;
+        }
+    }
+    assert!(nonzero_shaped_seen, "shaped reward must be nonzero once a goal has been scored");
+    let t = terminated_at.expect("match must eventually end on the clock");
+    assert!(t >= 4400, "match ended at step {t}, before the clock — a goal must not have ended it");
+    assert!(f[0].terminated, "match end must be a termination, not a truncation");
+    assert!(!f[0].truncated, "match mode truncated must always be false (Elliot's 2026-07-20 ruling)");
+}

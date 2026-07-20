@@ -1,0 +1,15 @@
+# Curriculum v3 — full-match episodes (task #56 Phase 1).
+#
+# Identical reset mixture to curriculum_v1, plus match_mode. Reset mixture is
+# held fixed ON PURPOSE: Phase 1 varies the objective and nothing else, so any
+# gate movement is attributable. Combining this with the replay pool would
+# repeat the 2026-07-20 confound where two variables moved at once.
+match_mode = true
+kickoff_weight = 0.4
+random_weight = 0.6
+
+[random]
+car_speed_max = 1800.0
+ball_speed_max = 2500.0
+z_max = 1700.0
+min_separation = 300.0
