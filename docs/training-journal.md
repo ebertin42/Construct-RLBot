@@ -1979,3 +1979,62 @@ there to tell apart.
 
 Launching 20 more null seeds (they need no training, only gate time) to push
 the decisive comparison as far as one night allows.
+
+## 2026-07-20 ~18:40 — 35 null seeds: the answer is BOTH, and my prediction was binary
+
+    NULL random-direction (35 seeds)  2979-3167  n=6146  0.485  [.472,.497]
+        vs parity: z=-2.40  p=0.0165   BELOW parity
+    ALL PPO checkpoints (19 gates)    1553-1829  n=3382  0.459  [.442,.476]
+        vs parity: z=-4.75  p<0.0001   BELOW parity
+
+    NULL - ALL PPO = +0.026  SE=0.011  z=+2.39  p=0.0169   RESOLVED
+
+**The pre-registered prediction was wrong in its structure, not just its
+value.** At 17:00 I wrote: random near 0.465 means (b) any movement is harmful;
+random near 0.500 means (a) PPO's direction is harmful. It landed at **0.485**,
+squarely between them, and the truth is that BOTH effects are real and they
+stack:
+
+  * Moving the champion AT ALL costs ~1.5 points. The champion does sit at a
+    local optimum of the gate metric -- (b) is real, and my 17:20 "costs
+    nothing" reading was wrong twice over (3 seeds said 0.501, 15 said 0.481,
+    35 say 0.485 and it is now significantly below parity).
+  * PPO's DIRECTION costs a further ~2.6 points beyond that -- (a) is real too.
+    **PPO's update is significantly worse than a random perturbation of
+    identical magnitude and identical per-layer profile.**
+
+I framed a binary and reality was additive. Worth noting for its own sake: a
+forced-choice prediction is a good discipline against retro-fitting, and a bad
+model of a world where two mechanisms can both be true.
+
+### The caveat that keeps this from being a headline
+
+Splitting the PPO pool by training engine:
+
+    NULL - PPO fine 1-10    (OLD engine)  +0.019  z=+1.44  p=0.150  NOT RESOLVED
+    NULL - PPO long600      (NEW engine)  +0.032  z=+2.31  p=0.021  RESOLVED
+
+The resolved verdict leans on the pooled arm. The two PPO arms do not differ
+from each other (0.465 vs 0.453, p~0.48), so pooling is statistically
+defensible -- but the engine-matched comparison, which is the cleanest one
+available, does NOT resolve. And p=0.0169 is a single result among many tests
+run tonight; the specific comparison was set up in advance, but the branch it
+landed on was not one of the two I named.
+
+**Status: PPO's direction being worse than random is SUPPORTED, not
+established.** Resolving +0.026 properly wants ~33 gates per arm; the null arm
+now has 35, the PPO arm 19. More PPO checkpoints -- which cost training time,
+unlike null seeds -- are what this needs.
+
+### What is now solid after a full night
+
+1. The champion sits at a local optimum: any perturbation costs ~1.5 points.
+2. PPO's first update costs ~4 points, and the entire effect is incurred by
+   that FIRST update -- flat through iteration 10 (p=0.824) and through
+   iteration 180 (p=0.768).
+3. Pure noise spans 0.385-0.568 across 35 seeds. Every arm measured tonight
+   lives inside that band.
+4. Nothing has ever beaten the champion: 6 hill-climb attempts, 8 arms, 19
+   long600 rungs, 10 fine rungs, 35 null controls. The pointer never moved.
+5. A random perturbation PASSED the 52% gate. The confirmation-gate design is
+   not paranoia; it is the difference between a champion and a coin flip.
