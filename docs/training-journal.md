@@ -1877,3 +1877,48 @@ if random perturbation gates near 0.465 the answer is (b) and the diagnosis
 changes completely; if it gates near 0.500 the answer is (a) and PPO's
 direction is genuinely harmful. I do not have a strong prior between them,
 which is the mark of a worthwhile experiment.
+
+## 2026-07-20 ~17:20 — the null control lands, and it points at (a)
+
+Three matched random-direction controls (champion moved ||d||=1.7796 -- exactly
+one PPO iteration's distance -- per-tensor matched, direction random):
+
+    nullctl seed1  94- 73  56.3%   PASS   <- random noise PASSED the champion gate
+    nullctl seed2  90- 84  51.7%   FAIL
+    nullctl seed3  80-106  43.0%   FAIL
+
+    NULL pooled          264-263  n= 527  0.501  [.458,.543]  vs parity p=0.97
+    PPO fine  1-10       817-939  n=1756  0.465  [.442,.489]  vs parity p=0.0036
+    PPO long600 20-180   736-890  n=1626  0.453  [.429,.477]  vs parity p=0.0001
+
+**Random movement of the same size costs nothing. PPO's movement costs ~4
+points.** That is explanation (a) from the registered prediction: the update
+DIRECTION is what hurts, not the mere fact of moving. The champion is not
+simply sitting on a needle-point local optimum where any perturbation falls off
+-- perturb it randomly and it holds parity.
+
+**But the direct comparison is NOT resolved, and saying otherwise would be a
+fallacy I should name.**
+
+    NULL - PPO(fine) = +0.036  SE=0.025  z=+1.44  p=0.1505  NOT RESOLVED
+    (needs ~17 gates per arm; the null arm has 3)
+
+"NULL is indistinguishable from parity" and "PPO is significantly below parity"
+are two separate tests, and concluding from them that NULL differs from PPO is
+**the difference-of-significance fallacy** -- comparing each to a threshold
+instead of to each other. The honest position right now is: the evidence leans
+to (a), and the decisive test is underpowered. Twelve more null seeds are
+gating (null controls need no training, only gate time, so this is cheap).
+
+**Separately important: seed1 PASSED the gate at 56.3%.** A pure random
+perturbation of the champion cleared the 52% promote threshold. At n~180 per
+gate that is exactly what the arithmetic predicts, and it is the strongest
+possible vindication of the confirmation-gate design added this morning: had
+this been a real candidate under `--promote-if-pass` with `n_confirm=0`, noise
+would have taken the belt. It also retroactively justifies refusing to lower
+the threshold after a16's 52.0% near-miss.
+
+Note too the null arm's spread: 43.0 to 56.3, thirteen points across three
+seeds of PURE NOISE. Any single gate reading in the 43-56 band is consistent
+with a policy that differs from the champion by nothing at all. That is the
+band every arm tonight has been living in.
