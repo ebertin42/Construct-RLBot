@@ -2360,3 +2360,62 @@ Worth noting what the shared/residual split has already achieved regardless:
 the shared probe is INDISTINGUISHABLE from a real PPO update (p=0.811) while
 carrying only ~39% of an update's length. Whatever the direct comparison
 concludes, a minority of the update reproduces all of its harm.
+
+## 2026-07-20 ~19:00 — LOCALISATION REFUTED: every part of a PPO update is harmful
+
+Full sweeps in. Shared arm to 17 match seeds, residual arm to all three
+directions x 9 seeds:
+
+    SHARED   (17 seeds)      1304-1586  n=2890  0.451  [.433,.469]
+    RESIDUAL (3 dirs x 9)    2107-2604  n=4711  0.447  [.433,.461]
+    NULL random (35)         2979-3167  n=6146  0.485  [.472,.497]
+    real PPO (30)            2394-2837  n=5231  0.458  [.444,.471]
+
+    SHARED   vs NULL: -0.0335  z=-2.98  p=0.0029  DIFFERS
+    RESIDUAL vs NULL: -0.0375  z=-3.88  p=0.0001  DIFFERS
+    SHARED   vs PPO : -0.0064  p=0.576   same
+    RESIDUAL vs PPO : -0.0104  p=0.298   same
+    SHARED vs RESIDUAL: +0.0040  z=+0.34  p=0.736  NOT RESOLVED
+
+**This is registered outcome #2, and it kills the localisation hypothesis.**
+At 18:35 I wrote that a residual indistinguishable from noise would mean the
+damage lives in the shared component, and that a residual also below noise
+would mean "any PPO-derived direction is harmful" and the split is the wrong
+decomposition. The second one happened.
+
+**And the 18:50 entry was built on one residual direction.** resid1 alone gave
+0.479 (p=0.680 vs null) and I reported the residual as noise-like. The other
+two directions are 0.455 and 0.410. Pooled: 0.447, four sigma below null.
+resid1 was the outlier of three. Fourth time tonight a reading has reversed on
+more data, and this one I had explicitly framed as the completeness check --
+the check itself needed a completeness check.
+
+### What actually holds
+
+Both the seed-SHARED direction and the seed-SPECIFIC residuals are
+significantly worse than random perturbation, indistinguishable from each other,
+and indistinguishable from real PPO updates. **The harm is not carried by a
+privileged component. Every direction the gradient produces -- the part all
+seeds agree on and the part only one seed found -- is worse than chance.**
+
+That is a stronger and more general statement than localisation would have
+been, and it is worse news. It says the problem is not a specific correctable
+bias inside the update; it is that the whole gradient-derived subspace points
+away from gate performance.
+
+### The intervention I was about to propose is now dead
+
+At 18:35 I proposed projecting the shared direction out of PPO updates during
+training. **That would not help.** Projecting out the shared component leaves
+the residual, which is equally harmful. Recording this explicitly because it was
+the first concrete intervention this line of work had produced and it survived
+about twenty minutes.
+
+### Where that leaves the diagnosis
+
+Unchanged in its core, sharper in its implication: PPO's gradient is
+anti-informative with respect to head-to-head goal share, and no decomposition
+of the update rescues it. The misalignment is between the OBJECTIVES, not
+inside the optimiser's step. Fixing it means changing what is optimised --
+which is the match-win objective work already sitting in the backlog (#56),
+not another tuning pass.
