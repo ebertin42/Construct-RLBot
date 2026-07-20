@@ -1682,3 +1682,62 @@ a lucky sample, a sound measurement of the wrong quantity, and one influential
 point. This one is: **a passing test cited for a claim it does not make.** The
 test was green, the reasoning around it was not, and green tests are exactly
 what one stops interrogating.
+
+## 2026-07-20 ~15:50 — the trajectory is FLAT, and the damage is immediate
+
+Six rungs of the 600-iter run gated against the frozen champion (same local
+eval engine for every rung, so the rungs are mutually clean AND clean against
+every earlier arm):
+
+    iter  20   82-118   0.410  [0.344,0.479]
+    iter  40   82- 89   0.480  [0.406,0.554]
+    iter  60   99- 98   0.503  [0.433,0.572]
+    iter  80   78-106   0.424  [0.355,0.496]
+    iter 100   79- 88   0.473  [0.399,0.549]
+    iter 120   77- 91   0.458  [0.385,0.534]
+
+    Cochran-Armitage trend: z=+0.53  p=0.597   NO RESOLVED TREND
+    POOLED (iters 20-120)  497-590  n=1087  0.457  [0.428,0.487]
+    vs parity 0.500:       z=-2.82  p=0.0048  significantly BELOW the champion
+
+**Two findings, and the second is the one that matters.**
+
+**1. Over iterations 20-120 the policy is flat.** No trend, and the pooled
+estimate is tight (n=1087, +/-3%) and clearly below the champion. More training
+across this range neither helps nor hurts. Note the shape 41.0 -> 48.0 -> 50.3
+-> 42.4 -> 47.3 -> 45.8 *looks* like a rise-then-fall, and the trend test says
+it is not: p=0.597. Six overlapping intervals wobbling around a flat line is
+exactly what this instrument produces from a constant. I would have drawn a
+curve through those points by eye; the tool built two hours ago refused, which
+is the whole reason it exists.
+
+**2. The damage is IMMEDIATE, not gradual.** By iteration 20 -- 3.3M steps,
+about 1.4% of the champion's training -- the policy is already at 41.0% and it
+never returns to parity. This kills the "PPO slowly erodes the policy" picture I
+have been carrying. Whatever happens, happens almost at once and then stops.
+
+That reframes the whole night. Every arm ran 145 iterations and landed in
+41-52%; it now appears essentially all of that displacement is incurred in the
+first ~20 iterations, and the remaining 125 are noise around the new level. The
+lambda sweep, the reset distribution, the entropy setting -- all of them were
+tuning a process whose effect is over before they get a chance to matter.
+
+**The engine effect is NOT resolved.** long600 (new engine, iters 20-120)
+pooled 0.457 vs a14+a15 (old engine, iter 145) 0.416: +0.041, z=+1.36, p=0.173,
+NOT RESOLVED. So the confound identified at 14:40 is real but its magnitude is
+unmeasured, and these two selections differ in iteration count as well as
+engine. The clean comparison is the iter-140 rung against a14+a15, both at
+~the same iteration count -- that rung is next.
+
+**What this does NOT yet answer.** The run continues to 600. Iterations 20-120
+being flat says nothing about 120-600; a slow recovery or a late collapse would
+both still be invisible here. That is precisely why the run was set to 600 and
+why the rungs keep getting gated.
+
+**Immediate next question worth its own experiment:** if the loss is incurred in
+the first ~20 iterations, what happens in the first 5? Rungs exist only every
+20 iterations, so the interesting region is currently unresolved. A short run
+saving every 2 iterations would localise it -- and if the drop is at iteration
+1-2, the suspect is the resumption itself (optimizer state, value-head
+re-fitting, the first large policy update) rather than anything about the
+training signal.
