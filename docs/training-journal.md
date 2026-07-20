@@ -938,3 +938,55 @@ pool is now on the box, md5 verified. A preflight (22c757a) refuses to launch
 that arm if the pool is missing, because the engine's failure mode is to warn
 and quietly fall back to kickoff/random — which would have measured a train_v1
 rerun, reported parity, and taught us the opposite of the truth.
+
+## 2026-07-20 ~07:10 — first REAL hill-climb gate: attempt 14 FAILs at 41.2%
+
+Every prior hill-climb row was a phantom produced by the blind-poll bug. This
+is the first attempt that actually trained, actually gated, and actually
+recorded a share.
+
+    attempt 14  lambda_p 0.6647  reward v3  145 iters  seed 20260734
+    candidate hc_a0014_s20260734_ck_000343838720
+    -> FAIL  share 41.2%  (threshold 52.0%)
+    champion untouched at ck_000320471040.pt
+
+**The harness is now proven on a full cycle**: launch -> poll sees the trainer
+-> 145 iters -> newest checkpoint fetched -> gated both side orders -> verdict
+recorded -> champion pointer left alone -> next attempt. That was the thing
+that needed proving tonight, and it is proven.
+
+**Do NOT over-read the number.** Placed against the lambda ladder it looks
+non-monotone:
+
+    lambda 0.2   -> 32.8%
+    lambda 0.5   -> 46.4%
+    lambda 0.66  -> 41.2%   <- attempt 14
+    lambda 1.0   -> 49.2%
+
+That is tempting to read as "0.66 is a bad spot". It is not readable as
+anything yet. One gate is ~185 goals, so the binomial SE on the share is
+~3.7% and the 95% band is roughly +/-7%: 41.2% spans 34-48%, which comfortably
+contains the lambda-0.5 arm's 46.4%. **n=1 cannot order these points.** Writing
+"0.66 is worse than 0.5" into the journal on this evidence is exactly the
+selection error that produced the retracted "562M is the high-water mark"
+claim, and the same error the confirmation gates exist to stop on the promote
+side. It deserves the same discipline on the failure side.
+
+What the night's remaining attempts actually buy is that scatter: several
+distinct seeds across the 0.5-0.7 band, all measured against the same frozen
+champion. If the between-seed spread turns out comparable to the +/-7%
+within-gate band, then the whole lambda ladder above is a noise field and the
+"monotone, saturating" reading from 06:50 needs retracting too. That is a live
+possibility and I would rather find it than defend the earlier story.
+
+**Loop restarted onto quarantine-aware code** (the running process still held
+the pre-quarantine build). Done while attempt 15 was ~1 minute in rather than
+77 minutes in. Streak counter now reads 1 (the one real FAIL) instead of 14.
+Attempt 15 relaunched at lambda_p 0.6196, verified visible to the loop's poll.
+
+**Trap re-encountered, as documented.** The compound
+`ssh box 'pkill -f "hc_a0015_[s]20260735"; rm -rf .../hc_a0015_s20260735'`
+died with 255: the `rm` argument put the literal string in the shell's own
+cmdline, so pkill matched and killed the shell running it. Bracket-proofing
+protects the pattern against ITSELF, not against a sibling command in the same
+compound string. Minimal one-purpose ssh calls, every time.
