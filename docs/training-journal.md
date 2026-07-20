@@ -1340,3 +1340,58 @@ is a HYPOTHESIS, not a measurement: it needs a direct check that the replay-arm
 policy actually diverged from the champion (behavioural distance, or the
 training kl_pri trace) where armH's did not. Until that check exists, the honest
 summary is two arms that both hold parity.
+
+## 2026-07-20 ~13:00 — parameter-space geometry: all arms move identically, and my "freezing" story is untestable this way
+
+Preserved first: the 8 arm checkpoints were living in `/tmp/claude-1000/ab/`
+(46 MB) -- the entire evidence base for the ladder, sitting in a scratch dir one
+cleanup away from gone. Copied to `checkpoints_arms_archive/`.
+
+Then measured drift from the champion in parameter space (58 float tensors,
+champion weight norm 71.48):
+
+    armG lambda 0.5    ||d|| 16.308   22.82% of ||W||
+    armH lambda 1.0    ||d|| 15.776   22.07%
+    a14 kickoff/random ||d|| 16.233   22.71%
+    a15 kickoff/random ||d|| 16.264   22.75%
+    a16 replay         ||d|| 16.162   22.61%
+    a17 replay         ||d|| 15.967   22.34%
+
+Every arm moves the SAME distance -- a 0.75-point spread across lambda 0.5 to
+1.0, across two different reset distributions, across four seeds. And pairwise
+cosine of the update directions is ~0.25 for **every** pair, with no clustering
+whatsoever: the two replay arms are no more similar to each other (0.250) than
+either is to a kickoff/random arm (0.252-0.259) or to armH (0.258-0.261).
+
+Read literally that says each run's update is roughly 25% a shared drift
+direction and 75% run-specific noise, with no arm-specific signature at all.
+
+**But it does NOT test the hypothesis I wrote it to test, and I nearly claimed
+it did.** At 11:55 I proposed that armH reaches parity by FREEZING while the
+replay arm reaches parity while still MOVING. The obvious reading of the table
+above is "armH moved 22.07%, so armH is not frozen, hypothesis refuted" -- and
+that reading is wrong. **The kl_prior penalty constrains the output
+distribution, not the parameters.** A run at lambda 1.0 is free to move weights
+as far as it likes along directions that leave the policy's action
+distribution unchanged, and in a 488k-parameter network there are enormously
+many such directions. Weight-space distance and behavioural distance are
+different quantities, and only the second bears on freezing.
+
+That is the sixth time tonight a plausible number would have carried me to a
+wrong conclusion, and the first where the number was entirely correct and the
+INFERENCE was the defect. Worth naming the difference: the earlier five were
+broken measurements; this one is a sound measurement of the wrong thing.
+
+**What is genuinely suggestive:** the complete absence of arm structure in
+parameter space. If replay resets were pushing the policy somewhere
+qualitatively different, some hint of clustering might have been expected --
+and there is none. That is weak evidence, not strong, precisely because
+parameter geometry is a poor proxy for behaviour.
+
+**Next tool, now clearly the highest-value one:** behavioural distance --
+KL between action distributions of candidate and champion over a shared, fixed
+batch of states, plus action-agreement rate. That measures what lambda actually
+constrains, would settle the freezing question, and would say whether the replay
+arm differs from the kickoff/random arm in DIRECTION rather than magnitude.
+Deliberately not rushed into existence in the 15 minutes before a18 gates --
+a half-verified tool is how five of tonight's six errors happened.
