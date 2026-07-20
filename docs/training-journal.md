@@ -2038,3 +2038,40 @@ unlike null seeds -- are what this needs.
    long600 rungs, 10 fine rungs, 35 null controls. The pointer never moved.
 5. A random perturbation PASSED the 52% gate. The confirmation-gate design is
    not paranoia; it is the difference between a champion and a coin flip.
+
+## 2026-07-20 ~19:05 — 14 rungs still flat; strengthening the engine-matched test
+
+    iter 200  109-108  0.502    iter 260  90- 95  0.486
+    iter 220   86-102  0.457    iter 280  70- 92  0.432
+    iter 240   79-117  0.403
+
+    Cochran-Armitage across 14 rungs: z=-0.16  p=0.873   NO RESOLVED TREND
+    long600 iters 20-280 POOLED: 1170-1404  n=2574  0.455  [.435,.474]
+
+Still flat, now across 260 iterations of training. The trajectory experiment
+has done its job: there is no shape to find.
+
+The pooled null comparison strengthens as PPO gates accumulate:
+
+    NULL - long600   +0.030  z=+2.58  p=0.0100  RESOLVED
+    NULL - ALL PPO   +0.026  z=+2.61  p=0.0091  RESOLVED   (was p=0.0169)
+
+But the caveat from 18:40 is untouched: the ENGINE-MATCHED comparison
+(NULL vs the local old-engine fine run) is still +0.019, p=0.150, because the
+fine arm has not grown. That is the cleanest test available and the one the
+conclusion should rest on, so it is the one worth paying for.
+
+**Fine run #2 launched** (local, old engine, seed 20260742, otherwise identical
+to the first). Two more such runs would take the fine arm from n~1756 to
+n~5300, which by the arithmetic brings the engine-matched z from 1.44 to ~2.09
+-- i.e. actually resolves it rather than leaving the verdict leaning on a pooled
+arm that mixes engines. Roughly 1.2 h of local GPU, and the remote box is busy
+with long600 anyway, so it costs nothing that is otherwise in use.
+
+Small recurrence worth logging: `pgrep -c -f "resume_trai[n].py"` reported **2**
+local trainers when there was one. The compound command that ran it contained
+the literal string `resume_train.py` in its launch clause, so the wrapping shell
+matched the pattern. Third distinct form of this trap tonight (after the
+compound pkill+rm that died 255, and the hillclimb `--status` false count).
+Bracket-proofing defends a pattern against ITSELF; it does nothing about a
+sibling clause in the same command line.
