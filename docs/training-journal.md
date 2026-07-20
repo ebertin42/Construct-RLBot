@@ -1029,3 +1029,54 @@ md5-verified, preflight guarding the silent-fallback failure mode.
 
 **Push unblocked.** Elliot granted it; 3e07b5e..2833738 pushed to
 origin/bc-pretrain (7 commits). Nothing outstanding.
+
+## 2026-07-20 ~08:20 — n=2, and the lambda ladder above 0.5 is UNRESOLVABLE
+
+    attempt 15  lambda_p 0.6196  -> FAIL  share 42.0%  (74-102)
+    attempt 14  lambda_p 0.6647  -> FAIL  share 41.2%  (75-107)
+    pooled hill-climb: 149-209, n=358, share 41.6%, SE 2.6%
+
+**RETRACTION of the 06:50 reading.** I wrote that the lambda curve is
+"monotone, saturating at parity". With the goal counts in hand that claim does
+not survive. Every gate is ~180 goals, so SE ~3.7% and the 95% band is ~+/-7%.
+The confidence intervals:
+
+    lambda 0.2  32.8%  [.255, .400]
+    lambda 0.62 42.0%  [.347, .494]
+    lambda 0.66 41.2%  [.339, .485]
+    lambda 0.5  46.4%  [.388, .540]
+    lambda 1.0  49.2%  [.421, .563]
+
+Everything from 0.5 upward overlaps everything else from 0.5 upward. Pooled
+hill-climb vs arm G is z=1.01 — nowhere near significant. **The top of the
+ladder is one flat, unresolved band around 41-49%, and the apparent ordering
+was me reading rank order off noise.** The monotone story was a story.
+
+What DOES survive: lambda 0.2 at [.255,.400] does not overlap lambda 1.0 at
+[.421,.563]. Low anchor weight is genuinely worse. The ladder has real signal
+at the bottom and none at the top.
+
+**The consequence is a change of plan, and it reverses my 07:55 decision.**
+I deferred the replay-reset arm on the grounds that the noise floor was a
+prerequisite. That was right, and now the floor is measured — so the deferral's
+own condition is discharged. The two hill-climb attempts agree to within 0.8%
+while each carries SE 3.7%, which says the between-SEED variance is small and
+the BINOMIAL gate noise dominates. That has a hard consequence:
+
+    to resolve a true 5-point difference at ~80% power needs ~1200 goals/arm,
+    i.e. ~7 gates per lambda point, i.e. ~9 hours per point.
+
+**Mapping the lambda curve finely is therefore not something this instrument
+can do overnight, and continuing to sample 0.5-0.7 is close to worthless.**
+What the loop CAN do is screen for a LARGE effect: a genuinely better policy
+(>52%, or anything near 60%) is detected easily at SE 3.7%. It is a large-effect
+screen, not a curve mapper.
+
+So the right use of the remaining night is the arm that might produce a large
+effect in the one dimension never varied: **replay-state resets**. Every arm so
+far changed HOW the policy trains; none changed WHICH STATES it trains from.
+Switching the loop to configs/train_v2_replayreset.toml now.
+
+This is the pre-registered condition being met, not a whim: "arm it once the
+baseline failure rate is established". Baseline established = 41-42%, tight,
+binomial-dominated.
