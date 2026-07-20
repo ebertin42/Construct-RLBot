@@ -772,7 +772,7 @@ impl EpisodeArena {
         //
         // LEGACY MODE: unchanged. A goal terminates. The goal-share screen and
         // every historical gate depend on this exact behavior.
-        let (terminated, truncated) = if self.match_mode() {
+        let (terminated, truncated, needs_kickoff) = if self.match_mode() {
             if let Some(team) = scored {
                 match team {
                     Team::Blue => self.score_blue += 1,
@@ -781,13 +781,21 @@ impl EpisodeArena {
             }
             let match_over = cur.tick_count - self.match_start_tick >= MAX_TICKS;
             let stalled = cur.tick_count - self.last_touch_tick >= NO_TOUCH_TICKS;
-            (match_over, !match_over && stalled)
+            // ONLY the clock ends a match (Elliot's ruling, 2026-07-20). A goal
+            // OR a no-touch stall just kicks off again with the score
+            // preserved, so `truncated` is always false in match mode (clean
+            // for GAE -- the trajectory continues across every kickoff, which
+            // is what lets credit flow across a goal). A stall that truncated
+            // instead would fire on `truncated`, which the Task 6 gate does NOT
+            // split on, silently merging two matches into one score.
+            let needs_kickoff = !match_over && (scored.is_some() || stalled);
+            (match_over, false, needs_kickoff)
         } else {
             let t = scored.is_some();
             let tr = !t
                 && (cur.tick_count - self.last_touch_tick >= NO_TOUCH_TICKS
                     || cur.tick_count - self.episode_start_tick >= MAX_TICKS);
-            (t, tr)
+            (t, tr, false)
         };
 
         for a in 0..n {
@@ -805,8 +813,11 @@ impl EpisodeArena {
             );
         }
 
-        // Match mode: a goal that did NOT end the match still needs a kickoff.
-        if self.match_mode() && scored.is_some() && !terminated && !truncated {
+        // Match mode: a goal or a no-touch stall that did NOT end the match
+        // kicks off again. reset_episode() also resets last_touch_tick
+        // (episode.rs:422), so a post-stall kickoff does not immediately
+        // re-stall, and sets prev_state to the fresh kickoff state.
+        if needs_kickoff {
             self.reset_episode();
         }
 
@@ -849,9 +860,11 @@ impl EpisodeArena {
                 self.start_match(cur.tick_count);
             }
             self.reset_episode();
-        } else {
+        } else if !needs_kickoff {
             self.prev_state = cur;
         }
+        // when needs_kickoff: prev_state was already set to the fresh kickoff
+        // by the reset_episode() above; do NOT overwrite it with cur.
     }
 
     pub fn game_state(&mut self) -> GameState {
@@ -1218,6 +1231,18 @@ mod tests {
         mk_match_test(Some(curr_with_match_mode(true)))
     }
 
+    /// Row index of the all-zero [throttle, steer, pitch, yaw, roll, jump,
+    /// boost, handbrake] action. The stall tests below drive both cars with
+    /// this for hundreds of steps and depend on it being a true no-op (no
+    /// throttle, no boost) so neither car can drift into the ball and falsify
+    /// "no touch occurred".
+    fn no_op_action_idx() -> i64 {
+        actions::make_lookup_table()
+            .iter()
+            .position(|r| r.iter().all(|&x| x == 0.0))
+            .expect("action table must contain an all-zero no-op row") as i64
+    }
+
     #[test]
     fn legacy_mode_still_terminates_on_a_goal() {
         // The goal-share screen depends on this. If match_mode leaks into the
@@ -1308,6 +1333,91 @@ mod tests {
         a.match_start_tick = 0;
         let over = a.match_state(MAX_TICKS * 2);
         assert!((0.0..=1.0).contains(&over.t_frac), "t_frac {}", over.t_frac);
+    }
+
+    #[test]
+    fn match_mode_stall_kicks_off_without_ending_match() {
+        // Elliot's ruling (2026-07-20): only the clock ends a match. A
+        // no-touch stall must kick off again -- NOT truncate. `truncated`
+        // would call `start_match()`, which zeroes the score, and the Task 6
+        // gate splits the reward tape on `terminated` only, so a truncated
+        // stall would silently merge this match's goals into the next one.
+        let mut a = mk_match_arena();
+        let no_op = no_op_action_idx();
+        let episode_start_before = a.episode_start_tick;
+        // Nonzero score, deliberately not 0-0, so "score unchanged" can't
+        // pass by coincidence (a bug that zeroed the score would zero it TO
+        // 0-0, indistinguishable from a fresh 0-0 match otherwise).
+        a.score_blue = 3;
+        a.score_orange = 1;
+
+        let mut r = vec![0.0; 2];
+        let mut f = vec![StepFlags::default(); 2];
+        let mut fo = vec![0.0; 2 * OBS_SIZE];
+        let mut ever_terminated = false;
+        let mut ever_truncated = false;
+        // NO_TOUCH_TICKS is 3600 physics ticks; tick_skip=8 means 450 steps
+        // clears it. Run comfortably past that with a true no-op action so
+        // neither car can drift into the ball and touch it by accident.
+        for _ in 0..470 {
+            a.step(&[no_op, no_op], &mut r, &mut f, &mut fo);
+            ever_terminated |= f[0].terminated;
+            ever_truncated |= f[0].truncated;
+        }
+
+        assert!(!ever_terminated, "a no-touch stall must not terminate a match");
+        assert!(
+            !ever_truncated,
+            "a no-touch stall must not truncate a match either -- truncated \
+             triggers start_match() and zeroes the score"
+        );
+        assert_eq!(a.score_blue, 3, "a stall must not reset the score");
+        assert_eq!(a.score_orange, 1, "a stall must not reset the score");
+        assert!(
+            a.episode_start_tick > episode_start_before,
+            "the stall must still have kicked the episode off internally"
+        );
+    }
+
+    #[test]
+    fn match_mode_stall_kickoff_resets_the_stall_timer() {
+        // reset_episode() resets last_touch_tick to the fresh kickoff tick
+        // (episode.rs:422). If a stall-triggered kickoff did NOT refresh it,
+        // the very next step would see the same huge no-touch gap and fire
+        // ANOTHER kickoff immediately -- an infinite immediate-rekickoff loop
+        // that would never let the match actually resume play.
+        let mut a = mk_match_arena();
+        let no_op = no_op_action_idx();
+        let mut r = vec![0.0; 2];
+        let mut f = vec![StepFlags::default(); 2];
+        let mut fo = vec![0.0; 2 * OBS_SIZE];
+
+        let mut kicked_off = false;
+        for _ in 0..470 {
+            let before = a.episode_start_tick;
+            a.step(&[no_op, no_op], &mut r, &mut f, &mut fo);
+            assert!(
+                !f[0].terminated && !f[0].truncated,
+                "a stall must not end the match"
+            );
+            if a.episode_start_tick != before {
+                kicked_off = true;
+                break;
+            }
+        }
+        assert!(kicked_off, "470 no-touch steps must trigger a stall kickoff");
+        let episode_start_after_kickoff = a.episode_start_tick;
+
+        // One more no-touch step immediately after the kickoff: if the stall
+        // timer had NOT been reset, this would trip `stalled` again and fire
+        // a second kickoff right away.
+        a.step(&[no_op, no_op], &mut r, &mut f, &mut fo);
+        assert!(!f[0].terminated && !f[0].truncated);
+        assert_eq!(
+            a.episode_start_tick, episode_start_after_kickoff,
+            "the stall timer must have been reset by the kickoff -- a second \
+             immediate kickoff means last_touch_tick was not refreshed"
+        );
     }
 }
 
