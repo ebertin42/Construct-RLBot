@@ -621,6 +621,49 @@ def replay_pool_requirement(train_config_path) -> str | None:
     return curriculum.get("replay_pool", {}).get("path") or None
 
 
+def remote_files_required(train_config_path, reward_config) -> list:
+    """Every file the launch command needs to already exist on the trainer box.
+
+    The 2026-07-20 lesson: preflight_replay_pool checked the DATA dependency
+    (the reset pool) and shipped nothing else, so pointing the loop at a train
+    config that existed only on the laptop launched a trainer that died
+    instantly with FileNotFoundError. The poll then correctly reported "never
+    appeared", the loop logged a failed launch, and it would have burned every
+    remaining attempt the same way. Check the whole dependency set, not the one
+    dependency that happened to bite last time."""
+    files = [str(train_config_path), str(reward_config)]
+    cfg = tomllib.loads(Path(train_config_path).read_text())
+    for key in ("curriculum_config_path", "schema_path"):
+        if cfg.get(key):
+            files.append(str(cfg[key]))
+    pool = replay_pool_requirement(train_config_path)
+    if pool:
+        files.append(pool)
+    return files
+
+
+def preflight_remote_files(runner, host, rdir, train_config_path, reward_config) -> None:
+    """Prove every launch dependency exists on the box before attempt 1."""
+    missing = []
+    for rel in remote_files_required(train_config_path, reward_config):
+        res = runner(["ssh", host, "test", "-s", f"{rdir}/{rel}"])
+        if _ssh_broken(res):
+            raise HillclimbAbort(
+                f"\n!! cannot reach {host} to verify launch dependencies -- refusing "
+                f"to launch blind.")
+        if res.returncode != 0:
+            missing.append(rel)
+    if missing:
+        listed = "\n".join(f"!!   {m}" for m in missing)
+        raise HillclimbAbort(
+            f"\n!! these files are missing or empty on {host}:{rdir}/ --\n{listed}\n"
+            f"!! the trainer would die instantly with FileNotFoundError and every\n"
+            f"!! attempt would log as a failed launch. Ship them first:\n"
+            f"!!   scp {' '.join(missing)} {host}:{rdir}/<same paths>")
+    print(f"preflight: {len(remote_files_required(train_config_path, reward_config))} "
+          f"launch dependencies present on {host}")
+
+
 def preflight_replay_pool(runner, host, rdir, train_config_path) -> None:
     """Abort before the first launch if the arm's reset pool is missing on the
     trainer box. Silent degradation is worse than no run: it produces a
@@ -647,7 +690,12 @@ def run_loop(args, runner=subprocess_runner, gate_fn=default_gate, sleep=time.sl
     """Attempt -> gate -> promote-or-discard, until a stop file, --max-attempts,
     or too many consecutive failures."""
     log_path = Path(args.log)
-    preflight_replay_pool(runner, args.host, args.remote_dir, args.train_config)
+    # a stop file means DO NOTHING -- it must short-circuit before preflight
+    # reaches for the network, not after
+    if stop_requested(args.stop_file):
+        print(f"stop file {args.stop_file} present -- exiting before any attempt.")
+        return 0
+    preflight_remote_files(runner, args.host, args.remote_dir, args.train_config, args.reward)
     done = 0
     while args.max_attempts is None or done < args.max_attempts:
         if stop_requested(args.stop_file):

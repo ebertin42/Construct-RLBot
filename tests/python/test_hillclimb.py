@@ -991,3 +991,27 @@ def test_quarantine_does_not_hide_a_real_promotion():
             {"promoted": False, "verdict": "ERROR", "quarantined": True},
             {"promoted": False, "verdict": "FAIL"}]
     assert hillclimb.consecutive_failures(rows) == 1
+
+
+def test_preflight_covers_every_launch_dependency_not_just_the_pool(tmp_path):
+    """2026-07-20: preflight checked the reset pool and nothing else, so a train
+    config that existed only on the laptop launched a trainer that died at once
+    with FileNotFoundError -- and every remaining attempt would have failed the
+    same way."""
+    train = _write_configs(tmp_path, 0.7)
+    files = hillclimb.remote_files_required(train, "configs/reward_v3.toml")
+    assert train in files, "the train config itself must be checked"
+    assert "configs/reward_v3.toml" in files, "the reward config must be checked"
+    assert any("curr" in f for f in files), "the curriculum config must be checked"
+    assert "data/reset_pool_v5.jsonl" in files, "the reset pool must be checked"
+
+
+def test_preflight_names_every_missing_file_and_how_to_ship_it(tmp_path):
+    train = _write_configs(tmp_path, 0.7)
+    with pytest.raises(hillclimb.HillclimbAbort) as e:
+        hillclimb.preflight_remote_files(
+            lambda argv, timeout=None: FakeResult(1, ""), "h", "construct",
+            train, "configs/reward_v3.toml")
+    msg = str(e.value)
+    assert "FileNotFoundError" in msg and "scp" in msg
+    assert "data/reset_pool_v5.jsonl" in msg and "configs/reward_v3.toml" in msg
