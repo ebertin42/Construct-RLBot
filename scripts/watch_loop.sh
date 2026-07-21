@@ -14,6 +14,17 @@ cd "$(dirname "$0")/.."
 ROTATE_SECS="${1:-300}"
 slot=0
 
+# Resolve python robustly: a bare `python` is often absent (the interpreter is
+# .venv/bin/python and the launching env may not have the venv on PATH, e.g.
+# when started via ctl.py viewer). Prefer an explicit PYTHON, then the repo
+# venv, then whatever `python`/`python3` resolves to.
+PYTHON="${PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+    if [ -x .venv/bin/python ]; then PYTHON=.venv/bin/python
+    elif command -v python >/dev/null 2>&1; then PYTHON=python
+    else PYTHON=python3; fi
+fi
+
 # Dirs the live trainer may be writing. The match-win arm writes to
 # checkpoints_hc/<arm>/, the legacy lineage to checkpoints_entity/. We stream
 # whichever holds the freshest checkpoint (newest by mtime = the live frontier),
@@ -48,9 +59,9 @@ while true; do
     if [ -n "$entity" ]; then
         announce "LIVE $mode" "$entity"
         if [ -n "$WATCH_CURRICULUM" ]; then
-            timeout "$ROTATE_SECS" python scripts/watch.py "$entity" --mode "$mode" --curriculum "$WATCH_CURRICULUM"
+            timeout "$ROTATE_SECS" "$PYTHON" scripts/watch.py "$entity" --mode "$mode" --curriculum "$WATCH_CURRICULUM"
         else
-            timeout "$ROTATE_SECS" python scripts/watch.py "$entity" --mode "$mode"
+            timeout "$ROTATE_SECS" "$PYTHON" scripts/watch.py "$entity" --mode "$mode"
         fi
     fi
     [ -z "$entity" ] && { echo "no live checkpoints yet, waiting..."; sleep 30; }
