@@ -2689,3 +2689,36 @@ Caveats to weigh before concluding, in case the final rung is also flat:
     is 1v1. A 1v1-only match-win arm targets the gated metric directly.
   * 290 iters may be too few -- though the goal-share drop was instant and flat
     over 600, so this is unlikely to be the explanation.
+
+## 2026-07-21 ~04:15 — CORRECTION: match-win arm CLIMBS to parity (not flat)
+
+My 03:45 "flat" read was premature -- it had only iters 20 and 140. The full
+trajectory (match-win gate, both orders, ~640 matches/rung, null 0.502):
+
+    iter  20   0.4203 +/- 0.0198   below
+    iter 140   0.4220 +/- 0.0197   below
+    iter 180   0.4508 +/- 0.0196   below
+    iter 280   0.497  +/- 0.014    PARITY  (pooled 2 gates: 0.4877, 0.5060)
+
+**The arm climbed from 0.42 to parity over the second half of training** --
+monotone, and still rising at the last point (0.45 -> 0.50 from iter 180 to
+280). It did NOT beat the champion (parity, not >= 0.55 threshold), so no
+promotion. But this is CATEGORICALLY different from the goal-share diagnosis,
+which was flat below parity over 600 iterations and never moved.
+
+(Note: the match-win gate has ~+/-0.02 run-to-run noise even at fixed seed,
+from physics-blowup containment rebuilding arenas nondeterministically. Hence
+pooling repeat gates.)
+
+**Interpretation.** The ALIGNED objective produced the first upward training
+trajectory this project has seen. The policy recovers from the early-update
+drop and climbs back to parity. Whether it can EXCEED parity is the open
+question: at iter 280 it is still climbing, so the run may have been stopped
+too early. The KL anchor (lambda 0.6) may also cap it at parity -- "near the
+champion" is now ~parity rather than below it.
+
+**Recommended next: EXTEND the run.** Continue training from iter 280 (or launch
+a longer arm, ~600 iters) and gate the ladder. If it breaks above 0.55, that is
+the first real improvement over the champion this project has produced -- on an
+objective aligned with what we measure. If it plateaus at parity, the anchor is
+the cap and a lower-lambda arm is the next lever.
