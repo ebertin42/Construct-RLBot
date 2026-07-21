@@ -49,9 +49,14 @@ def main(argv=None):
     sd = load_sd(args.champion)
     shares = []
     for seed in args.seeds:
+        # curriculum_v3_match => match_mode (G1): full 300s matches whose
+        # terminated flag is the clock, so split_matches groups real matches.
+        # reward_v0 is the neutral scoring tape (win_prob_weight=0, so the
+        # shaping term is inert on the tape; goals still spike +/-10).
         mr = MatchRunner(num_arenas=args.arenas, seed=seed, mode=1,
                          schema_version=1, net_heads=4,
-                         reward_config="configs/reward_v0.toml")
+                         reward_config="configs/reward_v0.toml",
+                         curriculum_config="configs/curriculum_v3_match.toml")
         mr.eng.set_weights(sd)
         mr.eng.set_opponents([sd])
         out = mr.eng.collect(args.steps, arena_opponents=mr.assignment)

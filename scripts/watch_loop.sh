@@ -14,6 +14,17 @@ cd "$(dirname "$0")/.."
 ROTATE_SECS="${1:-300}"
 slot=0
 
+# Dirs the live trainer may be writing. The match-win arm writes to
+# checkpoints_hc/<arm>/, the legacy lineage to checkpoints_entity/. We stream
+# whichever holds the freshest checkpoint (newest by mtime = the live frontier),
+# so the viewer auto-follows the current arm wherever it writes.
+WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_entity checkpoints_hc}"
+# Curriculum the viewer renders under -- MUST match the live arm's curriculum so
+# "what you watch matches what it learns". Default is the match-win regime
+# (full 300s matches + score); set CONSTRUCT_WATCH_CURRICULUM='' to render
+# legacy episodes when the live arm is a legacy run.
+WATCH_CURRICULUM="${CONSTRUCT_WATCH_CURRICULUM-configs/curriculum_v3_match.toml}"
+
 # Status file for the Windows overlay (deploy/windows_stream_overlay.ps1)
 STATUS_FILE="${CONSTRUCT_STREAM_STATUS:-/mnt/c/Users/Elliot/AppData/Local/Construct/current_stream.txt}"
 announce() {  # $1 = label, $2 = ck path
@@ -22,9 +33,11 @@ announce() {  # $1 = label, $2 = ck path
 }
 
 while true; do
-    # newest by MTIME, not lexical step number: after a rollback the live
-    # frontier has SMALLER step numbers than stale pre-rollback files
-    entity=$(find checkpoints_entity -maxdepth 1 -name 'ck_*.pt' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+    # newest by MTIME across all live-trainer dirs, not lexical step number:
+    # after a rollback the live frontier has SMALLER step numbers than stale
+    # pre-rollback files, and the current arm may write to checkpoints_hc/<arm>/
+    # rather than checkpoints_entity/. -maxdepth 2 reaches checkpoints_hc/<arm>/.
+    entity=$(find $WATCH_DIRS -maxdepth 2 -name 'ck_*.pt' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
     # 10-slot cycle mirroring team_size_weights [0.5, 0.3, 0.2]:
     # 1v1 on slots 0,2,4,6,8 | 2v2 on 1,5,7 | 3v3 on 3,9
     case $((slot % 10)) in
@@ -34,7 +47,11 @@ while true; do
     esac
     if [ -n "$entity" ]; then
         announce "LIVE $mode" "$entity"
-        timeout "$ROTATE_SECS" python scripts/watch.py "$entity" --mode "$mode"
+        if [ -n "$WATCH_CURRICULUM" ]; then
+            timeout "$ROTATE_SECS" python scripts/watch.py "$entity" --mode "$mode" --curriculum "$WATCH_CURRICULUM"
+        else
+            timeout "$ROTATE_SECS" python scripts/watch.py "$entity" --mode "$mode"
+        fi
     fi
     [ -z "$entity" ] && { echo "no live checkpoints yet, waiting..."; sleep 30; }
     slot=$((slot + 1))

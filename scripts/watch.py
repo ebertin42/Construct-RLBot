@@ -31,6 +31,13 @@ deterministic = "--argmax" in sys.argv
 size = 1
 if "--mode" in sys.argv:
     size = int(sys.argv[sys.argv.index("--mode") + 1][0])
+# --curriculum <path>: render in the SAME regime the policy trains in. Point it
+# at configs/curriculum_v3_match.toml to watch full 300s matches with a running
+# score (match_mode); omit it for legacy kickoff-to-goal episodes. "What you
+# watch matches what it learns." v1 path only (RenderSession curriculum arg).
+curriculum = None
+if "--curriculum" in sys.argv:
+    curriculum = sys.argv[sys.argv.index("--curriculum") + 1]
 ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 is_v1 = int(ck.get("schema_version", 0)) == 1
 
@@ -57,7 +64,9 @@ if is_v1:
 
     sess = RenderSession(blue=size, orange=size, schema_path="schema/v1.toml",
                          reward_config_path="configs/reward_v0.toml", seed=42,
-                         net_heads=heads)
+                         net_heads=heads, curriculum_config_path=curriculum)
+    if curriculum:
+        print(f"rendering under {curriculum} (match_mode if set)")
     sess.set_weights(
         {k: v.detach().cpu().numpy().astype(np.float32) for k, v in net.state_dict().items()}
     )

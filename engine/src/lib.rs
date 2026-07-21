@@ -452,17 +452,26 @@ impl RenderSession {
     #[new]
     #[pyo3(signature = (blue=1, orange=1, schema_path="schema/v0.toml",
                         reward_config_path="configs/reward_v0.toml", meshes_path=None, seed=0,
-                        net_heads=4))]
+                        net_heads=4, curriculum_config_path=None))]
     fn new(blue: usize, orange: usize, schema_path: &str, reward_config_path: &str,
-           meshes_path: Option<&str>, seed: u32, net_heads: usize) -> PyResult<Self> {
+           meshes_path: Option<&str>, seed: u32, net_heads: usize,
+           curriculum_config_path: Option<&str>) -> PyResult<Self> {
         sim_init::ensure_init(meshes_path);
         let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
         validate_schema(schema_path, &sch)?;
         let obs_mode = if sch.version == 1 { episode::ObsMode::V1 } else { episode::ObsMode::V0 };
         let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
+        // When set (e.g. curriculum_v3_match), the viewer renders in the SAME
+        // regime the policy trains in -- full 300s matches with a running score
+        // under match_mode -- so what you watch matches what it learns. Omitted
+        // => None => legacy episodes, exactly as before.
+        let curriculum = match curriculum_config_path {
+            Some(p) => Some(crate::curriculum::CurriculumConfig::load(p).map_err(PyValueError::new_err)?),
+            None => None,
+        };
         let tick_skip = sch.tick_skip;
         let mut arena = episode::EpisodeArena::new_full(
-            blue, orange, tick_skip, cfg, sch.normalization, seed, None, obs_mode,
+            blue, orange, tick_skip, cfg, sch.normalization, seed, curriculum, obs_mode,
         );
         let mut stream = viser::ViserStream::new().map_err(|e| PyValueError::new_err(e.to_string()))?;
         // real state (valid tick_rate) with cars cleared — see send_flush docs
