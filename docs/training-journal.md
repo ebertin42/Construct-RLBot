@@ -2664,3 +2664,28 @@ early-disruption point; the trajectory to iter 290 is the test. Gating a ladder
 (iters ~100, 200, 290). If it stays flat ~0.42, the aligned objective did not
 help and the misalignment was not the whole story. If it climbs toward/above
 0.55, that is the first real progress this project has made.
+
+## 2026-07-21 ~03:45 — match-win arm is FLAT too (iter 20 -> 140), preliminary
+
+    iter  20   232W/ 74D/334L  win_share 0.4203 +/- 0.0198
+    iter 140   239W/ 63D/339L  win_share 0.4220 +/- 0.0197
+
+120 iterations of match-win training, win_share moved +0.002 -- flat, deep
+below the 0.502 null. This is the SAME shape as the goal-share diagnosis: the
+policy drops below the champion in the first updates and holds flat below,
+now on the ALIGNED metric it is being trained on.
+
+Preliminary (2 rungs). The iter-290 final rung will confirm. But if it holds,
+the implication is heavy: **aligning the training objective with the gate metric
+did NOT make PPO improve the policy.** The misalignment was real but was not the
+cause of the no-improvement -- the problem is deeper.
+
+Caveats to weigh before concluding, in case the final rung is also flat:
+  * KL anchor lambda 0.6 may be too strong -- it holds the policy near the
+    champion, and "near the champion" is ~0.42 here. A lower lambda might let
+    it climb (or collapse, as no-anchor did in the diagnosis). Untested for
+    match-win.
+  * Mixed team sizes [0.5,0.3,0.2]: only ~50% of training is 1v1, but the gate
+    is 1v1. A 1v1-only match-win arm targets the gated metric directly.
+  * 290 iters may be too few -- though the goal-share drop was instant and flat
+    over 600, so this is unlikely to be the explanation.
