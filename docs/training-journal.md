@@ -2821,3 +2821,50 @@ reward_v5.2 keeps the win-prob potential (t_floor back to 0.05) and adds a small
 direct goal reward (goal > 0) so scoring pays on its own, independent of the
 potential, breaking the symmetry that produces draw-seeking. Prepped; launch
 after lever-2's iter-280 confirms.
+
+## 2026-07-22 ~00:15 — four match-win arms: pure win-prob (parity) beats every "push-past" lever
+
+    arm                          iter140  iter280   outcome
+    lever-0  win-prob λ0.6       0.422    0.497     CLIMBS TO PARITY (best)
+    lever-1  win-prob λ0.3       0.460    0.399     degenerates faster
+    lever-2  win-prob t_floor.2  0.434    ~0.44     draws worse (120 @140)
+    lever-3  win-prob + goal1.5  0.439    0.429     FLAT below parity
+
+**Every attempt to push PAST parity made it WORSE than the original pure
+win-prob arm.** Each failed in an instructive, distinct way:
+  * lever-1 (weaker anchor): the anchor was PROTECTIVE against the draw-
+    degeneration, not the cap. Less anchor -> faster collapse.
+  * lever-2 (flatter potential): a SYMMETRIC knob scales scoring-reward and
+    concede-penalty together; flattening cut the win incentive -> MORE draws.
+  * lever-3 (direct goal term): re-introduced goal-share -- the MISALIGNED
+    proxy the whole diagnosis showed is inert -- so it flatlined below parity,
+    exactly like the diagnosis arms.
+
+**What is now established:**
+  1. The pure win-probability aligned objective (lever-0) is the right one:
+     it is the ONLY thing that has ever walked a policy UP to the champion's
+     level. First real progress since the anneal.
+  2. Parity is the ceiling of this training approach. Three reward/anchor
+     tweaks to exceed it all made it worse. Beating the champion is NOT a
+     tuning problem.
+  3. The champion (ck_000320471040) is a strong, defensive 1v1 local optimum;
+     a KL-anchored policy converges TO it, and the anchor that stabilises the
+     climb also caps it at parity. This is a genuine tension, not a bug.
+
+**This is a step-back-to-Elliot point, not a launch-lever-4 point.** The
+directional options are structural, not another reward knob:
+  A. Opponent diversity -- gate/train vs a POOL (past champions, external
+     bots #54) rather than only the frozen champion, so the policy must
+     generalise past one opponent's weaknesses (AlphaStar-style league).
+  B. Progressive anchor -- promote to parity checkpoints and re-anchor, so
+     "near the champion" ratchets upward (gated hill-climb, but the gate now
+     measures the aligned metric).
+  C. Longer horizon / value-fn work -- 4500-step matches vs a 217-step gamma
+     may under-credit; a higher gamma or match-outcome value head.
+  D. Accept parity as the deploy candidate -- the parity policy is not WORSE
+     than the champion and was reached on the aligned objective; it is a
+     legitimate (if unexciting) checkpoint.
+
+Champion STILL unbeaten across 6 hill-climb attempts, 8 diagnosis arms, and
+4 match-win arms -- but the match-win objective reliably reaches parity, which
+nothing before it did.
