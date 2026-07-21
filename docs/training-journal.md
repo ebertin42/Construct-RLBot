@@ -2586,3 +2586,62 @@ hill-climb attempts, 8 arms, 30 long600 rungs, 30 fine-grained rungs, 35 null
 controls and 6 decomposition probes. Every one of those FAIL verdicts was
 correct, and the one PASS that did occur came from pure random noise at 56.3% —
 caught by the confirmation gates rather than by luck.
+
+## 2026-07-21 ~01:55 — local gate engine swapped (G2); bit-identity FAILED as expected; re-baselining
+
+Deployment gap G2: to run the match-win gate the local engine must support
+match_mode. Built a new wheel from main and ran the mandatory bit-identity
+check BEFORE trusting it — gate the same 3 references on old vs new engine in
+LEGACY mode (curriculum_v1, reward_v0, seed 11):
+
+    reference (old .so, 07-19 06:13)    new engine (legacy mode)
+    armF     59-119  (33.1%)            51-129  (28.3%)
+    armH     88- 82  (51.8%)            81- 92  (46.8%)
+    long600  84- 99  (45.9%)            83- 77  (51.9%)   <- flipped
+
+**NOT bit-identical.** Not noise -- integer goal counts, one arm flipped 6
+points. Cause: the old local .so predates 9 engine commits, and the
+replay-state-reset lever (96cd7d0) added an RNG draw to the reset path. The
+`zero_replay_weight_is_bit_identical_to_legacy` test proves that inert WITHIN
+the new engine, but -- exactly the distinction flagged at ~14:40 today -- it
+says nothing about old-vs-new. The new engine's legacy RNG stream diverged, so
+kickoffs differ, so games differ.
+
+This is not a bug: the engine legitimately evolved (reward v4, replay lever)
+since the old instrument was built. But it means the new engine cannot share a
+baseline with tonight's gate history.
+
+**Decision (Elliot): ADOPT the new engine + RE-BASELINE.** The diagnosis is a
+CLOSED old-engine campaign (task #58, done). The match-win campaign starts fresh
+on the new engine with its own baselines. **Pre/post 2026-07-21 gate numbers are
+NOT cross-comparable** -- every share in logs/champion_history.jsonl before this
+line was measured on the old engine.
+
+Backup of the old instrument: engine_backup_local_20260719_gate_instrument.so
+(revert is one cp). The bit-identity check is the reason we KNOW to re-baseline
+rather than silently confounding -- the discipline held.
+
+## 2026-07-21 ~02:45 — match-win gate null characterised; arm launched
+
+Ran the match-win null (champion self-play, match_mode, 20 seeds x 32 arenas x
+45000 steps ~= 320 matches/seed) ON THE REMOTE (heavier box, laptop paused):
+
+    NULL over 20 seeds: mean 0.5023  sd 0.0242  95% CI of mean [0.4917, 0.5129]
+    defensible promote threshold >= 0.548 (2 sd above 0.5)
+
+Centered at 0.50 as self-play must be; spread 0.024. The 2-seed smoke's scary
+sd=0.13 was small-sample noise (~16 matches/seed); at ~320 matches/seed the
+match-win gate resolves finely enough to be a real instrument. **Match-win
+promote threshold set to 0.55** (2 sd above null), to be used with confirmation
+gates like the goal-share gate.
+
+This is the FIRST usable match-win gate baseline, and it is a new-engine
+campaign number -- not comparable to the old-engine goal-share history.
+
+**Match-win arm launched (remote):** resume from champion ck_000320471040,
+config train_v3_matchwin (reward_v5 win-prob shaping + curriculum_v3_match full
+300s matches), KL anchor to the champion at lambda 0.6, seed 20260750. This is
+the first training run whose OBJECTIVE is aligned with the gate metric -- the
+whole point of the night's diagnosis. Mostly-failing is still the prior; a
+promotion here would be the first real progress since the anneal, on an aligned
+objective rather than a proxy.
