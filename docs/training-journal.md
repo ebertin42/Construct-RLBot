@@ -2799,3 +2799,25 @@ LEVER 2 targets: reward_v5.1 raises win_prob_t_floor 0.05 -> 0.2, flattening the
 late clock-sharpening that makes conceding-late so costly the policy stops
 attacking. Launching lever 2 at lambda 0.6 (the PROTECTIVE anchor kept) --
 single variable vs lam06: only t_floor changes.
+
+## 2026-07-21 ~22:00 — LEVER 2 (t_floor flatten) BACKFIRED: draws UP, not down
+
+    iter 140 draws:  lever-0 (t_floor .05) 63 | lever-1 (lam03) 75 | lever-2 (t_floor .2) 120
+    lever-2 iter 140 win_share 0.4337 (n=664), 120 draws (18%)
+
+Raising t_floor to flatten the late clock-sharpening was meant to reduce
+draw-seeking by making conceding-late less costly. It did the OPPOSITE -- draws
+DOUBLED. The error in my mechanism reasoning: flattening Phi reduces the reward
+for SCORING late by the same amount it reduces the penalty for conceding.
+Net = less incentive to attack = MORE draws.
+
+**The draw-seeking is inherent to a SYMMETRIC win-prob potential.** Phi(score_diff)
+is antisymmetric, so the incentive to score and the fear of conceding scale
+together; tuning t_floor moves both. No symmetric knob fixes it.
+
+**The fix must be ASYMMETRIC: reward WINNING more than not-losing.** That is the
+direct goal term I dismissed earlier for the (wrong) t_floor approach -- LEVER 3:
+reward_v5.2 keeps the win-prob potential (t_floor back to 0.05) and adds a small
+direct goal reward (goal > 0) so scoring pays on its own, independent of the
+potential, breaking the symmetry that produces draw-seeking. Prepped; launch
+after lever-2's iter-280 confirms.
