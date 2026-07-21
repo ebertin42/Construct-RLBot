@@ -2768,3 +2768,13 @@ degeneracy emerged with extended training and drove the solver unstable.
 
 Champion ck_000320471040 STILL unbeaten -- but for the first time, training
 walked a policy UP to its level rather than only down and flat.
+
+## 2026-07-21 ~16:35 — league_tick resumed on the new engine (re-baseline)
+
+Resumed league_tick_loop on the remote after the engine swap. Per Elliot, on the
+NEW engine (option 1: accept re-baseline rather than restore the old engine).
+The 48-entry registry's TrueSkill ratings were computed on the OLD engine
+goal-share; matches from here use the new engine, which is not goal-share
+bit-identical (see 01:55). So the ladder has a discontinuity at this point --
+pre/post ratings are not on the same scale. Acceptable: the goal-share campaign
+is closed, and future ladder motion is internally consistent on the new engine.
