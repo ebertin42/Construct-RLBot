@@ -2778,3 +2778,24 @@ goal-share; matches from here use the new engine, which is not goal-share
 bit-identical (see 01:55). So the ladder has a discontinuity at this point --
 pre/post ratings are not on the same scale. Acceptable: the goal-share campaign
 is closed, and future ladder motion is internally consistent on the new engine.
+
+## 2026-07-21 ~18:15 — LEVER 1 (lower anchor) REFUTED: degenerates faster
+
+    arm         iter 140    iter 280
+    lam06 (0.6) 0.422       0.497 (parity)
+    lam03 (0.3) 0.460       0.399 (110 draws, degenerating)
+
+The weaker anchor climbed faster early (0.46 vs 0.42 at iter 140) but
+DEGENERATED SOONER: by iter 280 it is draw-seeking (0.40, 17% draws), where
+lam06 was still holding parity. lam06 degenerated at iter ~580; lam03 at ~280.
+
+**"The anchor is the cap, lower it to climb past" is refuted.** The reverse is
+true: the KL anchor was PROTECTING against the draw-degeneration -- holding the
+policy near the champion suppressed the draw-seeking collapse. Removing anchor
+removed the protection.
+
+So the draw-degeneration, not the anchor, is the binding problem. That is what
+LEVER 2 targets: reward_v5.1 raises win_prob_t_floor 0.05 -> 0.2, flattening the
+late clock-sharpening that makes conceding-late so costly the policy stops
+attacking. Launching lever 2 at lambda 0.6 (the PROTECTIVE anchor kept) --
+single variable vs lam06: only t_floor changes.
