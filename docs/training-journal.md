@@ -2645,3 +2645,22 @@ the first training run whose OBJECTIVE is aligned with the gate metric -- the
 whole point of the night's diagnosis. Mostly-failing is still the prior; a
 promotion here would be the first real progress since the anneal, on an aligned
 objective rather than a proxy.
+
+## 2026-07-21 ~03:15 — first match-win gate: iter-20 arm FAILs at 0.420
+
+    matchwin arm ck iter 20 vs champion, match_mode, both orders:
+    232W / 74D / 334L  n=640  win_share 0.4203 +/- 0.0198  FAIL (threshold 0.55)
+
+Both side orders symmetric (116W each), so not an order artifact. ~4 sd below
+the 0.502 self-play null: by iter 20 the arm has dropped below the champion on
+the MATCH-WIN metric, mirroring the goal-share diagnosis (damage in the first
+updates).
+
+This is ONE early rung and does NOT settle the question. The diagnosis showed
+goal-share drops instantly and stays FLAT below parity forever. The match-win
+hypothesis is that an ALIGNED objective, unlike the goal-share proxy, will
+RECOVER and climb above the champion as training continues. iter 20 is the
+early-disruption point; the trajectory to iter 290 is the test. Gating a ladder
+(iters ~100, 200, 290). If it stays flat ~0.42, the aligned objective did not
+help and the misalignment was not the whole story. If it climbs toward/above
+0.55, that is the first real progress this project has made.
