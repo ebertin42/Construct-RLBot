@@ -1,0 +1,35 @@
+# Reward v5.2 — asymmetric anti-draw (match-win lever 3).
+# reward_v5 (win-prob potential, t_floor 0.05) PLUS a small direct goal term
+# (goal 1.5). Lever 2 (flatten t_floor) BACKFIRED -- draws doubled -- because a
+# symmetric potential scales scoring-reward and concede-penalty together. A
+# direct goal reward is ASYMMETRIC: scoring pays 1.5 on its own regardless of
+# the potential, so attacking beats sitting on a draw. The potential still
+# telescopes to the match outcome; the goal term is an explicit "win, do not
+# merely not-lose" nudge. NOTE: this re-introduces a little goal-share into the
+# objective by design -- the whole point is to break the draw symmetry.
+# w * (gamma * PHI(s') - PHI(s)) where PHI is the win probability from
+# score_diff and remaining clock (engine/src/reward.rs::win_prob).
+#
+# Because the term is potential-based, it telescopes to the match outcome and
+# leaves the optimal policy unchanged (Ng, Harada & Russell 1999) -- so PHI's
+# accuracy costs sample efficiency, never correctness.
+#
+# REQUIRES a curriculum with match_mode = true (configs/curriculum_v3_match.toml).
+# Without it there is no score or clock and the term is meaningless; the trainer
+# refuses this combination loudly rather than training on a constant.
+goal = 1.5
+touch = 0.0
+vel_to_ball = 0.0
+aggression_bias = 0.0
+touch_accel = 0.0
+vel_ball_to_goal = 0.0
+offensive_potential = 0.0
+
+team_spirit = 0.3
+opp_spirit = 0.3
+
+win_prob_weight = 10.0
+win_prob_k_base = 0.6
+win_prob_t_floor = 0.05
+# MUST equal configs/train_v1.toml [ppo] gamma. Checked at trainer startup.
+win_prob_gamma = 0.9954
