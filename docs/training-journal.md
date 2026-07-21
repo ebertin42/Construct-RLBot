@@ -2722,3 +2722,49 @@ a longer arm, ~600 iters) and gate the ladder. If it breaks above 0.55, that is
 the first real improvement over the champion this project has produced -- on an
 objective aligned with what we measure. If it plateaus at parity, the anchor is
 the cap and a lower-lambda arm is the next lever.
+
+## 2026-07-21 ~05:00 — full match-win trajectory: climb to parity, plateau, then degenerate
+
+Extended the arm 300 more iters (iter 280 -> 580, anchored to champion lambda 0.6).
+Full match-win trajectory (both orders, ~640 matches/rung, null 0.502):
+
+    iter  20   0.4203   below
+    iter 140   0.4220   below
+    iter 180   0.4508   below
+    iter 280   0.497    parity
+    iter 420   0.4922   parity
+    iter 520   0.5078   parity (high point, ~0.3 sd above null -- NOT sig.)
+    iter 580   0.3951   COLLAPSE: 200W/199D/359L, n=758
+
+**Three phases.** (1) Climb from 0.42 to parity over iters 20-280 -- the first
+upward training trajectory this project has produced. (2) Plateau at parity
+iters 280-520 (0.49-0.51, never significantly above the 0.55 threshold). (3)
+Degeneration at iter 580: win_share crashes to 0.395 with a DRAW EXPLOSION (199
+draws / 758 matches = 26%, vs ~11% elsewhere) and 18% more matches -- shorter
+games, i.e. more physics blowups. A win-probability objective can reward
+NOT-LOSING (defensive, clock-killing, drawing) over winning, and here that
+degeneracy emerged with extended training and drove the solver unstable.
+
+**What the aligned objective bought, and its limits:**
+  * It RECOVERED the policy to parity -- categorically better than the
+    goal-share proxy (flat below parity over 600 iters, never moved).
+  * It did NOT exceed the champion. Plateaued at parity: the KL anchor
+    (lambda 0.6) caps it near the champion -- "parity by staying close",
+    the same ceiling armH hit in the diagnosis, but reached by climbing UP
+    rather than starting there.
+  * Extended training DEGENERATED toward drawing. The win-prob potential's
+    clock-sharpening rewards protecting a tie late; without a counter-incentive
+    to actually win, the policy learned to not-lose.
+
+**Next levers (for Elliot, not tonight):**
+  1. LOWER the KL anchor (lambda 0.3-0.4) so the policy can climb PAST parity
+     instead of being pinned at it -- the plateau strongly implicates the anchor
+     as the cap. Risk: collapse, as no-anchor did in the diagnosis. The
+     match-win objective may tolerate a weaker anchor better than the proxy did.
+  2. Counter the draw-degeneracy: add a small explicit win/goal term on top of
+     the potential, or cap the clock-sharpening, so not-losing is not enough.
+  3. The best checkpoint is iter 520 (0.508) -- essentially parity, not a
+     promotion, so the champion pointer does NOT move. Correct per the gate.
+
+Champion ck_000320471040 STILL unbeaten -- but for the first time, training
+walked a policy UP to its level rather than only down and flat.
