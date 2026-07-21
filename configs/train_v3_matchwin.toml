@@ -1,0 +1,64 @@
+# Match-win training config (task #56 Phase 1). Identical to train_v1 (net dims,
+# ppo, 192 arenas, mixed team sizes) EXCEPT the objective: reward_v5 win-prob
+# shaping + curriculum_v3_match (full 300s matches, match_mode). Single
+# conceptual change from the diagnosis arms (reward_v3 + curriculum_v1); the KL
+# anchor to the champion is passed on the resume_train command line, lambda ~0.6.
+schema_path = "schema/v1.toml"
+reward_config_path = "configs/reward_v5_winprob.toml"
+curriculum_config_path = "configs/curriculum_v3_match.toml"
+
+[env]
+num_arenas = 192
+blue = 1
+orange = 1
+seed = 0
+team_size_weights = [0.5, 0.3, 0.2]   # 1v1/2v2/3v3 arena mix (live-run split)
+
+[net]
+# EntityPolicyNet dims (d_model/layers/heads/ff). `heads` is also passed to the
+# engine as net_heads (candle needs it to rebuild attention from the state dict).
+d_model = 128
+layers = 2
+heads = 4
+ff = 512
+
+[ppo]
+rollout_steps = 256        # T per iteration
+gamma = 0.9954             # ~10s half-life at 15 Hz
+lam = 0.95
+lr = 2e-4
+clip = 0.2
+entropy_coef = 0.01
+value_coef = 1.0
+epochs = 3
+minibatch_size = 8192
+
+[run]
+device = "cuda"            # falls back to cpu if unavailable
+# NOT "checkpoints" (v0 MLP lineage) and NOT "checkpoints_v1_archive" (that is the
+# archived reward-v1 lineage, unrelated naming): the entity-net run gets its own dir.
+checkpoint_dir = "checkpoints_entity"
+save_every_iters = 20
+log_every_iters = 1
+
+[kickstart]
+# Kickstart distillation (Schmitt 2018): annealed KL + value regression to a frozen
+# v0 MLP teacher so the entity net starts at, not below, the MLP's level. Inactive
+# until `teacher` is uncommented — point it at the promoted v0 checkpoint at launch.
+# teacher = "checkpoints/ck_XXXXXXXXXXXX.pt"
+steps = 500000000          # anneal horizon: lambda_k 1.0 -> 0 over these steps
+# lambda_k = 1.0           # initial KL weight
+# lambda_v = 0.5           # value-regression weight (fixed while lambda_k > 0)
+
+# [kl_prior]
+# Frozen BC human prior (KL(student‖prior) added to PPO loss). Enable after
+# BC-pretrain B6 go (docs/superpowers/plans/2026-07-17-bc-pretrain.md).
+# ck = "checkpoints_bc/ck_epoch1.pt"
+# lambda = 0.05
+
+# [league]
+# enabled = true
+# opponent_frac = 0.2        # fraction of arenas (tail-assigned) driven by opponent-pool checkpoints
+# registry = "league/registry.jsonl"
+# refresh_iters = 200        # how often to re-sample opponents + rebuild the arena assignment
+# slots = 4                  # opponent policies loaded at once (<= 8, engine limit)
