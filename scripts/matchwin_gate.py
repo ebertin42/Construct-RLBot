@@ -25,6 +25,33 @@ import math
 import sys
 
 
+def flip_to_candidate(matches):
+    """Order 2 plays the CHAMPION in the learner row, so its (goals_a, goals_b)
+    are (champion, candidate). Swap each pair so every match record is from the
+    CANDIDATE's perspective before the two orders are summed. Getting this
+    backwards silently inverts the verdict."""
+    return [(b, a) for (a, b) in matches]
+
+
+def aggregate(order1_wdl, order2_wdl, threshold):
+    """Pure gate arithmetic over the two side orders, both already from the
+    candidate's perspective. Draws count 0.5. `share` is None (never 0.0) when
+    no match completed -- 0.0 would read as a total loss and could reject on
+    zero evidence."""
+    w = order1_wdl[0] + order2_wdl[0]
+    d = order1_wdl[1] + order2_wdl[1]
+    losses = order1_wdl[2] + order2_wdl[2]
+    n = w + d + losses
+    if n == 0:
+        return {"wins": 0, "draws": 0, "losses": 0, "n": 0, "share": None,
+                "se": None, "threshold": threshold, "verdict": "FAIL",
+                "reason": "no completed matches"}
+    share = (w + 0.5 * d) / n
+    return {"wins": w, "draws": d, "losses": losses, "n": n, "share": share,
+            "se": math.sqrt(0.25 / n), "threshold": threshold,
+            "verdict": "PASS" if share >= threshold else "FAIL"}
+
+
 def _play_order(champion_sd, candidate_sd, arenas, seed, steps, as_candidate_weights):
     """One side order. Returns (cand_wins, draws, cand_losses) over the matches
     played this order. `as_candidate_weights` True => candidate drives the
@@ -44,7 +71,7 @@ def _play_order(champion_sd, candidate_sd, arenas, seed, steps, as_candidate_wei
     out = mr.eng.collect(steps, arena_opponents=mr.assignment)
     matches = split_matches(out["rewards"], out["terminated"])
     if not as_candidate_weights:
-        matches = [(b, a) for (a, b) in matches]  # flip to candidate perspective
+        matches = flip_to_candidate(matches)
     rec = match_record(matches)
     return rec["wins"], rec["draws"], rec["losses"]
 
@@ -54,18 +81,11 @@ def gate(candidate, champion, arenas, steps, seed, threshold):
 
     champ_sd = load_sd(champion)
     cand_sd = load_sd(candidate)
-    w1, d1, l1 = _play_order(champ_sd, cand_sd, arenas, seed, steps, True)
-    w2, d2, l2 = _play_order(champ_sd, cand_sd, arenas, seed + 1000, steps, False)
-    wins, draws, losses = w1 + w2, d1 + d2, l1 + l2
-    n = wins + draws + losses
-    if n == 0:
-        return {"n": 0, "share": None, "verdict": "FAIL", "reason": "no completed matches"}
-    share = (wins + 0.5 * draws) / n
-    se = math.sqrt(0.25 / n)
-    verdict = "PASS" if share >= threshold else "FAIL"
-    return {"wins": wins, "draws": draws, "losses": losses, "n": n,
-            "share": share, "se": se, "threshold": threshold, "verdict": verdict,
-            "order1": (w1, d1, l1), "order2": (w2, d2, l2)}
+    o1 = _play_order(champ_sd, cand_sd, arenas, seed, steps, True)
+    o2 = _play_order(champ_sd, cand_sd, arenas, seed + 1000, steps, False)
+    r = aggregate(o1, o2, threshold)
+    r["order1"], r["order2"] = o1, o2
+    return r
 
 
 def main(argv=None):
