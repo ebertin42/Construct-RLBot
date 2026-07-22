@@ -38,3 +38,16 @@ local_path    = ~/.cache/construct/necto_weights.npz
 sha256        = daf1f289715e373089095f4454f576c296ebd7f489e9a9b63d9278ed525151b7
 # Same obs contract as Nexto, but 1 block, NO LayerNorms, FF 256, and a
 # Linear(128->12) multi-discrete head split [3,3,2,2,2].
+
+[element]
+source_repo   = https://github.com/LoveSexDrugz/RLMarlbot
+source_commit = 9963b3bd328267d424ebac4a63429422df053e9c
+source_file   = rlmarlbot/element/model.p   (pickled OrderedDict, not a module)
+license       = NONE PUBLISHED (private research use only; do not redistribute)
+extracted_by  = scripts/extract_element_weights.py
+local_path    = ~/.cache/construct/element_weights.npz
+sha256        = 1fd1a40e6c7096d75c59bc9f425309bc4c618d59fbfa5ac73e419fc897032587
+# fc1 (256,107), fc2..fc5 (256,256), cat_heads (15,256), ber_heads (6,256):
+# a 5x256 ReLU MLP with 5 categorical (3-way) + 3 Bernoulli heads, decoded to
+# controls-8 via action_trans [-1,-1,-1,-1,-1,0,0,0]. Obs = AdvancedObs-107
+# (its CustomObs is functionally identical). Scripted Speedflip kickoff NOT ported.

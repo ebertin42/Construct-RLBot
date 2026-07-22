@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub mod actions;
 pub mod ballpred;
 pub mod curriculum;
+pub mod element;
 pub mod engine;
 pub mod episode;
 pub mod foreign;

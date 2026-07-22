@@ -107,14 +107,28 @@ pub enum ForeignKind {
     /// rotation, blue-keyed team flags, stateful boost/demo timers) and a
     /// multi-discrete head. See obs_necto.rs.
     Necto,
+    /// Element (RLMarlbot, by Rangler): AdvancedObs-107 (its CustomObs is
+    /// functionally identical) -> 5x256 ReLU MLP -> 5 categorical + 3 Bernoulli
+    /// heads -> controls-8 directly (no action table). Its scripted Speedflip
+    /// kickoff is NOT ported -- the network only.
+    Element,
 }
 
 impl ForeignKind {
+    /// Immortal and Element zero YAW while the jump button is held
+    /// (`yaw = 0 if action[5] > 0 else action[3]` in their bot.py); Nexto and
+    /// Necto pass yaw through unchanged. Missing this makes an aerial bot
+    /// dodge in the wrong direction.
+    pub fn zero_yaw_on_jump(self) -> bool {
+        matches!(self, Self::Immortal | Self::Element)
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "immortal" => Some(Self::Immortal),
             "nexto" => Some(Self::Nexto),
             "necto" => Some(Self::Necto),
+            "element" => Some(Self::Element),
             _ => None,
         }
     }
@@ -128,6 +142,7 @@ enum Backend {
     /// Necto: EARL trunk + multi-discrete head, and its OWN observation with
     /// per-arena stateful timers.
     Necto(crate::nexto::NextoNet),
+    Element(crate::element::ElementNet),
 }
 
 /// A ported community bot driving one or more cars. Holds the net, its action
@@ -165,6 +180,12 @@ impl ForeignPolicy {
                 let table = crate::actions::make_lookup_table();
                 (Backend::Necto(crate::nexto::NextoNet::new(w, &table)?), table)
             }
+            ForeignKind::Element => (
+                // Element emits controls directly; the table stays empty.
+                Backend::Element(crate::element::ElementNet::new(
+                    w, crate::obs_advanced::ADV_OBS_SIZE)?),
+                Vec::new(),
+            ),
         };
         Ok(Self {
             kind,
@@ -221,6 +242,15 @@ impl ForeignPolicy {
                     _ => return [0.0; 8],
                 }
             }
+            Backend::Element(net) => {
+                // CustomObs is functionally identical to AdvancedObs-107.
+                let mut obs = vec![0.0f32; crate::obs_advanced::ADV_OBS_SIZE];
+                crate::obs_advanced::build_advanced_obs(state, car_idx, &prev, &mut obs);
+                match net.decide(&obs) {
+                    Ok(c) => c,
+                    Err(_) => return [0.0; 8],
+                }
+            }
             Backend::Necto(net) => {
                 use crate::obs_necto::{build_necto_obs, n_entities, NectoTimers,
                                        NECTO_KV, NECTO_Q};
@@ -244,7 +274,14 @@ impl ForeignPolicy {
                 }
             }
         };
+        // The bot feeds its RAW chosen action back into its own observation, but
+        // applies the jump/yaw override only when setting controls -- keep the two
+        // separate or the obs drifts from the reference.
         self.prev.insert(key, controls);
-        controls
+        let mut out = controls;
+        if self.kind.zero_yaw_on_jump() && out[5] > 0.0 {
+            out[3] = 0.0;
+        }
+        out
     }
 }
