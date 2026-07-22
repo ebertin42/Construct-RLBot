@@ -309,6 +309,17 @@ fn collect_v1_worker(
                 // `foreign[slot]` via a controls override at step time -- they are
                 // neither learner rows nor native-opponent rows.
                 let fslot = (-k - 2) as usize;
+                // Ported bots have a FIXED input width tied to a team size --
+                // Immortal's AdvancedObs is 107 floats == exactly 1v1 (one other
+                // car). A 2v2/3v3 arena would need 169/201 and the net could not
+                // consume it, so refuse loudly instead of writing out of bounds.
+                if (b, o) != (1, 1) {
+                    return Err(format!(
+                        "foreign opponent assigned to a {b}v{o} arena (index {li}); \
+                         ported bots are 1v1-only (their obs width is fixed). Use \
+                         team_size_weights = [1, 0, 0] for foreign-opponent runs."
+                    ));
+                }
                 for i in 0..b {
                     learner_idx.push(a_off + i);
                 }

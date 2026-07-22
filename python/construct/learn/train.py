@@ -251,11 +251,60 @@ class Trainer:
                 "slots": slots,
             }
 
+        # Foreign opponents: ported community bots (docs/foreign-opponents.md).
+        # They occupy a SEPARATE engine slot space, addressed as -(slot)-2, and
+        # take arenas from the FRONT (league takes them from the BACK), so the two
+        # can run together. Disabled by default -> assignment untouched.
+        self._foreign_frac = 0.0
+        self._foreign_slots = 0
+        fg = cfg.foreign
+        if fg.get("enabled"):
+            kinds = list(fg.get("kinds", []))
+            paths = list(fg.get("weights", []))
+            assert kinds and len(kinds) == len(paths), (
+                f"foreign.kinds and foreign.weights must be non-empty and the same "
+                f"length, got {len(kinds)} and {len(paths)}"
+            )
+            frac = float(fg.get("opponent_frac", 0.25))
+            assert 0 <= frac < 1, f"foreign.opponent_frac must be in [0, 1), got {frac}"
+            sds = []
+            for p in paths:
+                path = os.path.expanduser(str(p))
+                sds.append({k: v.astype(np.float32) for k, v in np.load(path).items()})
+            # Fail loudly here: a foreign pool that silently doesn't load would make
+            # the run quietly identical to plain self-play and waste the experiment.
+            self.engine.set_foreign_opponents(sds, kinds)
+            self._foreign_frac = frac
+            self._foreign_slots = len(sds)
+            self._assignment = self._apply_foreign([-1] * self.num_arenas)
+            print(f"foreign: {kinds} on {round(frac * self.num_arenas)}/"
+                  f"{self.num_arenas} arenas (frac={frac})", flush=True)
+
         if _state:
             self.net.load_state_dict(_state["model"])
             if _state["optimizer"] is not None:  # None = deliberate reset (regime swap)
                 self.opt.load_state_dict(_state["optimizer"])
             self.total_steps = _state["total_steps"]
+
+    def _apply_foreign(self, a: list[int]) -> list[int]:
+        """Stamp foreign-opponent arenas onto the FRONT of an assignment.
+
+        Foreign slot `f` is encoded `-(f) - 2` (see engine/src/engine.rs). League
+        opponents are written to the BACK by _refresh_opponents, so the two only
+        collide if the fractions sum past 1 -- asserted here rather than silently
+        letting one overwrite the other.
+        """
+        if self._foreign_slots == 0 or self._foreign_frac <= 0:
+            return a
+        n = len(a)
+        n_for = round(self._foreign_frac * n)
+        n_league = round(self._league["frac"] * n) if self._league else 0
+        assert n_for + n_league <= n, (
+            f"foreign ({n_for}) + league ({n_league}) arenas exceed num_arenas ({n})"
+        )
+        for i in range(n_for):
+            a[i] = -(i % self._foreign_slots) - 2
+        return a
 
     def _refresh_opponents(self, it: int = 0):
         """Pull a fresh opponent pool from the registry and rebuild the arena
@@ -310,8 +359,13 @@ class Trainer:
         picks = L["choose"](L["registry"], k=L["slots"], rng=rng,
                              schema_version=self.schema["version"])
         if not picks:
-            self._assignment = None
-            print("league: no opponents available (pure self-play)", flush=True)
+            # Keep any foreign arenas: "no league opponents" must not silently
+            # drop the ported bots too.
+            self._assignment = (
+                self._apply_foreign([-1] * self.num_arenas)
+                if self._foreign_slots else None
+            )
+            print("league: no opponents available (self-play + foreign only)", flush=True)
             return
         sds, names = [], []
         for p in picks:
@@ -338,7 +392,7 @@ class Trainer:
         start = n - n_opp
         for i in range(n_opp):
             a[start + i] = i % len(sds)
-        self._assignment = a
+        self._assignment = self._apply_foreign(a)
         print(f"league: opponents {names}", flush=True)
 
     def collect(self, T: int) -> dict:

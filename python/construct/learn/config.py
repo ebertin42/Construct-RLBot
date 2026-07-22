@@ -23,6 +23,13 @@ class TrainConfig:
     # KL-prior anchor (v1-schema runs only; frozen BC net, see kl_prior.py +
     # Trainer.__init__). Keys: ck (checkpoint path), lambda (float, default 0.05).
     kl_prior: dict = field(default_factory=dict)
+    # Foreign opponents: externally-trained community bots ported into the engine
+    # (see docs/foreign-opponents.md). Keys: enabled (bool), kinds (list[str], e.g.
+    # ["immortal"]), weights (list[path] to the extracted npz, same length/order as
+    # kinds), opponent_frac (float, fraction of arenas they drive, default 0.25).
+    # Independent of `league`: foreign arenas are taken from the FRONT of the arena
+    # list and league opponent arenas from the BACK, so both can run at once.
+    foreign: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str) -> "TrainConfig":

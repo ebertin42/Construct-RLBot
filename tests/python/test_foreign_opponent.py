@@ -132,6 +132,22 @@ def test_rejects_length_mismatch():
 
 
 @needs_champion
+@needs_weights
+def test_rejects_non_1v1_arena():
+    """Immortal's AdvancedObs is 107 floats == exactly 1v1. A 2v2 arena would need
+    169 and the net cannot consume it, so the engine must refuse rather than write
+    out of bounds."""
+    sd = _champion_sd()
+    eng = Engine(num_arenas=1, blue=2, orange=2, schema_path="schema/v1.toml",
+                 reward_config_path="configs/reward_v0.toml", seed=7,
+                 num_threads=1, net_heads=4)
+    eng.set_weights(sd)
+    eng.set_foreign_opponents([_immortal_sd()], ["immortal"])
+    with pytest.raises(Exception, match="1v1"):
+        eng.collect(8, arena_opponents=[-2])
+
+
+@needs_champion
 def test_rejects_unset_foreign_slot():
     eng = _v1_engine(num_arenas=1)
     eng.set_weights(_champion_sd())
