@@ -2901,3 +2901,54 @@ in-engine via `EntityPolicy` (engine.rs ~388) so Immortal enters as a new
 Champion `ck_000320471040` STILL unbeaten: 6 hill-climb + 8 diagnosis + 4
 match-win + 3 reward-lever + 1 league arm. External opponent is the untried
 lever.
+
+---
+
+## 2026-07-22 (later) -- Immortal ported as an in-engine opponent; ENGINE IS NOT BIT-REPRODUCIBLE UNDER ASLR
+
+**Foreign-opponent port landed.** Immortal (RLMarlbot, rlgym-ppo) now runs inside
+the engine as a training opponent: its own AdvancedObs-107, its own 7x512
+LeakyReLU MLP in candle, its own 126-row action table, controls applied via a
+one-shot per-car override. Foreign slots live in a separate slot space addressed
+as `-(slot)-2` in a collect assignment; such an arena's ORANGE cars are the bot
+and BLUE stay learner rows. Every layer golden-tested (obs 32 cases blue+orange
+<1e-5; MLP vs torch <1e-5; table row-for-row). 105 Rust + 670 Python tests green.
+See docs/foreign-opponents.md.
+
+Two bugs caught by building it properly rather than trusting the recon:
+  - boost-pad ORDER: engine stores RocketSim canonical (6 big then 28 small),
+    Immortal expects rlgym BOOST_LOCATIONS order -> needs a position-matched
+    permutation, plus reverse for orange (`inverted_boost_pads`).
+  - `get_game_state()` does NOT preserve car add-order (returns id-descending);
+    mapping agent->car by index silently mirrors blue/orange.
+Also guarded: foreign opponents are 1v1-ONLY (AdvancedObs-107 = exactly one other
+car); a 2v2 arena would need 169 and previously would have written out of bounds.
+
+**THE IMPORTANT FINDING -- the engine is not bit-reproducible across processes.**
+Trying to prove the rebuild left the gate instrument untouched, the fingerprint
+(champion vs champion, fixed seed, 4 arenas x 3000 steps) returned THREE DIFFERENT
+hashes in three runs of the SAME build. Single-threaded too. The contained
+physics-blowup tick itself moved run to run (440 / 464 / 536 / 648).
+
+Cause: memory-layout dependence. With ASLR disabled (`setarch $(uname -m) -R`)
+the same config is deterministic: 7/7 identical hashes. With ASLR on, runs
+diverge intermittently.
+
+Consequences:
+  - The project's "byte-identity" discipline only holds under a FIXED LAYOUT.
+    Existing byte-identity tests pass because they are short enough not to
+    amplify; long match-mode rollouts do amplify.
+  - Gate VERDICTS remain statistically valid: n~640 matches and the null
+    (0.502 sd 0.024) was measured empirically, so it already absorbs this
+    variance. They are simply not bit-repeatable.
+  - scripts/instrument_fingerprint.py now warns unless run under `setarch -R`.
+
+With the layout pinned, the port was PROVEN inert: the pre-integration engine
+(76da0bc) and the post-integration engine produce IDENTICAL fingerprints across
+all 13 arrays. That is real evidence; the earlier ASLR-on "unchanged" reads were
+luck and should not have been trusted.
+
+Separately (also pre-existing, verified against the pre-port build): two
+freshly-constructed same-seed engines in ONE process can diverge ~1e-5 once other
+arenas have been created. Gates run in fresh processes, so this does not affect
+them.

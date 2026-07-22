@@ -11,10 +11,23 @@ at a fixed seed, and hashes every output array. Run it BEFORE and AFTER a rebuil
 identical hashes prove the instrument is unchanged and existing gate baselines
 remain comparable.
 
+YOU MUST RUN THIS UNDER A FIXED MEMORY LAYOUT (`setarch $(uname -m) -R`).
+
+The engine is NOT bit-reproducible across processes under normal ASLR: RocketSim's
+physics depends on memory layout, so the same seed can diverge run to run (measured
+2026-07-22: 3 distinct hashes in 3 runs of the same build; the contained
+physics-blowup tick itself moved between 440 and 648). Disabling ASLR makes it
+deterministic (7/7 identical). Without `setarch -R` a "changed" result means
+nothing and an "unchanged" result is luck.
+
 Usage:
-    .venv/bin/python scripts/instrument_fingerprint.py            # print fingerprint
-    .venv/bin/python scripts/instrument_fingerprint.py --save X   # write to X
-    .venv/bin/python scripts/instrument_fingerprint.py --check X  # compare to X
+    setarch $(uname -m) -R .venv/bin/python scripts/instrument_fingerprint.py --save X
+    # ... rebuild ...
+    setarch $(uname -m) -R .venv/bin/python scripts/instrument_fingerprint.py --check X
+
+Note this only pins BIT-reproducibility. Gate verdicts stay statistically valid
+without it (n~640 matches, and the null baseline was measured empirically so it
+already absorbs this variance) -- they are simply not bit-repeatable.
 """
 import argparse, hashlib, json, pathlib, sys
 
@@ -57,6 +70,27 @@ def main():
     ap.add_argument("--save")
     ap.add_argument("--check")
     args = ap.parse_args()
+
+    # Loud warning rather than a hard failure: someone may deliberately want a
+    # single informational fingerprint. But a --check verdict without a fixed
+    # layout is meaningless, so say so.
+    import os
+    if not os.environ.get("CONSTRUCT_FP_ALLOW_ASLR"):
+        try:
+            with open("/proc/sys/kernel/randomize_va_space") as f:
+                aslr_on = f.read().strip() != "0"
+        except OSError:
+            aslr_on = True
+        # setarch -R sets the process personality; detect via /proc/self/personality
+        try:
+            with open("/proc/self/personality") as f:
+                fixed = (int(f.read().strip(), 16) & 0x0040000) != 0
+        except OSError:
+            fixed = False
+        if aslr_on and not fixed:
+            print("WARNING: running WITHOUT a fixed memory layout. The engine is not "
+                  "bit-reproducible under ASLR; re-run under "
+                  "`setarch $(uname -m) -R` or this comparison is meaningless.\n")
 
     fp = fingerprint(args.arenas, args.steps, args.seed)
     print(f"combined: {fp['combined']}")
