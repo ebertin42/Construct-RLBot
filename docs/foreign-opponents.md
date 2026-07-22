@@ -11,7 +11,19 @@ FAIL**, null 0.502, threshold 0.55). Own-checkpoint "diversity" is just beating
 versions of yourself. A foreign bot is genuinely new blood. See
 `docs/superpowers/specs/2026-07-22-immortal-port-design.md`.
 
-Currently ported: **Immortal** (RLMarlbot, rlgym-ppo lineage).
+Currently ported: **Immortal** (RLMarlbot, rlgym-ppo), **Nexto** (~GC1) and
+**Necto** (~Diamond) (Rolv-Arild/Necto, CC BY-NC-SA 4.0).
+
+Measured strength of our champion `ck_000320471040` against each (`bench_foreign.py`):
+
+| opponent | our win_share |
+|---|---|
+| Necto  | see docs/training-journal.md |
+| Immortal | 0.0953 |
+| Nexto | 0.0000 (0W/0D/96L) |
+
+Nexto is far too strong to be a useful teacher today; Immortal is hard but
+playable. Pick the rung you can actually contest.
 
 ## Getting the weights
 
@@ -36,7 +48,7 @@ Foreign opponents live in their **own slot space**, separate from
 `set_opponents`, and are addressed from a collect assignment as `-(slot) - 2`:
 
 ```python
-eng.set_foreign_opponents([immortal_sd], ["immortal"])
+eng.set_foreign_opponents([immortal_sd], ["immortal"])   # or "nexto" / "necto"
 # arena 0 -> foreign slot 0; arena 1 -> self-play; arena 2 -> native slot 0
 out = eng.collect(steps, arena_opponents=[-2, -1, 0])
 ```

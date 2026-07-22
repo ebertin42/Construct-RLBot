@@ -18,3 +18,23 @@ local_path    = ~/.cache/construct/immortal_weights.npz
 sha256        = d72949bfa709002a33595e47b1aacd69972413f6769ae76f501e3ba41f453a4f
 # net: 7x Linear (107->512->512->512->512->512->512->126), 6x LeakyReLU(0.01),
 # single 126-wide head; obs = RLGym AdvancedObs-107; actions = 126-row lookup.
+
+[nexto]
+source_repo   = https://github.com/Rolv-Arild/Necto (via https://github.com/VirxEC/NectoFamily)
+source_file   = deploy/external/nexto/nexto-model.pt  (SHA-pinned in scripts/bench_external.py)
+license       = CC BY-NC-SA 4.0 (attribution + non-commercial + share-alike)
+extracted_by  = scripts/extract_nexto_weights.py
+local_path    = ~/.cache/construct/nexto_weights.npz
+sha256        = 1263dd21207e85c26ca9024730ba2ea89ddc50c41ee2a1f1a97a2445306e9b48
+# EARLPerceiver: query_pre 32->128->128, kv_pre 24->128->128, 2 pre-norm blocks
+# (4-head MHA d128, FF 512, 3 LayerNorms), ControlsPredictorDot over the 90-row table.
+
+[necto]
+source_repo   = https://github.com/Rolv-Arild/Necto (via https://github.com/VirxEC/NectoFamily)
+source_file   = deploy/external/necto/necto-model.pt
+license       = CC BY-NC-SA 4.0
+extracted_by  = scripts/extract_nexto_weights.py
+local_path    = ~/.cache/construct/necto_weights.npz
+sha256        = daf1f289715e373089095f4454f576c296ebd7f489e9a9b63d9278ed525151b7
+# Same obs contract as Nexto, but 1 block, NO LayerNorms, FF 256, and a
+# Linear(128->12) multi-discrete head split [3,3,2,2,2].
