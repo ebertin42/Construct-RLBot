@@ -1,0 +1,61 @@
+# Match-win + FOREIGN OPPONENT (Immortal) — the "new blood" arm.
+#
+# Option A (own-checkpoint league) was REFUTED: iter-290 gate win_share 0.4570
+# FAIL (null 0.502, threshold 0.55). Training against a pool of our own weaker
+# checkpoints is still just beating versions of ourselves. This arm changes
+# exactly ONE thing versus train_v3_matchwin: a fraction of arenas are played
+# against **Immortal**, an externally-trained community bot ported into the
+# engine (docs/foreign-opponents.md). No league, so attribution is clean.
+#
+# ALL ARENAS ARE 1v1 (team_size_weights = [1, 0, 0]) — required: Immortal's
+# AdvancedObs is 107 floats == exactly one other car. The engine refuses a
+# foreign opponent in a 2v2/3v3 arena.
+#
+# Requires the extracted weights on the box:
+#   scripts/extract_immortal_weights.py <RLMarlbot>/rlmarlbot/immortal/jit.pt
+# (unlicensed — never committed; see external_weights.manifest)
+schema_path = "schema/v1.toml"
+reward_config_path = "configs/reward_v5_winprob.toml"
+curriculum_config_path = "configs/curriculum_v3_match.toml"
+
+[env]
+num_arenas = 192
+blue = 1
+orange = 1
+seed = 0
+team_size_weights = [1.0, 0.0, 0.0]   # all 1v1 — foreign opponents are 1v1-only
+
+[net]
+d_model = 128
+layers = 2
+heads = 4
+ff = 512
+
+[ppo]
+rollout_steps = 256
+gamma = 0.9954
+lam = 0.95
+lr = 2e-4
+clip = 0.2
+entropy_coef = 0.01
+value_coef = 1.0
+epochs = 3
+minibatch_size = 8192
+
+[run]
+device = "cuda"
+checkpoint_dir = "checkpoints_entity"
+save_every_iters = 20
+log_every_iters = 1
+
+[kickstart]
+steps = 500000000
+
+[foreign]
+enabled = true
+kinds = ["immortal"]
+weights = ["~/.cache/construct/immortal_weights.npz"]
+# 35% of arenas vs Immortal, 65% self-play. Matches the league arm's 0.35 so the
+# comparison against Option A is like-for-like: same opponent exposure, different
+# opponent (external bot vs our own past checkpoints).
+opponent_frac = 0.35
