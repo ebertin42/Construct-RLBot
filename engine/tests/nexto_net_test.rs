@@ -74,3 +74,59 @@ fn nexto_net_matches_torch_logits() {
     }
     eprintln!("max abs logit diff: {worst:e}");
 }
+
+fn necto_weights_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join(".cache/construct/necto_weights.npz")
+}
+
+/// Necto shares the obs contract and EARL trunk with Nexto but has 1 block, NO
+/// LayerNorms, and a multi-discrete head split [3,3,2,2,2].
+#[test]
+fn necto_net_matches_torch_heads() {
+    if !necto_weights_path().exists() {
+        eprintln!("SKIP: {} absent", necto_weights_path().display());
+        return;
+    }
+    let mut npz = NpzReader::new(File::open(necto_weights_path()).unwrap()).unwrap();
+    let mut map: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
+    for n in npz.names().unwrap() {
+        let a: ndarray::Array<f32, IxDyn> = npz.by_name(&n).unwrap();
+        map.insert(n.trim_end_matches(".npy").to_string(),
+                   (a.iter().copied().collect(), a.shape().to_vec()));
+    }
+    let table = make_lookup_table();
+    let net = NextoNet::new(&map, &table).expect("build Necto net");
+
+    let raw = std::fs::read_to_string("tests/fixtures/nexto_obs.json").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    for (ci, case) in v["cases"].as_array().unwrap().iter().enumerate() {
+        let q: Vec<f32> = case["q"].as_array().unwrap().iter()
+            .map(|x| x.as_f64().unwrap() as f32).collect();
+        let kv: Vec<f32> = case["kv"].as_array().unwrap().iter()
+            .flat_map(|r| r.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32))
+            .collect();
+        let mask: Vec<bool> = case["mask"].as_array().unwrap().iter()
+            .map(|x| x.as_f64().unwrap() != 0.0).collect();
+        let expect = case["necto_heads"].as_array().unwrap();
+
+        match net.forward_head(&q, &kv, &mask).expect("forward") {
+            construct_engine::nexto::HeadOut::MultiDiscrete(heads) => {
+                assert_eq!(heads.len(), expect.len(), "case {ci} head count");
+                for (h, eh) in heads.iter().zip(expect) {
+                    let ev = eh.as_array().unwrap();
+                    assert_eq!(h.len(), ev.len(), "case {ci} head width");
+                    for k in 0..h.len() {
+                        let e = ev[k].as_f64().unwrap() as f32;
+                        assert!((h[k] - e).abs() < 2e-3,
+                                "case {ci} head logit {k}: rust {} torch {}", h[k], e);
+                    }
+                }
+                // the decoded controls are what actually drive the car
+                let c = construct_engine::nexto::decode_multi_discrete(&heads);
+                assert!(c.iter().all(|x| x.is_finite()), "case {ci} non-finite controls");
+            }
+            _ => panic!("case {ci}: expected a multi-discrete head"),
+        }
+    }
+}

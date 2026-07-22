@@ -39,10 +39,17 @@ def main():
     n_blocks = len({k.split(".")[3] for k in sd if k.startswith("net.earl.blocks.")})
     print(f"parameters: {len(sd)}, earl blocks: {n_blocks}")
     for req in ("net.earl.query_preprocess.0.weight",
-                "net.earl.key_value_preprocess.0.weight",
-                "net.output.emb_convertor.weight"):
+                "net.earl.key_value_preprocess.0.weight"):
         if req not in sd:
             raise SystemExit(f"missing expected key {req}")
+    # Nexto has a ControlsPredictorDot head (emb_convertor + net); Necto has a
+    # single output.linear split into [3,3,2,2,2]. Accept either.
+    if "net.output.emb_convertor.weight" in sd:
+        print("head: ControlsPredictorDot (Nexto-style, 90-action table)")
+    elif "net.output.linear.weight" in sd:
+        print("head: multi-discrete (Necto-style, [3,3,2,2,2])")
+    else:
+        raise SystemExit("no recognised output head")
 
     stem = pathlib.Path(args.model_pt).stem.replace("-model", "")
     out = pathlib.Path(args.out) if args.out else (

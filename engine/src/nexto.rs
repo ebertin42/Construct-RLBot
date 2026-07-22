@@ -53,9 +53,11 @@ fn layer_norm(map: &Raw, prefix: &str, dev: &Device) -> Result<LayerNorm, String
 }
 
 struct NexBlock {
-    norm1: LayerNorm,
-    norm2: LayerNorm,
-    norm3: LayerNorm,
+    /// Nexto is pre-norm (norm1/2/3 present); Necto's block has NO LayerNorms at
+    /// all -- plain residual attention + FF. Detected from the state dict.
+    norm1: Option<LayerNorm>,
+    norm2: Option<LayerNorm>,
+    norm3: Option<LayerNorm>,
     attn: Mha,
     linear1: Linear,
     linear2: Linear,
@@ -76,10 +78,17 @@ impl NexBlock {
         let mut it = parts.into_iter();
         let (q, k, v) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
         let o = linear(map, &format!("{prefix}.attention.out_proj"), dev)?;
+        let opt_norm = |name: &str| -> Result<Option<LayerNorm>, String> {
+            if map.contains_key(&format!("{prefix}.{name}.weight")) {
+                Ok(Some(layer_norm(map, &format!("{prefix}.{name}"), dev)?))
+            } else {
+                Ok(None)
+            }
+        };
         Ok(Self {
-            norm1: layer_norm(map, &format!("{prefix}.norm1"), dev)?,
-            norm2: layer_norm(map, &format!("{prefix}.norm2"), dev)?,
-            norm3: layer_norm(map, &format!("{prefix}.norm3"), dev)?,
+            norm1: opt_norm("norm1")?,
+            norm2: opt_norm("norm2")?,
+            norm3: opt_norm("norm3")?,
             attn: Mha::from_parts(q, k, v, o, NEXTO_HEADS, d / NEXTO_HEADS),
             linear1: linear(map, &format!("{prefix}.linear1"), dev)?,
             linear2: linear(map, &format!("{prefix}.linear2"), dev)?,
@@ -87,25 +96,43 @@ impl NexBlock {
     }
 
     fn forward(&self, q: &Tensor, kv: &Tensor, mask_add: &Tensor) -> Result<Tensor, String> {
-        let qn = e(self.norm1.forward(q))?;
-        let kn = e(self.norm2.forward(kv))?;
+        let apply = |n: &Option<LayerNorm>, t: &Tensor| -> Result<Tensor, String> {
+            match n {
+                Some(ln) => e(ln.forward(t)),
+                None => Ok(t.clone()),
+            }
+        };
+        let qn = apply(&self.norm1, q)?;
+        let kn = apply(&self.norm2, kv)?;
         let a = self.attn.forward(&qn, &kn, mask_add)?;
         let q = e(q.add(&a))?;
-        let h = e(self.linear1.forward(&e(self.norm3.forward(&q))?))?;
+        let h = e(self.linear1.forward(&apply(&self.norm3, &q)?))?;
         let h = e(h.relu())?;
         let h = e(self.linear2.forward(&h))?;
         e(q.add(&h))
     }
 }
 
+/// Nexto and Necto share the EARL trunk but differ at the head.
+enum EarlHead {
+    /// Nexto: ControlsPredictorDot -- logits = action_emb . emb_convertor(relu(q)).
+    Dot { emb_convertor: Linear, action_emb: Tensor },
+    /// Necto: a single Linear(128 -> 12) split into 5 heads of sizes [3,3,2,2,2].
+    MultiDiscrete { linear: Linear, sizes: Vec<usize> },
+}
+
+/// What the head produced: either a flat logit vector over the action table, or
+/// one logit vector per multi-discrete head.
+pub enum HeadOut {
+    Dot(Vec<f32>),
+    MultiDiscrete(Vec<Vec<f32>>),
+}
+
 pub struct NextoNet {
     q_pre: (Linear, Linear),
     kv_pre: (Linear, Linear),
     blocks: Vec<NexBlock>,
-    emb_convertor: Linear,
-    /// `output.net(action_table)` -> [90, 32]; the table is a constant so this is
-    /// computed once.
-    action_emb: Tensor,
+    head: EarlHead,
 }
 
 impl NextoNet {
@@ -124,14 +151,29 @@ impl NextoNet {
             .map(|i| NexBlock::new(map, &format!("net.earl.blocks.{i}"), &dev))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // action embeddings: output.net = Linear,ReLU,Linear,ReLU,Linear,ReLU
-        let flat: Vec<f32> = action_table.iter().flatten().copied().collect();
-        let n = action_table.len();
-        let mut a = e(Tensor::from_vec(flat, (n, 8), &dev))?;
-        for i in [0usize, 2, 4] {
-            let l = linear(map, &format!("net.output.net.{i}"), &dev)?;
-            a = e(e(l.forward(&a))?.relu())?;
-        }
+        // Head: Nexto has emb_convertor + net (dot product over the action table);
+        // Necto has a single output.linear split into [3,3,2,2,2].
+        let head = if map.contains_key("net.output.emb_convertor.weight") {
+            // action embeddings: output.net = Linear,ReLU,Linear,ReLU,Linear,ReLU
+            let flat: Vec<f32> = action_table.iter().flatten().copied().collect();
+            let n = action_table.len();
+            let mut a = e(Tensor::from_vec(flat, (n, 8), &dev))?;
+            for i in [0usize, 2, 4] {
+                let l = linear(map, &format!("net.output.net.{i}"), &dev)?;
+                a = e(e(l.forward(&a))?.relu())?;
+            }
+            EarlHead::Dot {
+                emb_convertor: linear(map, "net.output.emb_convertor", &dev)?,
+                action_emb: a,
+            }
+        } else if map.contains_key("net.output.linear.weight") {
+            EarlHead::MultiDiscrete {
+                linear: linear(map, "net.output.linear", &dev)?,
+                sizes: vec![3, 3, 2, 2, 2],
+            }
+        } else {
+            return Err("state dict has neither a Dot nor a MultiDiscrete head".into());
+        };
 
         Ok(Self {
             q_pre: (
@@ -143,14 +185,22 @@ impl NextoNet {
                 linear(map, "net.earl.key_value_preprocess.2", &dev)?,
             ),
             blocks,
-            emb_convertor: linear(map, "net.output.emb_convertor", &dev)?,
-            action_emb: a,
+            head,
         })
     }
 
-    /// `q`: 32 floats. `kv`: `n_ent * 24`. `mask[i]` true = entity is padding.
-    /// Returns `NEXTO_ACTIONS` logits.
+    /// Nexto-only convenience: flat logits over the action table.
     pub fn forward(&self, q: &[f32], kv: &[f32], mask: &[bool]) -> Result<Vec<f32>, String> {
+        match self.forward_head(q, kv, mask)? {
+            HeadOut::Dot(v) => Ok(v),
+            HeadOut::MultiDiscrete(_) => {
+                Err("this net has a multi-discrete head; use forward_head".into())
+            }
+        }
+    }
+
+    /// `q`: 32 floats. `kv`: `n_ent * 24`. `mask[i]` true = entity is padding.
+    pub fn forward_head(&self, q: &[f32], kv: &[f32], mask: &[bool]) -> Result<HeadOut, String> {
         let dev = Device::Cpu;
         let n_ent = mask.len();
         let mut x = e(Tensor::from_vec(q.to_vec(), (1, 1, q.len()), &dev))?;
@@ -168,10 +218,48 @@ impl NextoNet {
             x = b.forward(&x, &y, &mask_add)?;
         }
 
-        // logits = action_emb [A,32] . emb_convertor(relu(x)) [1,1,32]
-        let emb = e(self.emb_convertor.forward(&e(x.relu())?))?; // [1,1,32]
-        let emb = e(emb.reshape((emb.dims()[2], 1)))?; // [32,1]
-        let logits = e(self.action_emb.matmul(&emb))?; // [A,1]
-        e(e(logits.flatten_all())?.to_vec1::<f32>())
+        let xr = e(x.relu())?;
+        match &self.head {
+            EarlHead::Dot { emb_convertor, action_emb } => {
+                // logits = action_emb [A,32] . emb_convertor(relu(x)) [1,1,32]
+                let emb = e(emb_convertor.forward(&xr))?;
+                let emb = e(emb.reshape((emb.dims()[2], 1)))?; // [32,1]
+                let logits = e(action_emb.matmul(&emb))?; // [A,1]
+                Ok(HeadOut::Dot(e(e(logits.flatten_all())?.to_vec1::<f32>())?))
+            }
+            EarlHead::MultiDiscrete { linear, sizes } => {
+                let out = e(linear.forward(&xr))?; // [1,1,12]
+                let flat = e(e(out.flatten_all())?.to_vec1::<f32>())?;
+                let mut heads = Vec::with_capacity(sizes.len());
+                let mut off = 0usize;
+                for &sz in sizes {
+                    heads.push(flat[off..off + sz].to_vec());
+                    off += sz;
+                }
+                Ok(HeadOut::MultiDiscrete(heads))
+            }
+        }
     }
+}
+
+/// Decode Necto's multi-discrete heads to controls-8, matching
+/// deploy/external/necto/agent.py: per-head argmax, then
+/// throttle=a0-1, steer=a1-1, pitch=a0, yaw=a1*(1-a4), roll=a1*a4,
+/// jump=a2, boost=a3, handbrake=a4.
+pub fn decode_multi_discrete(heads: &[Vec<f32>]) -> [f32; 8] {
+    let am = |v: &[f32]| v.iter().enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) }).0;
+    let a: Vec<i32> = heads.iter().map(|h| am(h) as i32).collect();
+    let (a0, a1) = (a[0] - 1, a[1] - 1);
+    let (a2, a3, a4) = (a[2], a[3], a[4]);
+    [
+        a0 as f32,
+        a1 as f32,
+        a0 as f32,
+        (a1 * (1 - a4)) as f32,
+        (a1 * a4) as f32,
+        a2 as f32,
+        a3 as f32,
+        a4 as f32,
+    ]
 }

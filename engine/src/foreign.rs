@@ -7,6 +7,13 @@ use candle_core::{Device, Tensor};
 use candle_nn::{Linear, Module};
 use std::collections::HashMap;
 
+#[inline]
+fn argmax(v: &[f32]) -> usize {
+    v.iter().enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) })
+        .0
+}
+
 const LEAKY_SLOPE: f64 = 0.01;
 
 fn linear(
@@ -169,11 +176,15 @@ impl ForeignPolicy {
     pub fn decide(&mut self, state: &rocketsim_rs::GameState, car_idx: usize) -> [f32; 8] {
         let car_id = state.cars[car_idx].id;
         let prev = *self.prev.get(&car_id).unwrap_or(&[0.0; 8]);
-        let logits = match &self.backend {
+        let controls = match &self.backend {
             Backend::Immortal(mlp) => {
                 let mut obs = vec![0.0f32; crate::obs_advanced::ADV_OBS_SIZE];
                 crate::obs_advanced::build_advanced_obs(state, car_idx, &prev, &mut obs);
-                mlp.forward(&obs, 1, crate::obs_advanced::ADV_OBS_SIZE)
+                match mlp.forward(&obs, 1, crate::obs_advanced::ADV_OBS_SIZE) {
+                    Ok(l) => self.table[argmax(&l)],
+                    // A forward failure must not kill a rollout; do nothing instead.
+                    Err(_) => return [0.0; 8],
+                }
             }
             Backend::Earl(net) => {
                 use crate::obs_nexto::{build_nexto_obs, n_entities, NEXTO_KV, NEXTO_Q};
@@ -182,23 +193,17 @@ impl ForeignPolicy {
                 let mut kv = vec![0.0f32; n_ent * NEXTO_KV];
                 let mut mask = vec![false; n_ent];
                 build_nexto_obs(state, car_idx, &prev, &mut q, &mut kv, &mut mask);
-                net.forward(&q, &kv, &mask)
+                match net.forward_head(&q, &kv, &mask) {
+                    // Nexto: dot-product logits over the shared 90-row table.
+                    Ok(crate::nexto::HeadOut::Dot(l)) => self.table[argmax(&l)],
+                    // Necto: five multi-discrete heads decoded straight to controls.
+                    Ok(crate::nexto::HeadOut::MultiDiscrete(h)) => {
+                        crate::nexto::decode_multi_discrete(&h)
+                    }
+                    Err(_) => return [0.0; 8],
+                }
             }
         };
-        let logits = match logits {
-            Ok(l) => l,
-            // A forward failure must not kill a rollout; fall back to "do nothing".
-            Err(_) => return [0.0; 8],
-        };
-        let mut best = 0usize;
-        let mut bv = f32::NEG_INFINITY;
-        for (i, &v) in logits.iter().enumerate() {
-            if v > bv {
-                bv = v;
-                best = i;
-            }
-        }
-        let controls = self.table[best];
         self.prev.insert(car_id, controls);
         controls
     }

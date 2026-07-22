@@ -61,12 +61,15 @@ def load_builder():
 _MODEL = None
 
 
-def _model():
+def _model(path="deploy/external/nexto/nexto-model.pt"):
     global _MODEL
     if _MODEL is None:
-        _MODEL = torch.jit.load("deploy/external/nexto/nexto-model.pt")
-        _MODEL.eval()
-    return _MODEL
+        _MODEL = {}
+    if path not in _MODEL:
+        m = torch.jit.load(path)
+        m.eval()
+        _MODEL[path] = m
+    return _MODEL[path]
 
 
 def rand_quat(rng):
@@ -142,8 +145,17 @@ def main():
                              torch.as_tensor(mask, dtype=torch.bool)))
             logits = out[0] if isinstance(out, tuple) else out
             logits = np.asarray(logits).reshape(-1).tolist()
+            # Necto shares the obs contract but has 1 block, no LayerNorms and a
+            # multi-discrete head -- capture its per-head logits too.
+            nec = _model("deploy/external/necto/necto-model.pt")
+            with torch.no_grad():
+                nout = nec((torch.as_tensor(q, dtype=torch.float32),
+                            torch.as_tensor(kv, dtype=torch.float32),
+                            torch.as_tensor(mask, dtype=torch.bool)))
+            nheads = [np.asarray(h).reshape(-1).tolist() for h in nout[0]]
             cases.append({
                 "logits": logits,
+                "necto_heads": nheads,
                 "self_idx": i,
                 "pads": pads.tolist(),
                 "ball": {"pos": ball_pos.tolist(), "lin_vel": ball_vel.tolist(),
