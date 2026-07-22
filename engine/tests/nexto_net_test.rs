@@ -122,9 +122,17 @@ fn necto_net_matches_torch_heads() {
                                 "case {ci} head logit {k}: rust {} torch {}", h[k], e);
                     }
                 }
-                // the decoded controls are what actually drive the car
+                // The decoded controls are what actually drive the car -- check
+                // them against the REFERENCE decode (agent.py), not just for
+                // finiteness. A wrong head order yields correct logits and a
+                // bot that drives into a wall.
                 let c = construct_engine::nexto::decode_multi_discrete(&heads);
-                assert!(c.iter().all(|x| x.is_finite()), "case {ci} non-finite controls");
+                let ec = case["necto_controls"].as_array().unwrap();
+                for k in 0..8 {
+                    let e = ec[k].as_f64().unwrap() as f32;
+                    assert!((c[k] - e).abs() < 1e-6,
+                            "case {ci} control {k}: rust {} py {}", c[k], e);
+                }
             }
             _ => panic!("case {ci}: expected a multi-discrete head"),
         }

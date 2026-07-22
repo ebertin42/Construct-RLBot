@@ -102,7 +102,10 @@ pub enum ForeignKind {
     /// blocks -> ControlsPredictorDot -> 90 logits -> argmax -> the 90-row table
     /// (byte-identical to our own `make_lookup_table`).
     Nexto,
-    /// Necto (~Diamond): same architecture and action table as Nexto, weaker weights.
+    /// Necto (~Diamond). NET is ported and golden-tested, but its OBSERVATION is
+    /// NOT Nexto's and is not implemented yet, so constructing one is refused --
+    /// see `ForeignPolicy::new`. Kept in the enum so the gap is explicit rather
+    /// than someone re-adding it by accident.
     Necto,
 }
 
@@ -145,9 +148,28 @@ impl ForeignPolicy {
                     w, crate::obs_advanced::ADV_OBS_SIZE, 512, 126, 6)?),
                 crate::actions::make_immortal_table(),
             ),
-            ForeignKind::Nexto | ForeignKind::Necto => {
+            ForeignKind::Nexto => {
                 let table = crate::actions::make_lookup_table();
                 (Backend::Earl(crate::nexto::NextoNet::new(w, &table)?), table)
+            }
+            // REFUSED ON PURPOSE. Necto's observation differs from Nexto's in
+            // ways that are invisible from tensor widths (both are q32/kv24):
+            //   * entity order is [ball, players.., boosts..] -- ball FIRST
+            //   * relative transform subtracts pos AND velocity (5:11) and does
+            //     NOT rotate into the self heading
+            //   * is_teammate/is_opponent are keyed to BLUE then column-swapped
+            //   * pad col 21 is a per-pad RESPAWN TIMER and car col 21 a DEMO
+            //     TIMER -- both stateful across frames, not binary flags
+            // Running it on Nexto's obs produces a bot driving on nonsense while
+            // every net-level golden test still passes (they feed both torch and
+            // candle the same q/kv). A 96-0 benchmark was produced that way and
+            // had to be thrown out. Implement NectoObsBuilder before enabling.
+            ForeignKind::Necto => {
+                return Err("Necto is not runnable yet: its observation builder \
+                            (ball-first entities, pos+vel relative, no heading \
+                            rotation, stateful boost/demo timers) is not \
+                            implemented. Its net IS ported and tested."
+                    .into())
             }
         };
         Ok(Self { kind, backend, table, prev: HashMap::new() })

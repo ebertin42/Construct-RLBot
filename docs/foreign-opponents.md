@@ -18,12 +18,22 @@ Measured strength of our champion `ck_000320471040` against each (`bench_foreign
 
 | opponent | our win_share |
 |---|---|
-| Necto  | see docs/training-journal.md |
-| Immortal | 0.0953 |
+| Immortal | 0.0953 (25W/11D/284L) |
 | Nexto | 0.0000 (0W/0D/96L) |
+| Necto | NOT MEASURABLE YET (obs builder unimplemented — see below) |
 
 Nexto is far too strong to be a useful teacher today; Immortal is hard but
 playable. Pick the rung you can actually contest.
+
+**Necto is deliberately refused at construction.** Its net is ported and
+golden-tested, but its OBSERVATION is not Nexto's despite identical tensor
+widths (both q32/kv24): entity order is ball-first, the relative transform
+subtracts position AND velocity with no heading rotation, team flags are keyed
+to blue then column-swapped, and pad/car column 21 carries stateful respawn and
+demo TIMERS rather than binary flags. Running it on Nexto's obs yields a bot
+driving on nonsense while every net-level golden test still passes — those feed
+torch and candle the same q/kv, so they check the net, not the obs. A 96-0
+benchmark was produced exactly that way and discarded.
 
 ## Getting the weights
 

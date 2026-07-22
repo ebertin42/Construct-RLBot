@@ -153,9 +153,18 @@ def main():
                             torch.as_tensor(kv, dtype=torch.float32),
                             torch.as_tensor(mask, dtype=torch.bool)))
             nheads = [np.asarray(h).reshape(-1).tolist() for h in nout[0]]
+            # Reference decode, copied from deploy/external/necto/agent.py, so the
+            # Rust decode is checked against the real thing rather than only
+            # producing "finite" numbers.
+            acts = np.array([int(np.argmax(h)) for h in nheads], dtype=np.int64)
+            a0, a1 = acts[0] - 1, acts[1] - 1
+            a2, a3, a4 = acts[2], acts[3], acts[4]
+            nparsed = [float(a0), float(a1), float(a0), float(a1 * (1 - a4)),
+                       float(a1 * a4), float(a2), float(a3), float(a4)]
             cases.append({
                 "logits": logits,
                 "necto_heads": nheads,
+                "necto_controls": nparsed,
                 "self_idx": i,
                 "pads": pads.tolist(),
                 "ball": {"pos": ball_pos.tolist(), "lin_vel": ball_vel.tolist(),
