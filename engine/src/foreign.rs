@@ -82,3 +82,74 @@ impl ForeignMlp {
             .map_err(|e| e.to_string())
     }
 }
+
+/// Which ported bot a foreign opponent slot runs. Selects the obs builder, the
+/// action table and the MLP dims. Element/Nexto would extend this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForeignKind {
+    /// RLMarlbot's Immortal: AdvancedObs-107 -> 7xLinear/LeakyReLU(512) -> 126 logits
+    /// -> argmax -> 126-row lookup -> controls-8. Deterministic (argmax), matching
+    /// its deploy behaviour.
+    Immortal,
+}
+
+/// A ported community bot driving one or more cars. Holds the net, its action
+/// table, and the per-car previous action (Immortal feeds the last chosen
+/// controls-8 back into its obs; it starts at zeros each episode).
+pub struct ForeignPolicy {
+    kind: ForeignKind,
+    mlp: ForeignMlp,
+    table: Vec<[f32; 8]>,
+    prev: HashMap<u32, [f32; 8]>,
+}
+
+impl ForeignPolicy {
+    pub fn new(
+        w: &HashMap<String, (Vec<f32>, Vec<usize>)>,
+        kind: ForeignKind,
+    ) -> Result<Self, String> {
+        let (mlp, table) = match kind {
+            ForeignKind::Immortal => (
+                ForeignMlp::from_named(w, crate::obs_advanced::ADV_OBS_SIZE, 512, 126, 6)?,
+                crate::actions::make_immortal_table(),
+            ),
+        };
+        Ok(Self { kind, mlp, table, prev: HashMap::new() })
+    }
+
+    pub fn kind(&self) -> ForeignKind {
+        self.kind
+    }
+
+    /// Clear per-car previous actions. Call on episode reset so the obs restarts
+    /// from the zero action (matching the reference bot's `np.zeros(8)`).
+    pub fn reset(&mut self) {
+        self.prev.clear();
+    }
+
+    /// One decision for `state.cars[car_idx]`: build the bot's own obs using its
+    /// stored previous action, forward, argmax, look up controls-8, and store
+    /// those controls as the next previous action.
+    pub fn decide(&mut self, state: &rocketsim_rs::GameState, car_idx: usize) -> [f32; 8] {
+        let car_id = state.cars[car_idx].id;
+        let prev = *self.prev.get(&car_id).unwrap_or(&[0.0; 8]);
+        let mut obs = vec![0.0f32; crate::obs_advanced::ADV_OBS_SIZE];
+        crate::obs_advanced::build_advanced_obs(state, car_idx, &prev, &mut obs);
+        let logits = match self.mlp.forward(&obs, 1, crate::obs_advanced::ADV_OBS_SIZE) {
+            Ok(l) => l,
+            // A forward failure must not kill a rollout; fall back to "do nothing".
+            Err(_) => return [0.0; 8],
+        };
+        let mut best = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > bv {
+                bv = v;
+                best = i;
+            }
+        }
+        let controls = self.table[best];
+        self.prev.insert(car_id, controls);
+        controls
+    }
+}
