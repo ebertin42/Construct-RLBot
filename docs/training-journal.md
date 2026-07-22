@@ -3062,3 +3062,28 @@ Residual after removing the load effect is a ~1.2-point blue deficit (n.s. at
 n=2), consistent with the small side asymmetry measured directly by the goal
 probe (blue goal share 0.4821 +/- 0.0156). Small, and the empirical null absorbs
 it.
+
+### CORRECTION (same day): the null DID transfer -- 0.471 was purely load
+
+A third idle-box seed changed the conclusion. Champion-vs-champion, local, IDLE:
+
+    0.4891 / 0.4861 / 0.5345  ->  mean 0.5032, sd ~0.027
+
+That is the theoretical 0.5, and it matches the ORIGINAL null (0.502, sd 0.024)
+almost exactly -- including the spread. So:
+
+  * The old null **does** transfer to the new wheel. The instrument did not shift.
+  * The 0.55 threshold (mean + 2sd) still stands.
+  * The earlier claim in this journal that "the old null does NOT transfer" was
+    WRONG -- it was drawn from load-contaminated remote numbers plus a two-seed
+    local mean that happened to sit low. Seed-to-seed spread here is ~0.027, so
+    two seeds is simply not enough to locate the centre.
+  * There is no evidence of a real blue/orange gate bias after all; the direct
+    goal probe's 0.4821 (z = -1.15) was also not significant.
+
+What survives is the operational rule, which is confirmed and important:
+**gates must run on an idle box.** Under a 192-arena trainer the same measurement
+reads ~0.471 instead of ~0.503.
+
+Lesson for me: I reported "the null doesn't transfer" on 3 loaded seeds + 2 idle
+seeds. The honest read at that point was "insufficient data", not a conclusion.
