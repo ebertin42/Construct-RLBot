@@ -57,6 +57,48 @@ pub fn make_lookup_table_v1() -> Vec<[f32; 8]> {
     actions
 }
 
+/// Immortal's (RLMarlbot) 126-row action table. Distinct from `make_lookup_table`
+/// (our 90-row v0 table): different layout quirks -- `throttle or boost` uses
+/// Python truthy-or semantics (0 -> boost, else throttle), `steer` is written into
+/// BOTH the steer(1) and yaw(3) slots on ground, aerial rows force handbrake=1.
+/// Reproduces rlmarlbot/immortal/action/actionparser.py::ImmortalAction byte-exact.
+/// Row layout: [throttle, steer, pitch, yaw, roll, jump, boost, handbrake].
+pub fn make_immortal_table() -> Vec<[f32; 8]> {
+    let mut actions: Vec<[f32; 8]> = Vec::with_capacity(126);
+    // Ground (36)
+    for throttle in [-1.0f32, 0.0, 1.0] {
+        for steer in [-1.0f32, 0.0, 1.0] {
+            for boost in [0.0f32, 1.0] {
+                for handbrake in [0.0f32, 1.0] {
+                    if boost == 1.0 && throttle != 1.0 {
+                        continue;
+                    }
+                    // Python `throttle or boost`: throttle if nonzero else boost
+                    let t = if throttle != 0.0 { throttle } else { boost };
+                    actions.push([t, steer, 0.0, steer, 0.0, 0.0, boost, handbrake]);
+                }
+            }
+        }
+    }
+    // Aerial (90)
+    for pitch in [-1.0f32, 0.0, 1.0] {
+        for yaw in [-1.0f32, 0.0, 1.0] {
+            for roll in [-1.0f32, 0.0, 1.0] {
+                for jump in [0.0f32, 1.0] {
+                    for boost in [0.0f32, 1.0] {
+                        if pitch == 0.0 && roll == 0.0 && jump == 0.0 {
+                            continue;
+                        }
+                        actions.push([boost, yaw, pitch, yaw, roll, jump, boost, 1.0]);
+                    }
+                }
+            }
+        }
+    }
+    debug_assert_eq!(actions.len(), 126);
+    actions
+}
+
 pub fn to_controls(row: &[f32; 8]) -> CarControls {
     CarControls {
         throttle: row[0],
