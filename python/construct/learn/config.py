@@ -26,7 +26,9 @@ class TrainConfig:
     # Foreign opponents: externally-trained community bots ported into the engine
     # (see docs/foreign-opponents.md). Keys: enabled (bool), kinds (list[str], e.g.
     # ["immortal"]), weights (list[path] to the extracted npz, same length/order as
-    # kinds), opponent_frac (float, fraction of arenas they drive, default 0.25).
+    # kinds), opponent_frac (float, fraction of arenas they drive, default 0.25),
+    # decision_periods (list[int] same length as kinds, default all 1; a bot reacts
+    # every Nth decision -- the difficulty handicap, since every bot beats us 96-0).
     # Independent of `league`: foreign arenas are taken from the FRONT of the arena
     # list and league opponent arenas from the BACK, so both can run at once.
     foreign: dict = field(default_factory=dict)

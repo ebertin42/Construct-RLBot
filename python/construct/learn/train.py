@@ -267,18 +267,28 @@ class Trainer:
             )
             frac = float(fg.get("opponent_frac", 0.25))
             assert 0 <= frac < 1, f"foreign.opponent_frac must be in [0, 1), got {frac}"
+            # Difficulty handicap: react every N decisions. Every ported bot beats
+            # the champion 96-0, so a period > 1 is normally required to get a
+            # contestable teacher (Element at period 4 -> we win ~0.375).
+            periods = list(fg.get("decision_periods", [1] * len(kinds)))
+            assert len(periods) == len(kinds), (
+                f"foreign.decision_periods must match kinds ({len(kinds)}), "
+                f"got {len(periods)}"
+            )
+            assert all(int(p) >= 1 for p in periods), "decision_periods must be >= 1"
             sds = []
             for p in paths:
                 path = os.path.expanduser(str(p))
                 sds.append({k: v.astype(np.float32) for k, v in np.load(path).items()})
             # Fail loudly here: a foreign pool that silently doesn't load would make
             # the run quietly identical to plain self-play and waste the experiment.
-            self.engine.set_foreign_opponents(sds, kinds)
+            self.engine.set_foreign_opponents(sds, kinds, [int(p) for p in periods])
             self._foreign_frac = frac
             self._foreign_slots = len(sds)
             self._assignment = self._apply_foreign([-1] * self.num_arenas)
-            print(f"foreign: {kinds} on {round(frac * self.num_arenas)}/"
-                  f"{self.num_arenas} arenas (frac={frac})", flush=True)
+            print(f"foreign: {kinds} periods={periods} on "
+                  f"{round(frac * self.num_arenas)}/{self.num_arenas} arenas "
+                  f"(frac={frac})", flush=True)
 
         if _state:
             self.net.load_state_dict(_state["model"])

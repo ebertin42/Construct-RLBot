@@ -1,0 +1,62 @@
+# Match-win vs a HANDICAPPED foreign opponent -- the first curriculum in this
+# project where the policy can actually win sometimes.
+#
+# Every ported community bot beats the champion 96-0 at full strength (Element,
+# Immortal, Necto, Nexto all 0.0000), so none is a usable teacher as-is: at a 0%
+# win rate the win-probability potential saturates near -0.5 and those arenas
+# contribute almost no gradient (the lever-2 failure mode). The decision-period
+# handicap fixes this -- a bot reacts every Nth decision, holding controls in
+# between, which degrades skill smoothly without touching its policy or obs.
+#
+# Element at period 4 is contestable for the champion (measured: 11W/2D/19L,
+# win_share 0.375). We train against it and watch whether the policy pushes that
+# up -- the honest absolute metric is now "the period at which win_share crosses
+# 0.5", measured with scripts/bench_foreign.py.
+#
+# ALL ARENAS ARE 1v1 (team_size_weights = [1,0,0]) -- foreign opponents are
+# 1v1-only (their obs is fixed-width). Requires the extracted weights on the box:
+#   scripts/extract_element_weights.py <RLMarlbot>/rlmarlbot/element/model.p
+# (unlicensed; never committed; see external_weights.manifest)
+schema_path = "schema/v1.toml"
+reward_config_path = "configs/reward_v5_winprob.toml"
+curriculum_config_path = "configs/curriculum_v3_match.toml"
+
+[env]
+num_arenas = 192
+blue = 1
+orange = 1
+seed = 0
+team_size_weights = [1.0, 0.0, 0.0]
+
+[net]
+d_model = 128
+layers = 2
+heads = 4
+ff = 512
+
+[ppo]
+rollout_steps = 256
+gamma = 0.9954
+lam = 0.95
+lr = 2e-4
+clip = 0.2
+entropy_coef = 0.01
+value_coef = 1.0
+epochs = 3
+minibatch_size = 8192
+
+[run]
+device = "cuda"
+checkpoint_dir = "checkpoints_entity"
+save_every_iters = 20
+log_every_iters = 1
+
+[kickstart]
+steps = 500000000
+
+[foreign]
+enabled = true
+kinds = ["element"]
+weights = ["~/.cache/construct/element_weights.npz"]
+decision_periods = [4]     # contestable rung: champion ~0.375 vs Element here
+opponent_frac = 0.35       # 35% of arenas vs handicapped Element, 65% self-play
