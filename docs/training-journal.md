@@ -3123,3 +3123,38 @@ stateful timers.
 
 Lesson: matching tensor widths prove nothing about semantics, and a golden test
 only covers the layer it actually feeds.
+
+## 2026-07-22 -- CORRECTED LADDER: we lose 96-0 to every community bot
+
+Two fixes changed the picture. (1) `ForeignPolicy.prev` was keyed by car id, but
+RocketSim numbers cars from 1 in EVERY arena, so all arenas in a slot shared one
+previous-action entry -- the bots' observations were cross-contaminated across
+arenas. Keys are now `(arena_index << 32 | car_id)`. (2) Necto got its own
+observation builder (it is not Nexto's).
+
+Re-measured on the fixed engine, champion ck_000320471040 (16 arenas, 30k steps):
+
+    zero-weight control : 32W/0D/0L   1.0000   <- bench sanity, our side works
+    Necto  (~Diamond)   :  0W/0D/96L  0.0000
+    Immortal            :  0W/0D/96L  0.0000
+    Nexto  (~GC1)       :  0W/0D/96L  0.0000
+
+**The earlier 0.0953 vs Immortal is SUPERSEDED.** It was inflated by the keying
+bug degrading Immortal's input; with the bug fixed Immortal shuts us out. The
+zero-weight control (a bot that always picks table row 0) confirms the harness
+and our own policy are fine, so the zeros are real strength differences.
+
+So our champion is below the weakest ported community bot. Every internal gate
+this project has run was measuring movement at a very low absolute level.
+
+**Curriculum consequence.** No available foreign bot is a viable TEACHER right
+now -- at a 0% win rate the win-probability potential saturates near -0.5 and the
+gradient from those arenas nearly vanishes (the same saturation that made lever-2
+backfire). Options: handicap a strong bot into a difficulty ladder (act every N
+decisions, or inject action noise -- a cheap tunable knob from one bot), accept
+sparse signal, or use the bots purely as absolute rulers.
+
+Note the running arm (matchwin_immortal_s20260722) trains on the REMOTE wheel,
+which still has the keying bug -- so its teacher is the DEGRADED Immortal we
+could beat 9.5% of the time. Ironically that is a better curriculum than the
+fixed bot, though not a principled one.
