@@ -2992,3 +2992,49 @@ Also note the curriculum question this raises for the running arm
 only 9.5% of the time is a harsh teacher. The 65% self-play share is what keeps
 the signal from going fully sparse. Worth watching whether the arm's win_share
 vs Immortal actually moves.
+
+---
+
+## 2026-07-22 -- gate self-play centre is 0.471, not 0.5 (small side bias); Nexto port scoped
+
+**The gate's null must be re-measured per wheel.** Champion-vs-champion on the
+newly-installed remote wheel, 3 seeds: 0.4728 / 0.4617 / 0.4781, mean **0.471**
+(per-sample se ~0.0198 -> se of mean ~0.011, i.e. ~2.7 sigma below the old null
+mean 0.502). The old null does NOT transfer. Six more seeds are being measured to
+set the current null before the Immortal arm is judged; the 0.55 threshold was
+derived as mean + 2sd and has to be re-derived from the current centre.
+
+A policy against ITSELF must centre on 0.5 by symmetry, so 0.471 needed
+explaining rather than accepting. It is NOT the side-flip logic (order1 alone is
+0.4636) and NOT broken accounting: a direct self-play probe (one policy driving
+both sides, counting goals) gives blue 498 scored / 535 conceded, orange the
+mirror image -- cross-check exact (blue_scored == orange_conceded) -- for a blue
+goal share of 0.4821 +/- 0.0156 (z = -1.15).
+
+So there is a small real BLUE disadvantage of ~1.8% per goal, which amplifies to
+~3% on match outcomes: 0.482 goal share -> ~0.47 match share. Consistent with the
+gate. Most likely source is the reset distribution (curriculum is 60% random
+states) not being perfectly mirror-symmetric. Not fixed today -- changing it
+mid-experiment would break comparability -- but the empirical null absorbs it,
+which is exactly why the null is measured rather than assumed.
+
+**Latent bug found, NOT yet fixed (would change the instrument mid-run):**
+`GOAL_THRESHOLD = 9.4` with reward_v0 gives a SCORE +1.15 of margin
+(10 + touch 0.5 + shaping 0.05) but a CONCEDE only 0.05 (-10 + 0.55 = -9.45).
+Any extra positive shaping on a concede step silently drops that goal from the
+count, inflating win_share. Goals should be read from the SCORE, not from reward
+thresholds.
+
+**Nexto/Necto port scoped -- much smaller than feared.** Introspected
+nexto-model.pt: EARLPerceiver = query_preprocess (32->128->128),
+key_value_preprocess (24->128->128), **2 blocks** of packed-QKV MultiheadAttention
+(128) + FF (128->512->128) + 3 LayerNorms; head = ControlsPredictorDot (action
+rows embedded 8->32->32->32, player embedding 128->32, logits = dot product).
+Every one of those primitives already exists in our candle port `policy_v1.rs`
+(linear, layer_norm, Mha, dot action head), and `obs_v1.rs` already builds masked
+entity tensors.
+
+And: **our 90-row action table is byte-identical to Necto's** `make_lookup_table`
+(verified against the shipped deploy/external/nexto/agent.py). The action side of
+the port is already done. Remaining work is the NextoObsBuilder (q=32, kv=24,
+mask over players + ball + 34 pads) and wiring the 2-block EARL forward.
