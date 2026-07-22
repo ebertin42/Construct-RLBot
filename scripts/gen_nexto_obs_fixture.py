@@ -27,6 +27,7 @@ import sys
 import types
 
 import numpy as np
+import torch
 
 BALL_START = 37
 PLAYER_START = 55
@@ -55,6 +56,17 @@ def load_builder():
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
+
+
+_MODEL = None
+
+
+def _model():
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = torch.jit.load("deploy/external/nexto/nexto-model.pt")
+        _MODEL.eval()
+    return _MODEL
 
 
 def rand_quat(rng):
@@ -119,9 +131,19 @@ def main():
         for i in range(n_players):
             builder.add_actions(obs, prev[i], player_index=i)
 
+        # expected logits from the REAL torch model, so the candle port has a
+        # net-level golden target as well as an obs-level one
+        model = _model()
         for i in range(n_players):
             q, kv, mask = obs[i]
+            with torch.no_grad():
+                out = model((torch.as_tensor(q, dtype=torch.float32),
+                             torch.as_tensor(kv, dtype=torch.float32),
+                             torch.as_tensor(mask, dtype=torch.bool)))
+            logits = out[0] if isinstance(out, tuple) else out
+            logits = np.asarray(logits).reshape(-1).tolist()
             cases.append({
+                "logits": logits,
                 "self_idx": i,
                 "pads": pads.tolist(),
                 "ball": {"pos": ball_pos.tolist(), "lin_vel": ball_vel.tolist(),

@@ -91,6 +91,30 @@ pub enum ForeignKind {
     /// -> argmax -> 126-row lookup -> controls-8. Deterministic (argmax), matching
     /// its deploy behaviour.
     Immortal,
+    /// Nexto (~GC1) -- EARLPerceiver entity obs (q32/kv24/mask) -> 2 cross-attention
+    /// blocks -> ControlsPredictorDot -> 90 logits -> argmax -> the 90-row table
+    /// (byte-identical to our own `make_lookup_table`).
+    Nexto,
+    /// Necto (~Diamond): same architecture and action table as Nexto, weaker weights.
+    Necto,
+}
+
+impl ForeignKind {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "immortal" => Some(Self::Immortal),
+            "nexto" => Some(Self::Nexto),
+            "necto" => Some(Self::Necto),
+            _ => None,
+        }
+    }
+}
+
+/// The per-bot network + observation pathway.
+enum Backend {
+    Immortal(ForeignMlp),
+    /// Nexto and Necto share this; only the weights differ.
+    Earl(crate::nexto::NextoNet),
 }
 
 /// A ported community bot driving one or more cars. Holds the net, its action
@@ -98,7 +122,7 @@ pub enum ForeignKind {
 /// controls-8 back into its obs; it starts at zeros each episode).
 pub struct ForeignPolicy {
     kind: ForeignKind,
-    mlp: ForeignMlp,
+    backend: Backend,
     table: Vec<[f32; 8]>,
     prev: HashMap<u32, [f32; 8]>,
 }
@@ -108,13 +132,18 @@ impl ForeignPolicy {
         w: &HashMap<String, (Vec<f32>, Vec<usize>)>,
         kind: ForeignKind,
     ) -> Result<Self, String> {
-        let (mlp, table) = match kind {
+        let (backend, table) = match kind {
             ForeignKind::Immortal => (
-                ForeignMlp::from_named(w, crate::obs_advanced::ADV_OBS_SIZE, 512, 126, 6)?,
+                Backend::Immortal(ForeignMlp::from_named(
+                    w, crate::obs_advanced::ADV_OBS_SIZE, 512, 126, 6)?),
                 crate::actions::make_immortal_table(),
             ),
+            ForeignKind::Nexto | ForeignKind::Necto => {
+                let table = crate::actions::make_lookup_table();
+                (Backend::Earl(crate::nexto::NextoNet::new(w, &table)?), table)
+            }
         };
-        Ok(Self { kind, mlp, table, prev: HashMap::new() })
+        Ok(Self { kind, backend, table, prev: HashMap::new() })
     }
 
     pub fn kind(&self) -> ForeignKind {
@@ -140,9 +169,23 @@ impl ForeignPolicy {
     pub fn decide(&mut self, state: &rocketsim_rs::GameState, car_idx: usize) -> [f32; 8] {
         let car_id = state.cars[car_idx].id;
         let prev = *self.prev.get(&car_id).unwrap_or(&[0.0; 8]);
-        let mut obs = vec![0.0f32; crate::obs_advanced::ADV_OBS_SIZE];
-        crate::obs_advanced::build_advanced_obs(state, car_idx, &prev, &mut obs);
-        let logits = match self.mlp.forward(&obs, 1, crate::obs_advanced::ADV_OBS_SIZE) {
+        let logits = match &self.backend {
+            Backend::Immortal(mlp) => {
+                let mut obs = vec![0.0f32; crate::obs_advanced::ADV_OBS_SIZE];
+                crate::obs_advanced::build_advanced_obs(state, car_idx, &prev, &mut obs);
+                mlp.forward(&obs, 1, crate::obs_advanced::ADV_OBS_SIZE)
+            }
+            Backend::Earl(net) => {
+                use crate::obs_nexto::{build_nexto_obs, n_entities, NEXTO_KV, NEXTO_Q};
+                let n_ent = n_entities(state.cars.len());
+                let mut q = vec![0.0f32; NEXTO_Q];
+                let mut kv = vec![0.0f32; n_ent * NEXTO_KV];
+                let mut mask = vec![false; n_ent];
+                build_nexto_obs(state, car_idx, &prev, &mut q, &mut kv, &mut mask);
+                net.forward(&q, &kv, &mask)
+            }
+        };
+        let logits = match logits {
             Ok(l) => l,
             // A forward failure must not kill a rollout; fall back to "do nothing".
             Err(_) => return [0.0; 8],

@@ -79,7 +79,7 @@ fn layer_norm(map: &RawTensors, prefix: &str, dev: &Device) -> Result<LayerNorm,
 /// Multi-head attention from primitives, matching `model_v1.py::MHA` exactly:
 /// `q_in [B,Tq,d]`, `kv_in [B,Tk,d]`, additive key mask `[B,1,1,Tk]` (0 or
 /// `MASK_NEG`) broadcast over heads and query positions.
-struct Mha {
+pub(crate) struct Mha {
     q: Linear,
     k: Linear,
     v: Linear,
@@ -89,6 +89,14 @@ struct Mha {
 }
 
 impl Mha {
+    /// Build from already-split projections. Nexto/Necto pack Q,K,V into a single
+    /// `in_proj_weight`, so that port splits them and calls this rather than the
+    /// key-prefix constructor below.
+    pub(crate) fn from_parts(q: Linear, k: Linear, v: Linear, o: Linear,
+                             heads: usize, head_dim: usize) -> Self {
+        Self { q, k, v, o, heads, head_dim }
+    }
+
     fn new(map: &RawTensors, prefix: &str, d_model: usize, heads: usize, dev: &Device) -> Result<Self, String> {
         if d_model % heads != 0 {
             return Err(format!("d_model={d_model} not divisible by heads={heads}"));
@@ -103,7 +111,7 @@ impl Mha {
         })
     }
 
-    fn forward(&self, q_in: &Tensor, kv_in: &Tensor, mask_add: &Tensor) -> Result<Tensor, String> {
+    pub(crate) fn forward(&self, q_in: &Tensor, kv_in: &Tensor, mask_add: &Tensor) -> Result<Tensor, String> {
         let qd = q_in.dims();
         let kd = kv_in.dims();
         let (b, tq) = (qd[0], qd[1]);

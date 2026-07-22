@@ -14,6 +14,7 @@ pub mod curriculum;
 pub mod engine;
 pub mod episode;
 pub mod foreign;
+pub mod nexto;
 pub mod obs;
 pub mod obs_advanced;
 pub mod obs_nexto;
@@ -323,13 +324,11 @@ impl Engine {
                         (k, (v.as_array().iter().copied().collect(), shape))
                     })
                     .collect();
-                let fk = match kind.as_str() {
-                    "immortal" => crate::foreign::ForeignKind::Immortal,
-                    other => return Err(format!("unknown foreign kind {other:?}")),
-                };
+                let fk = crate::foreign::ForeignKind::parse(&kind)
+                    .ok_or_else(|| format!("unknown foreign kind {kind:?}"))?;
                 Ok(engine::NetWeights::Foreign { raw: arrays, kind: fk })
             })
-            .collect::<Result<_, _>>()
+            .collect::<Result<Vec<_>, String>>()
             .map_err(PyValueError::new_err)?;
         self.inner.set_foreign_opponents(parsed).map_err(PyValueError::new_err)
     }
