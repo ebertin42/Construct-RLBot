@@ -3158,3 +3158,47 @@ Note the running arm (matchwin_immortal_s20260722) trains on the REMOTE wheel,
 which still has the keying bug -- so its teacher is the DEGRADED Immortal we
 could beat 9.5% of the time. Ironically that is a better curriculum than the
 fixed bot, though not a principled one.
+
+## 2026-07-23 -- Element ported; ALL FOUR bots shut us out; handicap gives a real ladder
+
+**Element ported.** Its `CustomObs` turned out to be functionally IDENTICAL to
+Immortal's AdvancedObs-107 (verified by diffing the two shipped builders -- only
+`CustomObs.POS_STD` vs `self.POS_STD`), so the existing builder is reused. Net is
+a 5x256 ReLU MLP with 5 categorical (3-way) + 3 Bernoulli heads decoded through
+`action_trans [-1,-1,-1,-1,-1,0,0,0]`, golden-tested against the REAL Element
+Agent on the decoded controls-8 (exact to 1e-6, 24 cases). Its model.p is a plain
+OrderedDict, so no Actor class is needed to load it. NOT ported: Element's
+scripted Speedflip kickoff, which overrides the net at kickoff.
+
+**Fidelity bug it exposed, affecting Immortal:** both Element and Immortal set
+`yaw = 0 if action[5] > 0 else action[3]` -- yaw is zeroed while jumping -- and
+our `to_controls` passed yaw straight through, so aerial dodges went the wrong
+way. Nexto and Necto do NOT do this. Fixed for both; the bot still feeds its RAW
+action back into its own obs, so `prev` and the emitted controls stay separate.
+
+**Complete ladder (champion ck_000320471040, fixed engine, 16 arenas x 30k):**
+
+    zero-weight control : 32W/0D/0L   1.0000   <- harness sanity
+    Element             :  0W/0D/96L  0.0000
+    Necto  (~Diamond)   :  0W/0D/96L  0.0000
+    Immortal            :  0W/0D/96L  0.0000
+    Nexto  (~GC1)       :  0W/0D/96L  0.0000
+
+All four public community bots shut out our champion. There is NO rung at our
+level, so none of them is usable as a teacher as-is.
+
+**The fix: a decision-period handicap.** `ForeignPolicy::set_decision_period(n)`
+makes a bot react every n decisions, holding controls in between -- it degrades
+skill smoothly without touching the policy or its observation. Sweep vs Element:
+
+    period 1 : 0.0000
+    period 2 : 0.0000
+    period 4 : 0.3750   (11W/2D/19L)  <- contestable
+    period 8 : 0.9844   (31W/1D/0L)
+
+One bot now spans the whole difficulty range. That is a usable curriculum: start
+around period 8, ramp 4 -> 2 -> 1 as the policy improves, and measure absolute
+progress as the period at which win_share crosses 0.5.
+
+Exposed as `set_foreign_opponents(dicts, kinds, decision_periods=[..])` and
+`bench_foreign.py --period`.
