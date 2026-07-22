@@ -3202,3 +3202,31 @@ progress as the period at which win_share crosses 0.5.
 
 Exposed as `set_foreign_opponents(dicts, kinds, decision_periods=[..])` and
 `bench_foreign.py --period`.
+
+## 2026-07-23 -- Immortal arm FAILED (no improvement anywhere); Element-p4 handicap arm launched
+
+`matchwin_immortal_s20260722` finished (290 iters, ep_rew climbed 234->279, so it
+learned *something* vs degraded-Immortal). But it improved NOTHING:
+
+    vs champion (gate, local idle fixed engine): 234W/69D/337L  0.4195  FAIL
+    vs Element period 4 :  0.354   (champion 0.375)   -- identical within noise
+    vs Element period 8 :  1.000   (champion 0.984)   -- identical
+    vs Immortal full    :  0.000   (champion 0.000)   -- identical
+
+So training against a strong external opponent (even a keying-bug-degraded one we
+could beat ~9.5% of the time), at frac 0.35 with win-prob + champion anchor, gave
+NO measurable improvement -- on the champion gate OR on the absolute ladder. Same
+plateau as the reward levers and the own-checkpoint league arm.
+
+Hypothesis for why, and the motivation for the next arm: an opponent we beat ~9.5%
+of the time still leaves the win-prob potential mostly saturated (few close games,
+little gradient). A CONTESTABLE opponent -- one we beat ~37% -- should give usable
+gradient across many more states. Enter the handicap.
+
+**Launched `matchwin_element_p4_s20260723`:** identical objective/anchor/frac, but
+the opponent is Element handicapped to react every 4 decisions (champion ~0.375 vs
+it -- a genuinely contestable teacher, the first in this project). Trains on the
+FIXED wheel (per-arena keying + all four bots + handicap knob). 290 iters.
+
+Absolute progress will be read as the shift in win_share vs Element at fixed
+periods, not (only) the champion gate. Gates run idle, post-training.
