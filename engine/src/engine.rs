@@ -285,6 +285,9 @@ fn collect_v1_worker(
     pol: &EntityPolicy,
     opponents: &[EntityPolicy],
     foreign: &mut [crate::foreign::ForeignPolicy],
+    // Index of this worker's first arena in the GLOBAL arena list; used to build
+    // per-arena keys for foreign state (car ids restart at 1 in every arena).
+    global_base: usize,
     emit_v0_obs: bool,
 ) -> Result<CollectOut, String> {
     let agents = a_to_arena.len();
@@ -464,13 +467,14 @@ fn collect_v1_worker(
             // Foreign-driven arena: build this arena's orange cars' controls from
             // the ported bot (its own obs/net/table) and queue them as a one-shot
             // override, so step_impl uses them instead of our action table.
-            let mut foreign_ids: Vec<u32> = Vec::new();
+            let mut foreign_ids: Vec<u64> = Vec::new();
             if let Some(&(_, fslot, _)) = foreign_arenas.iter().find(|(l, _, _)| *l == li) {
                 let bc = ar.blue_count();
                 let mut ov = Vec::with_capacity(n.saturating_sub(bc));
                 for i in bc..n {
-                    let (cid, ctrl) = ar.foreign_controls(i, &mut foreign[fslot]);
-                    foreign_ids.push(cid);
+                    let (cid, key, ctrl) =
+                        ar.foreign_controls(i, &mut foreign[fslot], global_base + li);
+                    foreign_ids.push(key);
                     ov.push((cid, ctrl));
                 }
                 ar.set_foreign_overrides(ov);
@@ -501,8 +505,8 @@ fn collect_v1_worker(
             if !foreign_ids.is_empty() && flag_buf[..n].iter().any(|f| f.terminated || f.truncated)
             {
                 if let Some(&(_, fslot, _)) = foreign_arenas.iter().find(|(l, _, _)| *l == li) {
-                    for cid in &foreign_ids {
-                        foreign[fslot].reset_car(*cid);
+                    for key in &foreign_ids {
+                        foreign[fslot].reset_car(*key);
                     }
                 }
             }
@@ -891,7 +895,8 @@ impl MultiEngine {
                                 let msg = match collect_v1_worker(
                                     steps, my_assignment, &mut arenas, &arena_sizes,
                                     &a_to_arena, max_arena_agents, &mut rngs, pol,
-                                    &opponents_v1, &mut opponents_foreign, emit_v0_obs,
+                                    &opponents_v1, &mut opponents_foreign, global_base,
+                                    emit_v0_obs,
                                 ) {
                                     Ok(out) => WorkerOut::collect(out),
                                     Err(e) => WorkerOut::err(e),

@@ -29,6 +29,9 @@ fn zero_immortal_weights() -> HashMap<String, (Vec<f32>, Vec<usize>)> {
     w
 }
 
+/// Globally-unique per-car key: car ids restart at 1 in every arena.
+fn key(arena: u64, car_id: u64) -> u64 { (arena << 32) | car_id }
+
 fn car(team_orange: bool) -> FixtureCar {
     FixtureCar {
         pos: [100.0, -200.0, 17.0],
@@ -65,19 +68,19 @@ fn foreign_policy_decides_via_table_lookup() {
     let table = make_immortal_table();
 
     // all-zero logits -> argmax picks index 0 -> that exact controls row
-    let controls = p.decide(&gs, 0);
+    let controls = p.decide(&gs, 0, key(0, 1));
     assert_eq!(controls, table[0], "should return row 0 of Immortal's table");
 
     // callable again (prev-action now populated, weights still zero -> same row)
-    let again = p.decide(&gs, 0);
+    let again = p.decide(&gs, 0, key(0, 1));
     assert_eq!(again, table[0]);
 
     // and for the orange car
-    let orange = p.decide(&gs, 1);
+    let orange = p.decide(&gs, 1, key(0, 2));
     assert_eq!(orange, table[0]);
 
     p.reset();
-    assert_eq!(p.decide(&gs, 0), table[0]);
+    assert_eq!(p.decide(&gs, 0, key(0, 1)), table[0]);
 }
 
 #[test]
@@ -101,4 +104,28 @@ fn foreign_policy_rejects_missing_layer() {
         Err(e) => e,
     };
     assert!(err.contains("net.12.weight"), "unexpected error: {err}");
+}
+
+
+/// Regression: car ids restart at 1 in EVERY arena, so a car-id-only key made all
+/// arenas in a foreign slot share one previous-action entry. The prev action feeds
+/// the bot's observation, so that silently cross-contaminated every arena.
+#[test]
+fn prev_action_is_isolated_per_arena() {
+    let mut p = ForeignPolicy::new(&zero_immortal_weights(), ForeignKind::Immortal).unwrap();
+    let gs = state();
+    // same car id (1), different arenas -> must not share state
+    let k_a = key(0, 1);
+    let k_b = key(7, 1);
+    p.decide(&gs, 0, k_a);
+    // arena 7 has never been seen: it must still start from the zero prev action,
+    // which is what a fresh key yields. Resetting arena 0 must not disturb it.
+    p.reset_car(k_a);
+    let after = p.decide(&gs, 0, k_b);
+    assert_eq!(after.len(), 8);
+    // and clearing one arena's car leaves the other's entry intact
+    p.decide(&gs, 0, k_a);
+    p.reset_car(k_b);
+    let still = p.decide(&gs, 0, k_a);
+    assert_eq!(still.len(), 8);
 }

@@ -700,7 +700,8 @@ impl EpisodeArena {
         &mut self,
         agent_idx: usize,
         pol: &mut crate::foreign::ForeignPolicy,
-    ) -> (u32, [f32; 8]) {
+        arena_global_idx: usize,
+    ) -> (u32, u64, [f32; 8]) {
         let cid = self.car_ids[agent_idx];
         let gs = self.arena.pin_mut().get_game_state();
         let j = gs
@@ -708,8 +709,11 @@ impl EpisodeArena {
             .iter()
             .position(|c| c.id == cid)
             .expect("agent's car id present in game state");
-        let controls = pol.decide(&gs, j);
-        (cid, controls)
+        // car ids restart at 1 per arena, so combine with the arena index for a
+        // key that is unique across the whole run
+        let key = ((arena_global_idx as u64) << 32) | cid as u64;
+        let controls = pol.decide(&gs, j, key);
+        (cid, key, controls)
     }
 
     fn step_impl(

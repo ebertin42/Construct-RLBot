@@ -134,7 +134,10 @@ pub struct ForeignPolicy {
     kind: ForeignKind,
     backend: Backend,
     table: Vec<[f32; 8]>,
-    prev: HashMap<u32, [f32; 8]>,
+    /// Keyed by a GLOBALLY unique id, not car id: RocketSim numbers cars from 1
+    /// within each arena, so ids collide across arenas and a car-id key would
+    /// share one previous-action entry between every arena in the slot.
+    prev: HashMap<u64, [f32; 8]>,
 }
 
 impl ForeignPolicy {
@@ -188,16 +191,17 @@ impl ForeignPolicy {
     /// Clear ONE car's previous action. Used at an episode boundary: a slot may
     /// drive several arenas, so a blanket `reset()` would wrongly clear cars whose
     /// episodes are still running.
-    pub fn reset_car(&mut self, car_id: u32) {
-        self.prev.remove(&car_id);
+    pub fn reset_car(&mut self, key: u64) {
+        self.prev.remove(&key);
     }
 
     /// One decision for `state.cars[car_idx]`: build the bot's own obs using its
     /// stored previous action, forward, argmax, look up controls-8, and store
     /// those controls as the next previous action.
-    pub fn decide(&mut self, state: &rocketsim_rs::GameState, car_idx: usize) -> [f32; 8] {
-        let car_id = state.cars[car_idx].id;
-        let prev = *self.prev.get(&car_id).unwrap_or(&[0.0; 8]);
+    pub fn decide(&mut self, state: &rocketsim_rs::GameState, car_idx: usize, key: u64)
+        -> [f32; 8]
+    {
+        let prev = *self.prev.get(&key).unwrap_or(&[0.0; 8]);
         let controls = match &self.backend {
             Backend::Immortal(mlp) => {
                 let mut obs = vec![0.0f32; crate::obs_advanced::ADV_OBS_SIZE];
@@ -226,7 +230,7 @@ impl ForeignPolicy {
                 }
             }
         };
-        self.prev.insert(car_id, controls);
+        self.prev.insert(key, controls);
         controls
     }
 }
