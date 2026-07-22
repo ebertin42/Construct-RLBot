@@ -17,6 +17,7 @@ pub mod foreign;
 pub mod nexto;
 pub mod obs;
 pub mod obs_advanced;
+pub mod obs_necto;
 pub mod obs_nexto;
 pub mod obs_v1;
 pub mod test_support;

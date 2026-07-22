@@ -102,10 +102,10 @@ pub enum ForeignKind {
     /// blocks -> ControlsPredictorDot -> 90 logits -> argmax -> the 90-row table
     /// (byte-identical to our own `make_lookup_table`).
     Nexto,
-    /// Necto (~Diamond). NET is ported and golden-tested, but its OBSERVATION is
-    /// NOT Nexto's and is not implemented yet, so constructing one is refused --
-    /// see `ForeignPolicy::new`. Kept in the enum so the gap is explicit rather
-    /// than someone re-adding it by accident.
+    /// Necto (~Diamond). Shares the EARL trunk with Nexto but has its OWN
+    /// observation (ball-first entities, pos+vel relative with no heading
+    /// rotation, blue-keyed team flags, stateful boost/demo timers) and a
+    /// multi-discrete head. See obs_necto.rs.
     Necto,
 }
 
@@ -123,8 +123,11 @@ impl ForeignKind {
 /// The per-bot network + observation pathway.
 enum Backend {
     Immortal(ForeignMlp),
-    /// Nexto and Necto share this; only the weights differ.
-    Earl(crate::nexto::NextoNet),
+    /// Nexto: EARL trunk + dot head, Nexto's observation.
+    Nexto(crate::nexto::NextoNet),
+    /// Necto: EARL trunk + multi-discrete head, and its OWN observation with
+    /// per-arena stateful timers.
+    Necto(crate::nexto::NextoNet),
 }
 
 /// A ported community bot driving one or more cars. Holds the net, its action
@@ -134,6 +137,9 @@ pub struct ForeignPolicy {
     kind: ForeignKind,
     backend: Backend,
     table: Vec<[f32; 8]>,
+    /// Necto only: per-ARENA stateful timers (boost respawn + demo), keyed by the
+    /// arena part of the decide key. Necto carries these across frames.
+    necto_timers: std::collections::HashMap<u64, crate::obs_necto::NectoTimers>,
     /// Keyed by a GLOBALLY unique id, not car id: RocketSim numbers cars from 1
     /// within each arena, so ids collide across arenas and a car-id key would
     /// share one previous-action entry between every arena in the slot.
@@ -153,29 +159,20 @@ impl ForeignPolicy {
             ),
             ForeignKind::Nexto => {
                 let table = crate::actions::make_lookup_table();
-                (Backend::Earl(crate::nexto::NextoNet::new(w, &table)?), table)
+                (Backend::Nexto(crate::nexto::NextoNet::new(w, &table)?), table)
             }
-            // REFUSED ON PURPOSE. Necto's observation differs from Nexto's in
-            // ways that are invisible from tensor widths (both are q32/kv24):
-            //   * entity order is [ball, players.., boosts..] -- ball FIRST
-            //   * relative transform subtracts pos AND velocity (5:11) and does
-            //     NOT rotate into the self heading
-            //   * is_teammate/is_opponent are keyed to BLUE then column-swapped
-            //   * pad col 21 is a per-pad RESPAWN TIMER and car col 21 a DEMO
-            //     TIMER -- both stateful across frames, not binary flags
-            // Running it on Nexto's obs produces a bot driving on nonsense while
-            // every net-level golden test still passes (they feed both torch and
-            // candle the same q/kv). A 96-0 benchmark was produced that way and
-            // had to be thrown out. Implement NectoObsBuilder before enabling.
             ForeignKind::Necto => {
-                return Err("Necto is not runnable yet: its observation builder \
-                            (ball-first entities, pos+vel relative, no heading \
-                            rotation, stateful boost/demo timers) is not \
-                            implemented. Its net IS ported and tested."
-                    .into())
+                let table = crate::actions::make_lookup_table();
+                (Backend::Necto(crate::nexto::NextoNet::new(w, &table)?), table)
             }
         };
-        Ok(Self { kind, backend, table, prev: HashMap::new() })
+        Ok(Self {
+            kind,
+            backend,
+            table,
+            necto_timers: std::collections::HashMap::new(),
+            prev: HashMap::new(),
+        })
     }
 
     pub fn kind(&self) -> ForeignKind {
@@ -212,7 +209,7 @@ impl ForeignPolicy {
                     Err(_) => return [0.0; 8],
                 }
             }
-            Backend::Earl(net) => {
+            Backend::Nexto(net) => {
                 use crate::obs_nexto::{build_nexto_obs, n_entities, NEXTO_KV, NEXTO_Q};
                 let n_ent = n_entities(state.cars.len());
                 let mut q = vec![0.0f32; NEXTO_Q];
@@ -220,13 +217,30 @@ impl ForeignPolicy {
                 let mut mask = vec![false; n_ent];
                 build_nexto_obs(state, car_idx, &prev, &mut q, &mut kv, &mut mask);
                 match net.forward_head(&q, &kv, &mask) {
-                    // Nexto: dot-product logits over the shared 90-row table.
                     Ok(crate::nexto::HeadOut::Dot(l)) => self.table[argmax(&l)],
-                    // Necto: five multi-discrete heads decoded straight to controls.
+                    _ => return [0.0; 8],
+                }
+            }
+            Backend::Necto(net) => {
+                use crate::obs_necto::{build_necto_obs, n_entities, NectoTimers,
+                                       NECTO_KV, NECTO_Q};
+                let n_ent = n_entities(state.cars.len());
+                let mut q = vec![0.0f32; NECTO_Q];
+                let mut kv = vec![0.0f32; n_ent * NECTO_KV];
+                let mut mask = vec![false; n_ent];
+                // timers are per ARENA (the high half of the key), not per car
+                let arena = key >> 32;
+                let timers = self
+                    .necto_timers
+                    .entry(arena)
+                    .or_insert_with(|| NectoTimers::new(state.cars.len()));
+                build_necto_obs(state, car_idx, &prev, timers, &mut q, &mut kv, &mut mask);
+                match net.forward_head(&q, &kv, &mask) {
+                    // five multi-discrete heads decoded straight to controls
                     Ok(crate::nexto::HeadOut::MultiDiscrete(h)) => {
                         crate::nexto::decode_multi_discrete(&h)
                     }
-                    Err(_) => return [0.0; 8],
+                    _ => return [0.0; 8],
                 }
             }
         };
