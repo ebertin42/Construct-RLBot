@@ -2868,3 +2868,36 @@ directional options are structural, not another reward knob:
 Champion STILL unbeaten across 6 hill-climb attempts, 8 diagnosis arms, and
 4 match-win arms -- but the match-win objective reliably reaches parity, which
 nothing before it did.
+
+---
+
+## 2026-07-22 -- Option A (league, own-checkpoint) REFUTED; external-opponent port launched
+
+**League arm `matchwin_league_s20260755` (Option A, opponent_frac 0.35, pool =
+champion + 3 later selves), iter-290 final gate vs champion:**
+  TOTAL 251W/104D/308L  n=663  win_share=0.4570  verdict: FAIL
+  (null mean 0.502 sd 0.024; threshold 0.55)
+
+Own-checkpoint opponent diversity did NOT break parity -- it landed *below* it
+(0.457), same failure class as the reward levers (lever-3 0.4289). The pool was
+only OUR weaker checkpoints (44-entry registry, all `ck_*`, zero external bots),
+so "diversity" was really "beat several versions of yourself" -- no new blood.
+
+**Decision (Elliot, 2026-07-22): faithful in-engine port of an external bot as a
+training opponent.** Recon'd Nexto/Necto/Element/Immortal (all real, distinct,
+obtainable). Nexto/Necto already SHA-pinned + fetch-verified in
+`scripts/bench_external.py` (RLBot-v5 benchmark path, CC BY-NC-SA). Immortal
+chosen as the first training-opponent port (most drop-in: stock AdvancedObs-107
++ 126-action LookupAction + single-head MLP `jit.pt`). Design spec:
+`docs/superpowers/specs/2026-07-22-immortal-port-design.md`.
+
+Key engine facts nailed for the port: our obs is 94-wide (Immortal needs its own
+107 builder); our `tick_skip=8` vs Immortal's 6 (v1 accepts 8-tick cadence);
+`actions::to_controls([f32;8])->CarControls` already exists; opponents forward
+in-engine via `EntityPolicy` (engine.rs ~388) so Immortal enters as a new
+`External` opponent kind. Immortal weights are unlicensed -> kept out of git
+(manifest + SHA only).
+
+Champion `ck_000320471040` STILL unbeaten: 6 hill-climb + 8 diagnosis + 4
+match-win + 3 reward-lever + 1 league arm. External opponent is the untried
+lever.
