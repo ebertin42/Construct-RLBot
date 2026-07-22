@@ -23,7 +23,7 @@ const ANG_STD: f32 = std::f32::consts::PI;
 
 /// rlgym BOOST_LOCATIONS (rlgym_compat.common_values, verified) -- the order
 /// Immortal's obs `pads` are in.
-const BOOST_LOCATIONS: [[f32; 3]; 34] = [
+pub(crate) const BOOST_LOCATIONS: [[f32; 3]; 34] = [
     [0.0, -4240.0, 70.0], [-1792.0, -4184.0, 70.0], [1792.0, -4184.0, 70.0],
     [-3072.0, -4096.0, 73.0], [3072.0, -4096.0, 73.0], [-940.0, -3308.0, 70.0],
     [940.0, -3308.0, 70.0], [0.0, -2816.0, 70.0], [-3584.0, -2484.0, 70.0],
@@ -41,7 +41,7 @@ const BOOST_LOCATIONS: [[f32; 3]; 34] = [
 /// perm[j] = engine (canonical) pad index whose position is nearest
 /// BOOST_LOCATIONS[j] (xy). Static -- pad positions never move -- cached
 /// process-wide (standard soccar always has 34 pads).
-fn rlgym_to_canon(pads: &[BoostPad]) -> &'static [usize; 34] {
+pub(crate) fn rlgym_to_canon(pads: &[BoostPad]) -> &'static [usize; 34] {
     static PERM: OnceLock<[usize; 34]> = OnceLock::new();
     PERM.get_or_init(|| {
         let mut perm = [0usize; 34];
