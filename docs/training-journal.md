@@ -3038,3 +3038,27 @@ And: **our 90-row action table is byte-identical to Necto's** `make_lookup_table
 (verified against the shipped deploy/external/nexto/agent.py). The action side of
 the port is already done. Remaining work is the NextoObsBuilder (q=32, kv=24,
 mask over players + ball + 34 pads) and wiring the 2-block EARL forward.
+
+## 2026-07-22 -- gates must NOT run concurrently with training
+
+Follow-up to the 0.471 self-play centre. Champion-vs-champion, same wheel, two
+environments:
+
+    remote, DURING training : 0.4728 / 0.4617 / 0.4781  -> mean 0.471, z = -2.5 vs 0.5
+    local, IDLE box         : 0.4891 / 0.4861           -> mean 0.4876, z = -0.9 (n.s.)
+
+On an idle box the self-play centre is statistically consistent with the
+theoretical 0.5. Most of the deficit is a LOAD ARTIFACT: CPU contention perturbs
+an engine we already know is layout/timing sensitive (see the ASLR entry).
+
+**Rule: measure the null and run gates on an IDLE box.** A gate run alongside a
+192-arena trainer is biased low by ~2-3 points -- more than enough to flip a
+verdict near threshold. The six remote null seeds launched under load are
+therefore NOT the null to judge the Immortal arm against; the arm's final gate
+waits for training to exit, so the null must be re-measured in that same idle
+state.
+
+Residual after removing the load effect is a ~1.2-point blue deficit (n.s. at
+n=2), consistent with the small side asymmetry measured directly by the goal
+probe (blue goal share 0.4821 +/- 0.0156). Small, and the empirical null absorbs
+it.
