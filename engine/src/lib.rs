@@ -13,6 +13,7 @@ pub mod ballpred;
 pub mod curriculum;
 pub mod engine;
 pub mod episode;
+pub mod foreign;
 pub mod obs;
 pub mod obs_advanced;
 pub mod obs_v1;
