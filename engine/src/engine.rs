@@ -30,7 +30,7 @@ pub enum NetWeights {
     /// A ported community bot (see `foreign.rs`): its own obs builder, MLP and
     /// action table. Lives in a SEPARATE slot space from `set_opponents`
     /// (`set_foreign_opponents`), addressed by `k <= -2` in a collect assignment.
-    Foreign { raw: RawStateDict, kind: crate::foreign::ForeignKind },
+    Foreign { raw: RawStateDict, kind: crate::foreign::ForeignKind, period: u32 },
 }
 
 enum Cmd {
@@ -855,9 +855,12 @@ impl MultiEngine {
                             let mut build_err: Option<String> = None;
                             for w in ws.iter() {
                                 match w {
-                                    NetWeights::Foreign { raw, kind } => {
+                                    NetWeights::Foreign { raw, kind, period } => {
                                         match crate::foreign::ForeignPolicy::new(raw, *kind) {
-                                            Ok(p) => built.push(p),
+                                            Ok(mut p) => {
+                                                p.set_decision_period(*period);
+                                                built.push(p)
+                                            }
                                             Err(e) => {
                                                 build_err = Some(e);
                                                 break;

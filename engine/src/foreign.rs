@@ -152,6 +152,16 @@ pub struct ForeignPolicy {
     kind: ForeignKind,
     backend: Backend,
     table: Vec<[f32; 8]>,
+    /// Difficulty handicap: recompute a decision only every `decision_period`
+    /// calls, holding the previous controls in between. 1 = full strength.
+    /// Every ported bot outclasses us (all four score 96-0 against the champion),
+    /// so a tunable weakening is the only way to get a contestable teacher --
+    /// a 0% win rate saturates the win-probability potential and kills the
+    /// gradient. Reaction rate is the cleanest knob: it degrades skill smoothly
+    /// without touching the policy or its observation.
+    decision_period: u32,
+    /// Per-car countdown + last controls, for the handicap.
+    hold: HashMap<u64, (u32, [f32; 8])>,
     /// Necto only: per-ARENA stateful timers (boost respawn + demo), keyed by the
     /// arena part of the decide key. Necto carries these across frames.
     necto_timers: std::collections::HashMap<u64, crate::obs_necto::NectoTimers>,
@@ -192,6 +202,8 @@ impl ForeignPolicy {
             backend,
             table,
             necto_timers: std::collections::HashMap::new(),
+            decision_period: 1,
+            hold: HashMap::new(),
             prev: HashMap::new(),
         })
     }
@@ -200,10 +212,21 @@ impl ForeignPolicy {
         self.kind
     }
 
+    /// Handicap the bot by making it react every `n` decisions (>=1). At n=2 it
+    /// acts at half our decision rate, and so on.
+    pub fn set_decision_period(&mut self, n: u32) {
+        self.decision_period = n.max(1);
+    }
+
+    pub fn decision_period(&self) -> u32 {
+        self.decision_period
+    }
+
     /// Clear per-car previous actions. Call on episode reset so the obs restarts
     /// from the zero action (matching the reference bot's `np.zeros(8)`).
     pub fn reset(&mut self) {
         self.prev.clear();
+        self.hold.clear();
     }
 
     /// Clear ONE car's previous action. Used at an episode boundary: a slot may
@@ -211,6 +234,7 @@ impl ForeignPolicy {
     /// episodes are still running.
     pub fn reset_car(&mut self, key: u64) {
         self.prev.remove(&key);
+        self.hold.remove(&key);
     }
 
     /// One decision for `state.cars[car_idx]`: build the bot's own obs using its
@@ -219,6 +243,17 @@ impl ForeignPolicy {
     pub fn decide(&mut self, state: &rocketsim_rs::GameState, car_idx: usize, key: u64)
         -> [f32; 8]
     {
+        // Handicap: hold the previous controls until the countdown expires. The
+        // bot's own prev-action state is left untouched, so when it does think it
+        // sees exactly what the reference would.
+        if self.decision_period > 1 {
+            if let Some((left, held)) = self.hold.get_mut(&key) {
+                if *left > 0 {
+                    *left -= 1;
+                    return *held;
+                }
+            }
+        }
         let prev = *self.prev.get(&key).unwrap_or(&[0.0; 8]);
         let controls = match &self.backend {
             Backend::Immortal(mlp) => {
@@ -281,6 +316,9 @@ impl ForeignPolicy {
         let mut out = controls;
         if self.kind.zero_yaw_on_jump() && out[5] > 0.0 {
             out[3] = 0.0;
+        }
+        if self.decision_period > 1 {
+            self.hold.insert(key, (self.decision_period - 1, out));
         }
         out
     }

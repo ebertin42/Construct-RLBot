@@ -302,10 +302,12 @@ impl Engine {
     /// ported bot (its own obs -> net -> action table -> controls, applied directly),
     /// and its BLUE cars remain learner rows. Independent of schema version, since a
     /// foreign bot builds its observation from the raw game state.
+    #[pyo3(signature = (opponents, kinds, decision_periods=None))]
     fn set_foreign_opponents(
         &mut self,
         opponents: Vec<HashMap<String, PyReadonlyArrayDyn<'_, f32>>>,
         kinds: Vec<String>,
+        decision_periods: Option<Vec<u32>>,
     ) -> PyResult<()> {
         if opponents.len() != kinds.len() {
             return Err(PyValueError::new_err(format!(
@@ -315,10 +317,15 @@ impl Engine {
         if opponents.len() > 8 {
             return Err(PyValueError::new_err("at most 8 foreign opponent slots"));
         }
+        let periods = decision_periods.unwrap_or_else(|| vec![1; opponents.len()]);
+        if periods.len() != opponents.len() {
+            return Err(PyValueError::new_err("decision_periods length mismatch"));
+        }
         let parsed: Vec<engine::NetWeights> = opponents
             .into_iter()
             .zip(kinds)
-            .map(|(w, kind)| {
+            .zip(periods)
+            .map(|((w, kind), period)| {
                 let arrays: HashMap<String, (Vec<f32>, Vec<usize>)> = w
                     .into_iter()
                     .map(|(k, v)| {
@@ -328,7 +335,7 @@ impl Engine {
                     .collect();
                 let fk = crate::foreign::ForeignKind::parse(&kind)
                     .ok_or_else(|| format!("unknown foreign kind {kind:?}"))?;
-                Ok(engine::NetWeights::Foreign { raw: arrays, kind: fk })
+                Ok(engine::NetWeights::Foreign { raw: arrays, kind: fk, period })
             })
             .collect::<Result<Vec<_>, String>>()
             .map_err(PyValueError::new_err)?;

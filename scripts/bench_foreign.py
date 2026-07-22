@@ -29,6 +29,8 @@ def main(argv=None):
     ap.add_argument("--arenas", type=int, default=32)
     ap.add_argument("--steps", type=int, default=45000)
     ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--period", type=int, default=1,
+                    help="handicap: bot reacts every N decisions (1 = full strength)")
     args = ap.parse_args(argv)
 
     from construct._engine import Engine
@@ -44,7 +46,7 @@ def main(argv=None):
                  curriculum_config_path="configs/curriculum_v3_match.toml",
                  seed=args.seed, net_heads=4)
     eng.set_weights(sd)
-    eng.set_foreign_opponents([fw], [args.kind])
+    eng.set_foreign_opponents([fw], [args.kind], [args.period])
     # every arena driven by foreign slot 0 (encoded -2)
     out = eng.collect(args.steps, arena_opponents=[-2] * args.arenas)
 
@@ -56,7 +58,7 @@ def main(argv=None):
         return 1
     share = (rec["wins"] + 0.5 * rec["draws"]) / n
     se = (share * (1 - share) / n) ** 0.5
-    print(f"{args.checkpoint} (blue) vs {args.kind} (orange)")
+    print(f"{args.checkpoint} (blue) vs {args.kind} (orange), period={args.period}")
     print(f"  {rec['wins']}W/{rec['draws']}D/{rec['losses']}L  n={n}  "
           f"win_share={share:.4f} +/- {se:.4f}")
     if share > 0.90:
