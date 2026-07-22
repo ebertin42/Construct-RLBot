@@ -2,14 +2,20 @@
 #
 # Option A (own-checkpoint league) was REFUTED: iter-290 gate win_share 0.4570
 # FAIL (null 0.502, threshold 0.55). Training against a pool of our own weaker
-# checkpoints is still just beating versions of ourselves. This arm changes
-# exactly ONE thing versus train_v3_matchwin: a fraction of arenas are played
-# against **Immortal**, an externally-trained community bot ported into the
-# engine (docs/foreign-opponents.md). No league, so attribution is clean.
+# checkpoints is still just beating versions of ourselves. This arm plays a
+# fraction of arenas against **Immortal**, an externally-trained community bot
+# ported into the engine (docs/foreign-opponents.md).
 #
 # ALL ARENAS ARE 1v1 (team_size_weights = [1, 0, 0]) — required: Immortal's
 # AdvancedObs is 107 floats == exactly one other car. The engine refuses a
 # foreign opponent in a 2v2/3v3 arena.
+#
+# ATTRIBUTION CAVEAT: this therefore differs from the Option-A league arm in TWO
+# ways, not one — the foreign opponent AND the all-1v1 mix ([1,0,0] vs the
+# champion/league [0.5,0.3,0.2]). The 1v1 mix is FORCED by Immortal, not chosen.
+# Since the gate is itself 1v1 (matchwin_gate uses mode=1), extra 1v1 practice
+# should if anything HELP this arm — so a FAIL is still informative. A WIN cannot
+# be credited to Immortal alone; that needs a control arm (all-1v1, no foreign).
 #
 # Requires the extracted weights on the box:
 #   scripts/extract_immortal_weights.py <RLMarlbot>/rlmarlbot/immortal/jit.pt
