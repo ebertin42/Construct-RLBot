@@ -1,0 +1,20 @@
+# Foreign (ported community bot) weights — SHA256 pins.
+#
+# These files are NOT in this repo and must never be committed: RLMarlbot
+# publishes no license, so its bundled weights are usable for private research
+# only and are not redistributable. This manifest records what was used, so a
+# run is reproducible and the artifacts are tamper-evident.
+#
+# Regenerate with scripts/extract_immortal_weights.py (prints the sha256).
+# See docs/foreign-opponents.md.
+
+[immortal]
+source_repo   = https://github.com/LoveSexDrugz/RLMarlbot
+source_commit = 9963b3bd328267d424ebac4a63429422df053e9c
+source_file   = rlmarlbot/immortal/jit.pt
+license       = NONE PUBLISHED (private research use only; do not redistribute)
+extracted_by  = scripts/extract_immortal_weights.py
+local_path    = ~/.cache/construct/immortal_weights.npz
+sha256        = d72949bfa709002a33595e47b1aacd69972413f6769ae76f501e3ba41f453a4f
+# net: 7x Linear (107->512->512->512->512->512->512->126), 6x LeakyReLU(0.01),
+# single 126-wide head; obs = RLGym AdvancedObs-107; actions = 126-row lookup.

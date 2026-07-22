@@ -287,6 +287,52 @@ impl Engine {
         self.inner.set_opponents(parsed).map_err(PyValueError::new_err)
     }
 
+    /// Loads FOREIGN (ported community bot) opponents into their own slot space.
+    ///
+    /// `opponents[i]` is that bot's state_dict (for Immortal: `net.{0,2,..,12}.
+    /// {weight,bias}`) and `kinds[i]` names the bot (currently only `"immortal"`),
+    /// which selects its observation builder, MLP dims and action table.
+    ///
+    /// Addressed from `collect(arena_opponents=...)` as `-(slot) - 2` — i.e. foreign
+    /// slot 0 is `-2`, slot 1 is `-3`. Such an arena's ORANGE cars are driven by the
+    /// ported bot (its own obs -> net -> action table -> controls, applied directly),
+    /// and its BLUE cars remain learner rows. Independent of schema version, since a
+    /// foreign bot builds its observation from the raw game state.
+    fn set_foreign_opponents(
+        &mut self,
+        opponents: Vec<HashMap<String, PyReadonlyArrayDyn<'_, f32>>>,
+        kinds: Vec<String>,
+    ) -> PyResult<()> {
+        if opponents.len() != kinds.len() {
+            return Err(PyValueError::new_err(format!(
+                "opponents/kinds length mismatch: {} vs {}", opponents.len(), kinds.len()
+            )));
+        }
+        if opponents.len() > 8 {
+            return Err(PyValueError::new_err("at most 8 foreign opponent slots"));
+        }
+        let parsed: Vec<engine::NetWeights> = opponents
+            .into_iter()
+            .zip(kinds)
+            .map(|(w, kind)| {
+                let arrays: HashMap<String, (Vec<f32>, Vec<usize>)> = w
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let shape = v.shape().to_vec();
+                        (k, (v.as_array().iter().copied().collect(), shape))
+                    })
+                    .collect();
+                let fk = match kind.as_str() {
+                    "immortal" => crate::foreign::ForeignKind::Immortal,
+                    other => return Err(format!("unknown foreign kind {other:?}")),
+                };
+                Ok(engine::NetWeights::Foreign { raw: arrays, kind: fk })
+            })
+            .collect::<Result<_, _>>()
+            .map_err(PyValueError::new_err)?;
+        self.inner.set_foreign_opponents(parsed).map_err(PyValueError::new_err)
+    }
+
     /// Runs `steps` rounds of on-worker rollout (policy-driven actions, sampled with
     /// each arena's own deterministic Pcg32 — see `engine::MultiEngine::collect`) and
     /// returns a dict of numpy arrays for the trainer: `obs (T,N,94) f32`, `actions

@@ -27,6 +27,10 @@ pub type RawStateDict = HashMap<String, (Vec<f32>, Vec<usize>)>;
 pub enum NetWeights {
     V0(PolicyWeights),
     V1 { raw: RawStateDict, heads: usize },
+    /// A ported community bot (see `foreign.rs`): its own obs builder, MLP and
+    /// action table. Lives in a SEPARATE slot space from `set_opponents`
+    /// (`set_foreign_opponents`), addressed by `k <= -2` in a collect assignment.
+    Foreign { raw: RawStateDict, kind: crate::foreign::ForeignKind },
 }
 
 enum Cmd {
@@ -35,6 +39,9 @@ enum Cmd {
     Debug { local_idx: usize },
     SetWeights(Arc<NetWeights>),
     SetOpponents(Arc<Vec<NetWeights>>),
+    /// Foreign (ported-bot) opponent slots. Separate slot space from
+    /// `SetOpponents`; a Collect assignment addresses slot `f` as `-(f) - 2`.
+    SetForeignOpponents(Arc<Vec<NetWeights>>),
     // `assignment` is the FULL (global, length num_arenas) opponent assignment;
     // each worker slices its own `[global_base..global_base+count)` range out of
     // it (see the Cmd::Collect arm). Legacy calls (Python `arena_opponents=None`)
@@ -277,6 +284,7 @@ fn collect_v1_worker(
     rngs: &mut [Pcg32],
     pol: &EntityPolicy,
     opponents: &[EntityPolicy],
+    foreign: &mut [crate::foreign::ForeignPolicy],
     emit_v0_obs: bool,
 ) -> Result<CollectOut, String> {
     let agents = a_to_arena.len();
@@ -289,11 +297,23 @@ fn collect_v1_worker(
     let mut learner_idx: Vec<usize> = Vec::with_capacity(agents);
     let mut opp_idx: Vec<Vec<usize>> = vec![Vec::new(); opponents.len()];
     let mut learner_col: Vec<Option<usize>> = vec![None; agents];
+    // Arenas whose ORANGE cars are driven by a foreign (ported) bot:
+    // (local arena index, foreign slot, first agent index of the arena).
+    let mut foreign_arenas: Vec<(usize, usize, usize)> = Vec::new();
     {
         let mut a_off = 0usize;
         for (li, &(b, o)) in arena_sizes.iter().enumerate() {
             let k = my_assignment[li];
-            if k < 0 {
+            if k <= -2 {
+                // Foreign opponent: blue are learner rows, orange are driven by
+                // `foreign[slot]` via a controls override at step time -- they are
+                // neither learner rows nor native-opponent rows.
+                let fslot = (-k - 2) as usize;
+                for i in 0..b {
+                    learner_idx.push(a_off + i);
+                }
+                foreign_arenas.push((li, fslot, a_off));
+            } else if k < 0 {
                 for i in 0..(b + o) {
                     learner_idx.push(a_off + i);
                 }
@@ -428,8 +448,22 @@ fn collect_v1_worker(
         // 5. step arenas (all agents), record learner rewards/flags.
         let mut aoff = 0usize;
         let mut done: Vec<usize> = Vec::new();
-        for ar in arenas.iter_mut() {
+        for (li, ar) in arenas.iter_mut().enumerate() {
             let n = ar.num_agents();
+            // Foreign-driven arena: build this arena's orange cars' controls from
+            // the ported bot (its own obs/net/table) and queue them as a one-shot
+            // override, so step_impl uses them instead of our action table.
+            let mut foreign_ids: Vec<u32> = Vec::new();
+            if let Some(&(_, fslot, _)) = foreign_arenas.iter().find(|(l, _, _)| *l == li) {
+                let bc = ar.blue_count();
+                let mut ov = Vec::with_capacity(n.saturating_sub(bc));
+                for i in bc..n {
+                    let (cid, ctrl) = ar.foreign_controls(i, &mut foreign[fslot]);
+                    foreign_ids.push(cid);
+                    ov.push((cid, ctrl));
+                }
+                ar.set_foreign_overrides(ov);
+            }
             ar.step_v1(
                 &acts[aoff..aoff + n],
                 &mut rew_buf[..n],
@@ -447,6 +481,17 @@ fn collect_v1_worker(
                     out.truncated[t * n_learner + col] = flag_buf[i].truncated;
                     if flag_buf[i].terminated || flag_buf[i].truncated {
                         done.push(a);
+                    }
+                }
+            }
+            // Episode boundary in a foreign arena: clear just THIS arena's cars'
+            // stored previous action so the bot's obs restarts from zeros (a slot
+            // may drive several arenas, so a blanket reset() would be wrong).
+            if !foreign_ids.is_empty() && flag_buf[..n].iter().any(|f| f.terminated || f.truncated)
+            {
+                if let Some(&(_, fslot, _)) = foreign_arenas.iter().find(|(l, _, _)| *l == li) {
+                    for cid in &foreign_ids {
+                        foreign[fslot].reset_car(*cid);
                     }
                 }
             }
@@ -555,6 +600,10 @@ pub struct MultiEngine {
     // Number of currently-set opponent slots (`Cmd::SetOpponents` payload length);
     // 0 until `set_opponents` is first called. Bounds-checks `Collect`'s assignment.
     opponent_slots: usize,
+    // Number of currently-set FOREIGN (ported-bot) opponent slots. Separate slot
+    // space from `opponent_slots`; a Collect assignment addresses foreign slot `f`
+    // as `-(f) - 2`. 0 until `set_foreign_opponents` is called.
+    foreign_slots: usize,
 }
 
 impl MultiEngine {
@@ -656,6 +705,10 @@ impl MultiEngine {
                 let mut opponents: Vec<MlpPolicy> = Vec::new();
                 // V1 twin of `opponents` (same slot indexing).
                 let mut opponents_v1: Vec<EntityPolicy> = Vec::new();
+                // Foreign (ported-bot) opponent slots — a SEPARATE slot space,
+                // addressed by `k <= -2` in a Collect assignment. Empty until
+                // set_foreign_opponents is called.
+                let mut opponents_foreign: Vec<crate::foreign::ForeignPolicy> = Vec::new();
                 while let Ok(cmd) = crx.recv() {
                     match cmd {
                         Cmd::Shutdown => break,
@@ -737,6 +790,11 @@ impl MultiEngine {
                                         policy = None;
                                     })
                                 }
+                                // MultiEngine::set_weights rejects this before it
+                                // ever reaches a worker; kept for exhaustiveness.
+                                NetWeights::Foreign { .. } => {
+                                    Err("a foreign bot cannot be the learner policy".to_string())
+                                }
                             };
                             match built {
                                 Ok(()) => { let _ = otx.send(WorkerOut::ack()); }
@@ -753,6 +811,12 @@ impl MultiEngine {
                                     NetWeights::V1 { raw, heads } => {
                                         EntityPolicy::new(raw, *heads).map(|p| built_v1.push(p))
                                     }
+                                    // Rejected by MultiEngine::set_opponents; foreign
+                                    // bots use the separate SetForeignOpponents slot space.
+                                    NetWeights::Foreign { .. } => Err(
+                                        "foreign dict in set_opponents; use set_foreign_opponents"
+                                            .to_string(),
+                                    ),
                                 };
                                 if let Err(e) = r {
                                     build_err = Some(e);
@@ -771,6 +835,37 @@ impl MultiEngine {
                                 }
                             }
                         }
+                        Cmd::SetForeignOpponents(ws) => {
+                            let mut built = Vec::new();
+                            let mut build_err: Option<String> = None;
+                            for w in ws.iter() {
+                                match w {
+                                    NetWeights::Foreign { raw, kind } => {
+                                        match crate::foreign::ForeignPolicy::new(raw, *kind) {
+                                            Ok(p) => built.push(p),
+                                            Err(e) => {
+                                                build_err = Some(e);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        build_err =
+                                            Some("set_foreign_opponents got a non-foreign dict".into());
+                                        break;
+                                    }
+                                }
+                            }
+                            match build_err {
+                                Some(e) => {
+                                    let _ = otx.send(WorkerOut::err(e));
+                                }
+                                None => {
+                                    opponents_foreign = built;
+                                    let _ = otx.send(WorkerOut::ack());
+                                }
+                            }
+                        }
                         Cmd::Collect { steps, assignment } => {
                             // V1 (entity) rollout lives in its own function so
                             // the v0 loop below stays literally untouched
@@ -785,7 +880,7 @@ impl MultiEngine {
                                 let msg = match collect_v1_worker(
                                     steps, my_assignment, &mut arenas, &arena_sizes,
                                     &a_to_arena, max_arena_agents, &mut rngs, pol,
-                                    &opponents_v1, emit_v0_obs,
+                                    &opponents_v1, &mut opponents_foreign, emit_v0_obs,
                                 ) {
                                     Ok(out) => WorkerOut::collect(out),
                                     Err(e) => WorkerOut::err(e),
@@ -1061,6 +1156,7 @@ impl MultiEngine {
             debug_policy: None,
             sizes,
             opponent_slots: 0,
+            foreign_slots: 0,
         }
     }
 
@@ -1144,6 +1240,11 @@ impl MultiEngine {
             (ObsMode::V1, NetWeights::V0(_)) => {
                 return Err("v0 state dict given to a v1-schema engine".into());
             }
+            (_, NetWeights::Foreign { .. }) => {
+                return Err("foreign state dict given to set_weights; a foreign bot \
+                            can only be an OPPONENT (set_foreign_opponents)"
+                    .into());
+            }
         };
         for w in &self.workers {
             w.tx.send(Cmd::SetWeights(arc.clone())).map_err(|e| e.to_string())?;
@@ -1186,6 +1287,11 @@ impl MultiEngine {
                 (ObsMode::V1, NetWeights::V0(_)) => {
                     return Err("v0 opponent state dict given to a v1-schema engine".into());
                 }
+                (_, NetWeights::Foreign { .. }) => {
+                    return Err("foreign state dict given to set_opponents; use \
+                                set_foreign_opponents (separate slot space)"
+                        .into());
+                }
             }
         }
         let n = weights.len();
@@ -1206,6 +1312,37 @@ impl MultiEngine {
             return Err(e);
         }
         self.opponent_slots = n;
+        Ok(())
+    }
+
+    /// Load FOREIGN (ported community bot) opponents into their own slot space.
+    /// Addressed in a collect assignment as `-(slot) - 2`. Unlike `set_opponents`
+    /// these are obs-mode independent: a foreign bot builds its own observation
+    /// from the raw GameState, so it works regardless of our schema version.
+    pub fn set_foreign_opponents(&mut self, weights: Vec<NetWeights>) -> Result<(), String> {
+        for w in &weights {
+            if !matches!(w, NetWeights::Foreign { .. }) {
+                return Err("set_foreign_opponents requires foreign state dicts".into());
+            }
+        }
+        let n = weights.len();
+        let arc = Arc::new(weights);
+        for w in &self.workers {
+            w.tx.send(Cmd::SetForeignOpponents(arc.clone())).map_err(|e| e.to_string())?;
+        }
+        let mut first_err: Option<String> = None;
+        for w in &self.workers {
+            let out = w.rx.recv().map_err(|e| e.to_string())?;
+            if let Some(e) = out.error {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        self.foreign_slots = n;
         Ok(())
     }
 
@@ -1230,15 +1367,27 @@ impl MultiEngine {
             ));
         }
         for &k in assignment.iter() {
-            if k < -1 || (k >= 0 && k as usize >= self.opponent_slots) {
+            // k == -1 self-play; k >= 0 native opponent slot; k <= -2 FOREIGN slot
+            // (-k - 2), a separate slot space filled by set_foreign_opponents.
+            let bad = if k == -1 {
+                false
+            } else if k <= -2 {
+                ((-k - 2) as usize) >= self.foreign_slots
+            } else {
+                k as usize >= self.opponent_slots
+            };
+            if bad {
                 return Err(format!(
-                    "arena_opponents value {k} out of range: expected -1 or an opponent slot in [0, {})",
-                    self.opponent_slots
+                    "arena_opponents value {k} out of range: expected -1, a native slot in \
+                     [0, {}), or a foreign slot encoded as -(f)-2 for f in [0, {})",
+                    self.opponent_slots, self.foreign_slots
                 ));
             }
         }
+        // Only self-play arenas (-1) contribute their orange cars as learner rows;
+        // both native-opponent and foreign arenas contribute blue only.
         let learner_count: usize = self.sizes.iter().zip(assignment.iter())
-            .map(|(&(b, o), &k)| if k < 0 { b + o } else { b })
+            .map(|(&(b, o), &k)| if k == -1 { b + o } else { b })
             .sum();
         if learner_count == 0 {
             return Err("arena_opponents assignment yields no learner agents".into());

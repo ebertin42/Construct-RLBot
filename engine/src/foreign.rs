@@ -127,6 +127,13 @@ impl ForeignPolicy {
         self.prev.clear();
     }
 
+    /// Clear ONE car's previous action. Used at an episode boundary: a slot may
+    /// drive several arenas, so a blanket `reset()` would wrongly clear cars whose
+    /// episodes are still running.
+    pub fn reset_car(&mut self, car_id: u32) {
+        self.prev.remove(&car_id);
+    }
+
     /// One decision for `state.cars[car_idx]`: build the bot's own obs using its
     /// stored previous action, forward, argmax, look up controls-8, and store
     /// those controls as the next previous action.

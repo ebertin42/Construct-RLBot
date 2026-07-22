@@ -192,6 +192,13 @@ pub struct EpisodeArena {
     table: Vec<[f32; 8]>,
     car_ids: Vec<u32>, // blue asc, then orange asc — agent index order
     blue_count: usize,
+    /// One-shot per-car controls override, consumed (and cleared) by the next
+    /// `step_impl`. Used by foreign opponents (ported community bots), which
+    /// produce controls-8 directly from their OWN action table instead of an
+    /// index into `self.table`. Empty on every ordinary step, so the normal
+    /// path is unchanged (the `.iter().find()` on an empty vec is a no-op) —
+    /// byte-identity of self-play/native-opponent collects is preserved.
+    foreign_overrides: Vec<(u32, [f32; 8])>,
     tick_skip: u32,
     reward_cfg: RewardConfig,
     norm: Normalization,
@@ -274,6 +281,7 @@ impl EpisodeArena {
             },
             car_ids,
             blue_count: blue,
+            foreign_overrides: Vec::new(),
             tick_skip,
             reward_cfg,
             norm,
@@ -673,6 +681,37 @@ impl EpisodeArena {
         )
     }
 
+    /// Number of blue (learner-side) agents; orange agents are
+    /// `blue_count()..num_agents()` in this arena's agent order.
+    pub fn blue_count(&self) -> usize {
+        self.blue_count
+    }
+
+    /// Queue per-car controls overrides for the NEXT step (consumed and cleared
+    /// by it). Used to drive foreign-opponent cars.
+    pub fn set_foreign_overrides(&mut self, o: Vec<(u32, [f32; 8])>) {
+        self.foreign_overrides = o;
+    }
+
+    /// Ask a foreign (ported) policy for `agent_idx`'s controls. Maps the agent
+    /// to its car in the live `GameState` BY CAR ID -- `get_game_state()` does
+    /// not return cars in agent order -- then runs the bot's own obs/net/table.
+    pub fn foreign_controls(
+        &mut self,
+        agent_idx: usize,
+        pol: &mut crate::foreign::ForeignPolicy,
+    ) -> (u32, [f32; 8]) {
+        let cid = self.car_ids[agent_idx];
+        let gs = self.arena.pin_mut().get_game_state();
+        let j = gs
+            .cars
+            .iter()
+            .position(|c| c.id == cid)
+            .expect("agent's car id present in game state");
+        let controls = pol.decide(&gs, j);
+        (cid, controls)
+    }
+
     fn step_impl(
         &mut self,
         action_idx: &[i64],
@@ -698,10 +737,18 @@ impl EpisodeArena {
 
         let controls: Vec<(u32, rocketsim_rs::sim::CarControls)> = (0..n)
             .map(|a| {
+                let cid = self.car_ids[a];
+                // Foreign-driven cars supply controls-8 directly (their own action
+                // table); everyone else indexes ours. `foreign_overrides` is empty
+                // on ordinary steps, so this is the same code path as before.
+                if let Some((_, row)) = self.foreign_overrides.iter().find(|(oid, _)| *oid == cid) {
+                    return (cid, actions::to_controls(row));
+                }
                 let row = &self.table[action_idx[a] as usize];
-                (self.car_ids[a], actions::to_controls(row))
+                (cid, actions::to_controls(row))
             })
             .collect();
+        self.foreign_overrides.clear();
         self.arena.pin_mut().set_all_controls(&controls).expect("valid car ids");
         self.arena.pin_mut().step(self.tick_skip);
 
