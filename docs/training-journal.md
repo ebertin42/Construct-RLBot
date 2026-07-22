@@ -2952,3 +2952,43 @@ Separately (also pre-existing, verified against the pre-port build): two
 freshly-constructed same-seed engines in ONE process can diverge ~1e-5 once other
 arenas have been created. Gates run in fresh processes, so this does not affect
 them.
+
+---
+
+## 2026-07-22 -- THE CHAMPION LOSES 89% TO IMMORTAL (first absolute measurement)
+
+`scripts/bench_foreign.py` plays one of our checkpoints against a ported foreign
+bot in-engine, scoring with the SAME match accounting as the gate. First run:
+
+    ck_000320471040 (blue) vs immortal (orange)
+      25W/11D/284L  n=320  win_share=0.0953 +/- 0.0164
+
+The champion -- unbeaten across 6 hill-climb + 8 diagnosis + 4 match-win + 3
+reward-lever + 1 league arm -- loses roughly 89% of matches to a public community
+bot. And it does so while Immortal is HANDICAPPED: it decides on our 8-tick clock
+(15 Hz) instead of the 6-tick (20 Hz) it was trained at.
+
+Not a side-order artifact: the champion-vs-champion self-gate's two orders agree
+(0.4636 / 0.4819), so there is no large blue/orange bias to explain a 0.095.
+
+Not a broken port either -- a mis-ported bot would flail, not win 89%. This is
+the strongest evidence yet that the obs/action/net port is faithful.
+
+**What this means.** Every metric this project has optimised was self-referential:
+goal-share vs our own checkpoints, then match-win vs our own champion. We have
+been hill-climbing inside a very small pond, and "champion unbeaten" said nothing
+about absolute strength. The gate bar ("beat ck_000320471040") is close to
+meaningless in absolute terms.
+
+We now have an ABSOLUTE, cheap, in-engine ruler. Progress should be measured as
+win_share vs Immortal, not (only) vs the champion.
+
+Immediate follow-up hypothesis, being tested: **the champion was SELECTED by
+self-referential gates, so it may not be our best policy against an external
+opponent.** Benching a spread of the entity lineage vs Immortal.
+
+Also note the curriculum question this raises for the running arm
+(matchwin_immortal_s20260722, 35% of arenas vs Immortal): an opponent we beat
+only 9.5% of the time is a harsh teacher. The 65% self-play share is what keeps
+the signal from going fully sparse. Worth watching whether the arm's win_share
+vs Immortal actually moves.
