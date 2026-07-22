@@ -11,8 +11,8 @@ FAIL**, null 0.502, threshold 0.55). Own-checkpoint "diversity" is just beating
 versions of yourself. A foreign bot is genuinely new blood. See
 `docs/superpowers/specs/2026-07-22-immortal-port-design.md`.
 
-Currently ported: **Immortal** (RLMarlbot, rlgym-ppo), **Nexto** (~GC1) and
-**Necto** (~Diamond) (Rolv-Arild/Necto, CC BY-NC-SA 4.0).
+Currently ported: **Immortal**, **Element** (RLMarlbot, rlgym-ppo/MLP, unlicensed),
+**Nexto** (~GC1) and **Necto** (~Diamond) (Rolv-Arild/Necto, CC BY-NC-SA 4.0).
 
 Measured strength of our champion `ck_000320471040` against each (`bench_foreign.py`):
 
@@ -110,6 +110,26 @@ scored on. Before and after a rebuild:
 It replays the gate's exact MatchRunner construction champion-vs-champion at a
 fixed seed and hashes every output array. The foreign-opponent port was verified
 this way: `INSTRUMENT UNCHANGED`.
+
+## Handicapping a bot (the difficulty knob)
+
+Every ported bot beats the champion 96-0 at full strength, so none is usable as a
+TEACHER as-is: at a 0% win rate the win-probability potential saturates near -0.5
+and those arenas contribute almost no gradient. `decision_periods` fixes this -- a
+bot recomputes a decision every Nth call and holds its controls in between, which
+degrades skill smoothly without touching its policy or observation:
+
+```python
+eng.set_foreign_opponents([element_sd], ["element"], decision_periods=[4])
+```
+
+Measured champion win_share vs Element by period: 1 -> 0.00, 2 -> 0.00,
+4 -> 0.375, 8 -> 0.984. One bot spans the whole range. The honest absolute
+progress metric is "the period at which win_share crosses 0.5" -- measure it with
+`bench_foreign.py --period N`.
+
+In a training config this is `[foreign].decision_periods` (same length as
+`kinds`); see `configs/train_v5_element_handicap.toml`.
 
 ## Adding another bot
 
