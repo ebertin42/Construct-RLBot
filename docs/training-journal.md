@@ -3338,3 +3338,31 @@ bots take billions) -- a real compute commitment, not a 290-iter probe.
 Alternative honest read: matching Nexto/Element may just need scale/compute we
 have not spent (they trained billions of steps from scratch with league
 self-play).
+
+## 2026-07-23 -- Option A launched: FROM-SCRATCH auto-curriculum (fromscratch_s20260723)
+
+Elliot chose A. Fresh EntityPolicyNet (488k, champion dims) trained from ZERO,
+UNBOUNDED, on the remote box. `python -m construct.learn.train
+configs/train_v8_fromscratch.toml` under setsid.
+
+Recipe (everything the trapped champion was NOT):
+  * fresh net -> no local-optimum baggage, no stale-critic collapse, NO anchor.
+  * a real graded external opponent (Element) from step 0 via the auto-curriculum
+    -> never enters the pure-self-play collapse the champion is trapped in.
+  * reward_v0 (goal + touch + vel_to_ball) to bootstrap a random net.
+  * DECOUPLED controller: the auto-curriculum reads a clean GOAL-based win rate on
+    a SEPARATE eval engine, not the shaped training reward -> immune to the
+    win-prob-gaming trap. Opponent starts nearly idle (period 12), ratchets up as
+    win rate crosses 0.55.
+  * absolute metric: progress = the difficulty (period, then bot ladder) at which
+    we hold ~50%, tracked with bench_foreign.py.
+
+Early: ~8,700 sps (2x the fine-tune rate). ep_rew ~+280 is the reward_v0 self-play
+shaping baseline (NOT the controller signal). Controller winrate 0.000 -> holds
+p12 while the net learns basics from shaping + self-play.
+
+This is a MULTI-DAY run. Bootstrap is the first milestone: watch for the net to
+start scoring vs p12 Element (winrate > 0), then the curriculum ratcheting the
+period down. Real progress = beating handicapped Element at ever-lower periods,
+then the bot ladder (Element -> Immortal -> Necto -> Nexto). If it never
+bootstraps past self-play level, the conclusion narrows to compute/scale.
