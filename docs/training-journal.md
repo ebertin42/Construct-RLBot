@@ -3230,3 +3230,34 @@ FIXED wheel (per-arena keying + all four bots + handicap knob). 290 iters.
 
 Absolute progress will be read as the shift in win_share vs Element at fixed
 periods, not (only) the champion gate. Gates run idle, post-training.
+
+## 2026-07-23 -- replay-BC net CANNOT PLAY (639-0 loss to champion); thread shelved
+
+Benched the orphaned human-replay BC net for the first time:
+
+    ck_bc_ep01 vs champion ck_000320471040:  0W/1D/639L   win_share 0.0008
+
+The BC net (top1 0.642 / top3 0.844 on human actions) is crushed 639-0 by our own
+champion -- which itself loses 96-0 to real community bots. So the human-replay
+supervised BC produced a policy that essentially cannot play in closed loop.
+
+Why: supervised action-matching != skill. With heavy action-class imbalance,
+predicting the common action ("throttle-ish forward") scores ~64% top1 while
+missing the decisive rare actions; and offline BC has no correction for
+compounding error / distribution shift (the DAgger problem) -- small mistakes
+drift the policy into unseen states where it collapses.
+
+Consequence: **BC-from-replays is NOT a usable warm-start.** The champion is still
+our best policy by a mile. The "our own bot" pivot therefore starts from the
+CHAMPION, not from BC:
+  champion init -> anchor-free RL vs an AUTO-HANDICAPPED real opponent
+  (period auto-tuned to hold ~50% win rate) -> measured absolutely (the
+  difficulty level at which we hold 50%). No distill, no copy -- the bots are
+  only the curriculum and the ruler.
+
+Replay corpus (18,738 games) is not wasted -- a live future use is as an episode
+RESET distribution (start from real game states) rather than as imitation
+targets. Secondary; not now.
+
+SSL pull is dead again (died ~19h ago); not relaunching until BC/replay has a
+purpose, which right now it doesn't.
