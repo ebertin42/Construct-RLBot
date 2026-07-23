@@ -3366,3 +3366,38 @@ start scoring vs p12 Element (winrate > 0), then the curriculum ratcheting the
 period down. Real progress = beating handicapped Element at ever-lower periods,
 then the bot ladder (Element -> Immortal -> Necto -> Nexto). If it never
 bootstraps past self-play level, the conclusion narrows to compute/scale.
+
+## 2026-07-23 -- BOT-VS-BOT tournament: true strength ranking for the ladder
+
+Added `BotMatch` (engine): both cars foreign-driven, so the ported bots play
+EACH OTHER (the champion saturates at 0.0 vs every full bot and can't rank them).
+`scripts/bot_tournament.py`.
+
+**Round-robin win-share (row vs col), full strength:**
+             element immortal  necto  nexto
+    element    --      0.09    0.14   0.00
+    immortal   0.91    --      0.44   0.00
+    necto      0.86    0.56    --     0.00
+    nexto      1.00    1.00    1.00   --
+
+**True strength (mean win_share vs field):**
+    nexto     1.000   <- dominant, beats everyone 1.0 (GC1)
+    necto     0.476   \  nearly tied, necto marginally ahead
+    immortal  0.448   /
+    element   0.076   <- floor
+
+Ordering: Element < Immortal ~= Necto < Nexto. This SETTLES the earlier
+champion-vs-necto 0.45 anomaly: that was blowup-fragmentation (n=418); Necto is
+genuinely strong. The port is fine.
+
+**Handicap scale (Nexto period P vs full Element) -- a CLIFF, not smooth:**
+    p1 1.00  p2 1.00  p3 0.92  p4 0.06  p6 0.00
+Nexto goes from crushing to losing in ONE handicap step (p3->p4). So the period
+knob is coarse near a strong bot -- which is why the curriculum must be a single
+CROSS-BOT sorted ladder-index (fill the nexto-p3..p4 gap with other bots'
+intermediate versions), not period-within-one-bot.
+
+Difficulty axis for the league (easy -> hard): heavily-handicapped anything ->
+element-full -> immortal/necto handicapped -> immortal~necto full -> nexto
+handicapped -> NEXTO FULL (final boss). Wire the ladder-index controller to walk
+this when the from-scratch net climbs out of bootstrap.
