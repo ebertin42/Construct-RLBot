@@ -3299,3 +3299,42 @@ champion gate), post-training.
 
 Note: the controller lags a fast-improving policy (1 period per 10 iters). If it
 keeps pinning, adjust_every should drop or the step should scale with the margin.
+
+## 2026-07-23 -- THE CHAMPION IS A TRAPPED LOCAL OPTIMUM. RL-from-it cannot improve.
+
+The auto-curriculum, done honestly (goal reward, autocur7), also DEGRADED the
+policy: vs Element p4, autocur7 = 0.1146, autocur6 (win-prob) = 0.133, champion =
+0.375. Both rewards, both worse than the champion.
+
+Combined with everything this session, the picture is now unambiguous:
+
+  * Strong anchor (lambda 0.6 constant): policy STAYS at champion (capped, never
+    exceeds ~parity) -- every match-win/league/Immortal arm.
+  * Weak/annealed/no anchor: policy DEGRADES below champion (autocur6/7,
+    the anchor-free/0.2 collapses).
+  * Win-prob shaping: gameable (inflates PHI, real skill drops).
+  * Goal reward: honest but the policy still drifts down as the anchor releases.
+  * Human-replay BC: 639-0 loss, cannot play.
+
+RL fine-tuning from the champion NEVER improves it -- it either stays capped or
+degrades. The champion is a sharp local optimum from self-play, and local PPO
+gradients out of it point DOWN. This is why days of levers failed: they were all
+fine-tunes of a trapped optimum, scored by a self-referential (and gameable)
+metric.
+
+The ceiling is the RECIPE, confirmed: Element is a 400k-param MLP (our size) and
+beats us 96-0. So a comparable net CAN be far better -- but not reachable by
+fine-tuning our champion.
+
+**The genuinely different path: train a FRESH net FROM SCRATCH with the
+auto-curriculum.** A fresh net has no local-optimum baggage. The auto-curriculum
+is exactly the tool for it: start the opponent very weak (heavily handicapped, so
+even a random net can contest), ratchet difficulty up as the policy learns --
+a real graded opponent from step 0, which avoids BOTH self-play collapse AND the
+champion's trap. This is the legitimate "our own bot": fresh net, our RL, real
+curriculum, no baggage. Cost: a LONG run (champion took 320M steps; competitive
+bots take billions) -- a real compute commitment, not a 290-iter probe.
+
+Alternative honest read: matching Nexto/Element may just need scale/compute we
+have not spent (they trained billions of steps from scratch with league
+self-play).
