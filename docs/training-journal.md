@@ -3401,3 +3401,29 @@ Difficulty axis for the league (easy -> hard): heavily-handicapped anything ->
 element-full -> immortal/necto handicapped -> immortal~necto full -> nexto
 handicapped -> NEXTO FULL (final boss). Wire the ladder-index controller to walk
 this when the from-scratch net climbs out of bootstrap.
+
+## 2026-07-23 -- FULL version ladder (16 versions, bot-vs-bot round-robin)
+
+scripts/version_ladder.py: every (bot x period) plays every other, ranked by mean
+win_share vs the field. logs/version_ladder.tsv. HARDEST opponent -> EASIEST:
+
+  nexto:p1 0.857 | immortal:p1 0.783 | necto:p1 0.733 | element:p1 0.703 |
+  nexto:p3 0.702 | element:p3 0.592 | necto:p3 0.587 | immortal:p3 0.525 |
+  nexto:p6 0.437 | element:p6 0.433 | necto:p6 0.393 | immortal:p6 0.342 |
+  element:p12 0.250 | necto:p12 0.228 | immortal:p12 0.226 | nexto:p12 0.210
+
+Findings:
+  1. PERIOD dominates difficulty -- clean bands p1 (0.70-0.86) > p3 (0.52-0.70) >
+     p6 (0.34-0.44) > p12 (0.21-0.25). Bot identity is the SECONDARY sort.
+  2. Interleaving confirmed: element:p1 (0.703) ~= nexto:p3 (0.702); at p6 all four
+     bots collapse to 0.34-0.44 (handicap swamps skill). -> cross-bot ladder-index
+     is correct, not per-bot ramping.
+  3. SURPRISE: nexto:p12 (0.210) is the WEAKEST version -- below element:p12. At
+     heavy handicap the bot holds stale controls, and Nexto's sophisticated frozen
+     actions (whiffed aerials) are a bigger liability than Element's simple held
+     ground inputs. Skill inverts into a handicap when frozen. The easiest rung is
+     a crippled STRONG bot.
+
+Curriculum spine (easiest -> hardest) = the 16 rows reversed. Wire the
+ladder-index controller to walk this. Note per-pair n~21 (small) so fine ordering
+within a band is noisy; the BANDS are robust.
