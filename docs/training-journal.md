@@ -3261,3 +3261,41 @@ targets. Secondary; not now.
 
 SSL pull is dead again (died ~19h ago); not relaunching until BC/replay has a
 purpose, which right now it doesn't.
+
+## 2026-07-23 -- auto-curriculum arm WORKING (matchwin_autocur6); collapse cause found
+
+Built the auto-curriculum controller (train.py): tunes the foreign opponent's
+decision_period to hold ep_reward_mean (a clean margin -- self-play cancels under
+a zero-sum reward) near 0, so the gradient is always maximally informative.
+Winning -> opponent harder; losing -> easier; clamped, EMA-smoothed.
+
+Getting a STABLE run took five failed launches and taught the real lesson:
+
+  * anchor-free (lambda 0) -> collapse in ~5 iters (+32 -> -256)
+  * lambda 0.2 -> collapse
+  * lambda 0.6 ANNEALED -> collapse
+  * reward_v6 vs reward_v5 -> not it (both collapse)
+  * START AT AN EASY DIFFICULTY (Element period 8, champion wins 0.98) -> collapse
+  * START AT A CONTESTED DIFFICULTY (Element period 4, ~0.375) -> STABLE
+
+**The collapse was never the anchor.** It was starting against a too-easy
+opponent while the critic is stale (champion's value head was trained on the goal
+reward, now it's win-prob). Crushing a weak opponent + a stale critic = enormous
+advantages = one destructive PPO step. Starting CONTESTED keeps advantages
+moderate, so it's stable -- exactly the regime the earlier (stable) arms were in
+because they faced FULL-strength opponents. The anchor "helped" before only
+because those arms happened to start contested.
+
+Corollary: the auto-curriculum should START near 50% and stay there, which is
+also what makes the gradient informative. Easy-start is bad for BOTH stability and
+signal.
+
+matchwin_autocur6 (contested p4 start, annealed anchor 0.6->0 over 80,
+auto-curriculum): stable, and improving fast vs Element -- ep_rew climbed then the
+controller dropped the period (4->3) at iter 10 to re-contest. Whether the
+improvement is real skill or an exploit of the handicapped (predictable) opponent
+is the open question the absolute bench answers (vs FULL Element + the ladder +
+champion gate), post-training.
+
+Note: the controller lags a fast-improving policy (1 period per 10 iters). If it
+keeps pinning, adjust_every should drop or the step should scale with the margin.
