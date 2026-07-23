@@ -289,12 +289,64 @@ class Trainer:
             print(f"foreign: {kinds} periods={periods} on "
                   f"{round(frac * self.num_arenas)}/{self.num_arenas} arenas "
                   f"(frac={frac})", flush=True)
+            # --- auto-curriculum: hold the opponent near a ~50% win rate by
+            # tuning its decision_period, so the gradient is always maximally
+            # informative (never saturated at a 0% or 100% win rate). Because
+            # the reward is zero-sum, self-play arenas cancel in the mean episode
+            # reward, leaving ep_reward_mean as a clean "are we beating the
+            # foreign opponent" margin -- the control signal. See
+            # docs/foreign-opponents.md.
+            self._foreign_sds = sds
+            self._foreign_kinds = kinds
+            self._foreign_periods = [int(p) for p in periods]
+            ac = fg.get("auto_curriculum", {})
+            self._ac_on = bool(ac.get("enabled", False))
+            # widen/narrow the opponent when ep_reward_mean leaves [-band, +band]
+            self._ac_band = float(ac.get("band", 1.0))
+            self._ac_period_min = int(ac.get("period_min", 1))
+            self._ac_period_max = int(ac.get("period_max", 12))
+            self._ac_every = max(1, int(ac.get("adjust_every", 20)))
+            self._ac_ema = None
+            self._ac_alpha = float(ac.get("ema_alpha", 0.3))
+            if self._ac_on:
+                print(f"auto-curriculum ON: hold ep_rew in +/-{self._ac_band}, "
+                      f"period in [{self._ac_period_min},{self._ac_period_max}], "
+                      f"adjust every {self._ac_every} iters", flush=True)
 
         if _state:
             self.net.load_state_dict(_state["model"])
             if _state["optimizer"] is not None:  # None = deliberate reset (regime swap)
                 self.opt.load_state_dict(_state["optimizer"])
             self.total_steps = _state["total_steps"]
+
+    def _auto_curriculum_step(self, it: int, ep_reward_mean: float):
+        """Adjust the foreign opponent's decision_period to hold ep_reward_mean
+        near 0 (a ~50% win rate). Winning (ep_rew > +band) -> make the opponent
+        harder (lower period); losing (< -band) -> make it easier (higher period).
+
+        The reward is zero-sum, so self-play arenas cancel and ep_reward_mean is a
+        clean margin against the foreign opponent. An EMA smooths per-iter noise.
+        """
+        if not getattr(self, "_ac_on", False) or self._foreign_slots == 0:
+            return
+        self._ac_ema = (ep_reward_mean if self._ac_ema is None
+                        else (1 - self._ac_alpha) * self._ac_ema
+                        + self._ac_alpha * ep_reward_mean)
+        if it % self._ac_every != 0:
+            return
+        cur = self._foreign_periods[0]
+        new = cur
+        if self._ac_ema > self._ac_band:
+            new = max(self._ac_period_min, cur - 1)      # winning -> harder
+        elif self._ac_ema < -self._ac_band:
+            new = min(self._ac_period_max, cur + 1)       # losing -> easier
+        if new != cur:
+            self._foreign_periods = [new] * len(self._foreign_kinds)
+            # rebuild the foreign opponents at the new period (cheap -- small nets)
+            self.engine.set_foreign_opponents(
+                self._foreign_sds, self._foreign_kinds, self._foreign_periods)
+            print(f"auto-curriculum: ep_rew_ema {self._ac_ema:+.3f} -> "
+                  f"period {cur} -> {new}", flush=True)
 
     def _apply_foreign(self, a: list[int]) -> list[int]:
         """Stamp foreign-opponent arenas onto the FRONT of an assignment.
@@ -513,6 +565,8 @@ class Trainer:
             n = p["rollout_steps"] * batch["n_agents"]
             self.total_steps += n
             it += 1
+            # auto-curriculum: retune the opponent difficulty from this iter's margin
+            self._auto_curriculum_step(it, batch["ep_reward_mean"])
             if it % self.cfg.run.get("log_every_iters", 1) == 0:
                 sps = n / (time.perf_counter() - t0)
                 msg = (

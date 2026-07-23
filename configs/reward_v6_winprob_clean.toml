@@ -1,0 +1,35 @@
+# Reward v6 -- win-prob shaping ONLY, spirit terms ZEROED for an exactly
+# zero-sum reward. Used by the auto-curriculum arm: with a zero-sum reward the
+# self-play arenas' learner rewards cancel in ep_reward_mean, so that mean is a
+# clean margin against the FOREIGN opponent -- the signal the difficulty
+# controller reads. team_spirit/opp_spirit are irrelevant in 1v1 anyway (one
+# player per team); zeroing them just removes any chance of a constant offset.
+#
+#
+# Every shaping term from v0-v4.1 is ZERO here. The only signal is
+# w * (gamma * PHI(s') - PHI(s)) where PHI is the win probability from
+# score_diff and remaining clock (engine/src/reward.rs::win_prob).
+#
+# Because the term is potential-based, it telescopes to the match outcome and
+# leaves the optimal policy unchanged (Ng, Harada & Russell 1999) -- so PHI's
+# accuracy costs sample efficiency, never correctness.
+#
+# REQUIRES a curriculum with match_mode = true (configs/curriculum_v3_match.toml).
+# Without it there is no score or clock and the term is meaningless; the trainer
+# refuses this combination loudly rather than training on a constant.
+goal = 0.0
+touch = 0.0
+vel_to_ball = 0.0
+aggression_bias = 0.0
+touch_accel = 0.0
+vel_ball_to_goal = 0.0
+offensive_potential = 0.0
+
+team_spirit = 0.0
+opp_spirit = 0.0
+
+win_prob_weight = 10.0
+win_prob_k_base = 0.6
+win_prob_t_floor = 0.05
+# MUST equal configs/train_v1.toml [ppo] gamma. Checked at trainer startup.
+win_prob_gamma = 0.9954

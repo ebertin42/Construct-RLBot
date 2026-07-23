@@ -1,0 +1,75 @@
+# AUTO-CURRICULUM arm -- the pivot (2026-07-23).
+#
+# Diagnosis of days of failure: we optimised a self-referential metric ("beat our
+# own champion"), anchored every arm to that weak champion (KL prior lambda 0.6),
+# over-engineered the reward, and trained via self-play / own-checkpoints that
+# collapse to a shared local optimum. The champion loses 96-0 to every public
+# community bot -- including a small MLP the size of our own net -- so the ceiling
+# is the RECIPE, not the model.
+#
+# This arm changes the recipe:
+#   * NO champion anchor  -> launched WITHOUT --kl-prior. Free to move.
+#   * AUTO-CURRICULUM     -> the opponent is Element, handicapped by a
+#     decision_period that auto-tunes to hold our win rate near 50%. Always
+#     contestable => always-informative gradient; a real external opponent =>
+#     no self-play blind-spot collapse. As we improve it ratchets harder.
+#   * ZERO-SUM reward     -> win-prob shaping only, spirit terms zeroed
+#     (reward_v6), so self-play cancels and ep_reward_mean is a clean margin the
+#     controller reads.
+#   * ABSOLUTE metric     -> progress is the difficulty (period) at which we hold
+#     ~50%, measured with bench_foreign.py; the champion gate is secondary.
+#
+# Starts from the champion (our best policy; beats Element at period 8). ALL 1v1
+# (foreign opponents are 1v1-only). Requires element_weights.npz on the box.
+schema_path = "schema/v1.toml"
+reward_config_path = "configs/reward_v6_winprob_clean.toml"
+curriculum_config_path = "configs/curriculum_v3_match.toml"
+
+[env]
+num_arenas = 192
+blue = 1
+orange = 1
+seed = 0
+team_size_weights = [1.0, 0.0, 0.0]
+
+[net]
+d_model = 128
+layers = 2
+heads = 4
+ff = 512
+
+[ppo]
+rollout_steps = 256
+gamma = 0.9954
+lam = 0.95
+lr = 2e-4
+clip = 0.2
+entropy_coef = 0.01
+value_coef = 1.0
+epochs = 3
+minibatch_size = 8192
+
+[run]
+device = "cuda"
+checkpoint_dir = "checkpoints_entity"
+save_every_iters = 20
+log_every_iters = 1
+
+[kickstart]
+steps = 500000000
+
+[foreign]
+enabled = true
+kinds = ["element"]
+weights = ["~/.cache/construct/element_weights.npz"]
+decision_periods = [8]     # start easy (champion wins ~0.98 vs Element p8); the
+                           # controller lowers it as we improve
+opponent_frac = 0.35
+
+[foreign.auto_curriculum]
+enabled = true
+band = 1.0                 # retune when ep_reward_mean leaves [-1, +1]
+period_min = 1
+period_max = 12
+adjust_every = 10          # check/adjust every 10 iters
+ema_alpha = 0.3            # smoothing on the per-iter margin
