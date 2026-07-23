@@ -29,7 +29,7 @@ fi
 # checkpoints_hc/<arm>/, the legacy lineage to checkpoints_entity/. We stream
 # whichever holds the freshest checkpoint (newest by mtime = the live frontier),
 # so the viewer auto-follows the current arm wherever it writes.
-WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_entity checkpoints_hc}"
+WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_scratch checkpoints_entity checkpoints_hc}"
 # Curriculum the viewer renders under -- MUST match the live arm's curriculum so
 # "what you watch matches what it learns". Default is the match-win regime
 # (full 300s matches + score); set CONSTRUCT_WATCH_CURRICULUM='' to render
