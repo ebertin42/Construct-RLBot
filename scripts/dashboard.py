@@ -34,8 +34,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-MAIN_LOG = REPO / "checkpoints_entity" / "train_remote.log"   # synced remote train_v1.log
-CKPT_DIR = REPO / "checkpoints_entity"
+# Env-overridable so the dashboard can follow whichever run is live without an
+# edit. Defaults keep the legacy entity run; the from-scratch auto-curriculum run
+# sets CONSTRUCT_DASH_MAIN_LOG / CONSTRUCT_DASH_CKPT_DIR to checkpoints_scratch.
+import os as _os
+MAIN_LOG = Path(_os.environ.get(
+    "CONSTRUCT_DASH_MAIN_LOG", REPO / "checkpoints_entity" / "train_remote.log"))
+CKPT_DIR = Path(_os.environ.get(
+    "CONSTRUCT_DASH_CKPT_DIR", REPO / "checkpoints_entity"))
 BC_LOG = REPO / "logs" / "bc_train.log"
 LEAGUE_LOCAL = REPO / "league" / "registry.jsonl"
 LEAGUE_REMOTE = REPO / "league" / "registry_remote.jsonl"     # synced by sync_remote.sh

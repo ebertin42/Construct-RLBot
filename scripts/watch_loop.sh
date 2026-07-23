@@ -50,12 +50,18 @@ while true; do
     # rather than checkpoints_entity/. -maxdepth 2 reaches checkpoints_hc/<arm>/.
     entity=$(find $WATCH_DIRS -maxdepth 2 -name 'ck_*.pt' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
     # 10-slot cycle mirroring team_size_weights [0.5, 0.3, 0.2]:
-    # 1v1 on slots 0,2,4,6,8 | 2v2 on 1,5,7 | 3v3 on 3,9
-    case $((slot % 10)) in
-        1|5|7) mode="2v2" ;;
-        3|9)   mode="3v3" ;;
-        *)     mode="1v1" ;;
-    esac
+    # 1v1 on slots 0,2,4,6,8 | 2v2 on 1,5,7 | 3v3 on 3,9.
+    # CONSTRUCT_WATCH_MODE forces a single format -- the from-scratch/foreign-opponent
+    # runs are ALL 1v1 (foreign bots are 1v1-only), so set it to 1v1 there.
+    if [ -n "${CONSTRUCT_WATCH_MODE:-}" ]; then
+        mode="$CONSTRUCT_WATCH_MODE"
+    else
+        case $((slot % 10)) in
+            1|5|7) mode="2v2" ;;
+            3|9)   mode="3v3" ;;
+            *)     mode="1v1" ;;
+        esac
+    fi
     if [ -n "$entity" ]; then
         announce "LIVE $mode" "$entity"
         if [ -n "$WATCH_CURRICULUM" ]; then
