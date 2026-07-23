@@ -72,4 +72,9 @@ ema_alpha = 0.2            # ep_rew fallback only
 win_lo = 0.45              # target win-rate band (goal-based eval)
 win_hi = 0.55
 eval_arenas = 16           # separate goal-based eval engine for the win-rate signal
-eval_steps = 3000
+# The eval runs in MATCH_MODE (same regime as training + bench). A match only ends
+# at 300s (~4500 steps), so eval_steps must span several full matches or NO match
+# completes and the win-rate signal is None (silently falling back to the gameable
+# ep_rew EMA). 14000 -> ~3 matches/arena x 16 arenas ~= 48 matches. Fixed 2026-07-23
+# alongside the goal-terminated->match_mode eval fix in train.py.
+eval_steps = 14000
