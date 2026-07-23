@@ -221,9 +221,16 @@ class Trainer:
                 "net": KLPrior(cfg.kl_prior["ck"], device=str(self.device),
                                expect_net=cfg.net),
                 "lambda": float(cfg.kl_prior.get("lambda", 0.05)),
+                # anneal_iters > 0 -> lambda_p decays lambda -> lambda_floor over
+                # this many iters, then stays at the floor (stabilise early, free late)
+                "anneal_iters": int(cfg.kl_prior.get("anneal_iters", 0)),
+                "lambda_floor": float(cfg.kl_prior.get("lambda_floor", 0.0)),
             }
+            _an = self.kl_prior["anneal_iters"]
             print(f"kl_prior: anchored to {cfg.kl_prior['ck']} "
-                  f"lambda_p={self.kl_prior['lambda']}", flush=True)
+                  f"lambda_p={self.kl_prior['lambda']}"
+                  + (f" annealing -> {self.kl_prior['lambda_floor']} over {_an} iters"
+                     if _an > 0 else ""), flush=True)
 
         # Opponent-pool ("league") integration. Disabled by default (cfg.league == {}
         # or {"enabled": False}) -> self._assignment stays None -> engine.collect's
@@ -546,6 +553,16 @@ class Trainer:
             prior_logits, lambda_p = None, 0.0
             if self.kl_prior is not None:
                 lambda_p = self.kl_prior["lambda"]
+                # Optional anchor ANNEAL: keep the anchor strong early -- it holds
+                # the policy still while the value head recalibrates to a new reward
+                # (a cold regime change otherwise collapses: the stale critic feeds
+                # garbage advantages) -- then decay it to `lambda_floor` so the
+                # policy is free to move past the anchor, driven by the curriculum.
+                anneal = self.kl_prior.get("anneal_iters", 0)
+                if anneal > 0:
+                    floor = self.kl_prior.get("lambda_floor", 0.0)
+                    frac = max(0.0, 1.0 - it / anneal)
+                    lambda_p = floor + (self.kl_prior["lambda"] - floor) * frac
                 with torch.no_grad():
                     prior_logits = self.kl_prior["net"].logits(batch["obs"])
             extra_loss_fn = compose_extra_loss(

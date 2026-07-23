@@ -68,8 +68,19 @@ opponent_frac = 0.35
 
 [foreign.auto_curriculum]
 enabled = true
-band = 1.0                 # retune when ep_reward_mean leaves [-1, +1]
+band = 10.0                # ep_rew swings ~+/-30 (winning vs losing); adjust when clearly one-sided
 period_min = 1
 period_max = 12
 adjust_every = 10          # check/adjust every 10 iters
 ema_alpha = 0.3            # smoothing on the per-iter margin
+
+[kl_prior]
+# ANNEALED anchor: pure anchor-free collapses on this reward-regime change (the
+# champion's critic is stale -> garbage advantages -> the policy self-destructs in
+# ~5 iters). Hold the anchor strong early to survive critic recalibration, then
+# decay it to 0 so the policy is free to move past the champion, driven by the
+# auto-curriculum. This is the kickstart pattern applied to the prior.
+ck = "checkpoints_entity/ck_000320471040.pt"
+lambda = 0.6
+anneal_iters = 80          # lambda 0.6 -> 0 linearly over 80 iters, then stays 0
+lambda_floor = 0.0
