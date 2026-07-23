@@ -308,16 +308,40 @@ class Trainer:
             self._foreign_periods = [int(p) for p in periods]
             ac = fg.get("auto_curriculum", {})
             self._ac_on = bool(ac.get("enabled", False))
-            # widen/narrow the opponent when ep_reward_mean leaves [-band, +band]
-            self._ac_band = float(ac.get("band", 1.0))
             self._ac_period_min = int(ac.get("period_min", 1))
             self._ac_period_max = int(ac.get("period_max", 12))
             self._ac_every = max(1, int(ac.get("adjust_every", 20)))
+            # Target a GOAL-based win rate, measured on a separate eval engine, so
+            # the signal is clean regardless of the (possibly shaped, non-zero-sum)
+            # TRAINING reward. Winning > win_hi -> opponent harder; < win_lo ->
+            # easier. Falls back to the ep_reward_mean signal (band) only if the
+            # eval engine can't be built.
+            self._ac_win_hi = float(ac.get("win_hi", 0.55))
+            self._ac_win_lo = float(ac.get("win_lo", 0.45))
+            self._ac_band = float(ac.get("band", 5.0))     # ep_rew fallback only
             self._ac_ema = None
-            self._ac_alpha = float(ac.get("ema_alpha", 0.3))
+            self._ac_alpha = float(ac.get("ema_alpha", 0.2))
+            self._ac_eval = None
             if self._ac_on:
-                print(f"auto-curriculum ON: hold ep_rew in +/-{self._ac_band}, "
-                      f"period in [{self._ac_period_min},{self._ac_period_max}], "
+                try:
+                    # goal-terminated (curriculum_v1) + goal reward so match
+                    # outcomes are detectable; small + all-foreign for a fast,
+                    # clean win-rate vs the current opponent.
+                    ev = Engine(num_arenas=int(ac.get("eval_arenas", 16)),
+                                blue=1, orange=1, schema_path=self.cfg.schema_path,
+                                reward_config_path="configs/reward_v0.toml",
+                                seed=12345, num_threads=0, net_heads=int(self.cfg.net.get("heads", 4)))
+                    ev.set_foreign_opponents(sds, kinds, self._foreign_periods)
+                    self._ac_eval = {"eng": ev, "steps": int(ac.get("eval_steps", 3000)),
+                                     "arenas": int(ac.get("eval_arenas", 16))}
+                    print("auto-curriculum: goal-based eval engine built "
+                          f"({self._ac_eval['arenas']} arenas)", flush=True)
+                except Exception as e:
+                    print(f"auto-curriculum: eval engine failed ({e}); "
+                          "falling back to ep_rew signal", flush=True)
+                print(f"auto-curriculum ON: hold win rate in "
+                      f"[{self._ac_win_lo},{self._ac_win_hi}], period in "
+                      f"[{self._ac_period_min},{self._ac_period_max}], "
                       f"adjust every {self._ac_every} iters", flush=True)
 
         if _state:
@@ -326,19 +350,35 @@ class Trainer:
                 self.opt.load_state_dict(_state["optimizer"])
             self.total_steps = _state["total_steps"]
 
-    def _auto_curriculum_step(self, it: int, ep_reward_mean: float):
-        """Adjust the foreign opponent's decision_period to hold ep_reward_mean
-        near 0 (a ~50% win rate). Winning (ep_rew > +band) -> make the opponent
-        harder (lower period); losing (< -band) -> make it easier (higher period).
+    def _measure_foreign_winrate(self) -> float | None:
+        """Blue goal-share vs the foreign opponent at the current period, on the
+        goal-based eval engine (decoupled from the training reward). ~0.5 = even.
+        Returns None if no eval engine or no completed episodes."""
+        ev = self._ac_eval
+        if ev is None:
+            return None
+        import numpy as _np
+        from construct.league.matches import match_record, split_matches
+        sd = {k: v.detach().cpu().numpy().astype(_np.float32)
+              for k, v in self.net.state_dict().items()}
+        ev["eng"].set_weights(sd)
+        ev["eng"].set_foreign_opponents(
+            self._foreign_sds, self._foreign_kinds, self._foreign_periods)
+        out = ev["eng"].collect(ev["steps"], arena_opponents=[-2] * ev["arenas"])
+        rec = match_record(split_matches(out["rewards"], out["terminated"]))
+        n = rec["wins"] + rec["draws"] + rec["losses"]
+        if n == 0:
+            return None
+        return (rec["wins"] + 0.5 * rec["draws"]) / n
 
-        The reward is zero-sum, so self-play arenas cancel and ep_reward_mean is a
-        clean margin against the foreign opponent. An EMA smooths per-iter noise.
-        """
+    def _auto_curriculum_step(self, it: int, ep_reward_mean: float):
+        """Hold the foreign opponent near a ~50% win rate by tuning its
+        decision_period. Preferred signal is a GOAL-based win rate on a separate
+        eval engine (clean regardless of the training reward). Falls back to the
+        zero-sum ep_reward_mean margin if the eval engine is absent."""
         if not getattr(self, "_ac_on", False) or self._foreign_slots == 0:
             return
-        # Normalise by the foreign-arena count so the band is scale-independent
-        # (raw ep_reward_mean grows with arena count). With a pure-goal reward the
-        # signal is then ~10 * avg net goal margin per foreign arena per rollout.
+        # ep_rew fallback signal accumulates every iter (EMA)
         n_for = max(1, round(self._foreign_frac * self.num_arenas))
         signal = ep_reward_mean / n_for
         self._ac_ema = (signal if self._ac_ema is None
@@ -348,17 +388,26 @@ class Trainer:
             return
         cur = self._foreign_periods[0]
         new = cur
-        if self._ac_ema > self._ac_band:
-            new = max(self._ac_period_min, cur - 1)      # winning -> harder
-        elif self._ac_ema < -self._ac_band:
-            new = min(self._ac_period_max, cur + 1)       # losing -> easier
+        wr = self._measure_foreign_winrate()
+        if wr is not None:
+            if wr > self._ac_win_hi:
+                new = max(self._ac_period_min, cur - 1)   # winning -> harder
+            elif wr < self._ac_win_lo:
+                new = min(self._ac_period_max, cur + 1)    # losing -> easier
+            reason = f"winrate {wr:.3f}"
+        else:  # fallback: ep_rew margin
+            if self._ac_ema > self._ac_band:
+                new = max(self._ac_period_min, cur - 1)
+            elif self._ac_ema < -self._ac_band:
+                new = min(self._ac_period_max, cur + 1)
+            reason = f"ep_rew_ema {self._ac_ema:+.2f}"
         if new != cur:
             self._foreign_periods = [new] * len(self._foreign_kinds)
-            # rebuild the foreign opponents at the new period (cheap -- small nets)
             self.engine.set_foreign_opponents(
                 self._foreign_sds, self._foreign_kinds, self._foreign_periods)
-            print(f"auto-curriculum: ep_rew_ema {self._ac_ema:+.3f} -> "
-                  f"period {cur} -> {new}", flush=True)
+            print(f"auto-curriculum: {reason} -> period {cur} -> {new}", flush=True)
+        else:
+            print(f"auto-curriculum: {reason} -> hold period {cur}", flush=True)
 
     def _apply_foreign(self, a: list[int]) -> list[int]:
         """Stamp foreign-opponent arenas onto the FRONT of an assignment.

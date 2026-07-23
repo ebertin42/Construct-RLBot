@@ -1,0 +1,75 @@
+# FROM-SCRATCH auto-curriculum -- Option A (2026-07-23).
+#
+# Conclusion after days: fine-tuning the champion CANNOT improve it. It is a sharp
+# self-play local optimum; strong anchor keeps it capped, weak/no anchor degrades
+# it, win-prob shaping is gameable, goal reward still drifts down. A comparable-size
+# net (Element, 400k) beats us 96-0, so the ceiling is the RECIPE, not the model --
+# but that better recipe is not reachable from our champion.
+#
+# So: train a FRESH net from ZERO against a real graded opponent. No champion, no
+# anchor, no local-optimum baggage, and (unlike the champion) a real external
+# opponent from step 0 -- so it never enters the self-play collapse the champion
+# is trapped in. The auto-curriculum handles the cold-start: the opponent starts
+# nearly idle (period 12) so even a random net can score, and ratchets up as the
+# policy learns. 65% self-play gives dense practice alongside.
+#
+# Launch: `python -m construct.learn.train configs/train_v8_fromscratch.toml`
+# (fresh net, UNBOUNDED). This is a long run -- monitor bootstrap via the ladder.
+#
+# Reward: reward_v0 (goal + touch + vel_to_ball) -- a proven SHAPED reward that
+# bootstraps a random net. The auto-curriculum controller does NOT read this
+# reward (dense shaping isn't zero-sum); it measures a clean GOAL-based win rate on
+# a SEPARATE eval engine, so the training reward can be shaped while the curriculum
+# signal stays honest. This is the fix for the win-prob-gaming trap.
+schema_path = "schema/v1.toml"
+reward_config_path = "configs/reward_v0.toml"
+curriculum_config_path = "configs/curriculum_v3_match.toml"
+
+[env]
+num_arenas = 192
+blue = 1
+orange = 1
+seed = 0
+team_size_weights = [1.0, 0.0, 0.0]   # 1v1 (foreign opponents are 1v1-only)
+
+[net]
+d_model = 128
+layers = 2
+heads = 4
+ff = 512
+
+[ppo]
+rollout_steps = 256
+gamma = 0.9954
+lam = 0.95
+lr = 3e-4                # a touch higher than the fine-tune 2e-4: from scratch
+clip = 0.2
+entropy_coef = 0.01
+value_coef = 1.0
+epochs = 3
+minibatch_size = 8192
+
+[run]
+device = "cuda"
+checkpoint_dir = "checkpoints_scratch"
+save_every_iters = 20
+log_every_iters = 1
+
+[foreign]
+enabled = true
+kinds = ["element"]
+weights = ["~/.cache/construct/element_weights.npz"]
+decision_periods = [12]    # start nearly idle so a random net can score; ratchets up
+opponent_frac = 0.35
+
+[foreign.auto_curriculum]
+enabled = true
+band = 5.0                 # normalised ~= 10 * avg net goals/foreign-arena/rollout
+period_min = 1
+period_max = 12
+adjust_every = 20          # measure win rate + adjust every 20 iters
+ema_alpha = 0.2            # ep_rew fallback only
+win_lo = 0.45              # target win-rate band (goal-based eval)
+win_hi = 0.55
+eval_arenas = 16           # separate goal-based eval engine for the win-rate signal
+eval_steps = 3000
