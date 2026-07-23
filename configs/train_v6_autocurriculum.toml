@@ -22,7 +22,7 @@
 # Starts from the champion (our best policy; beats Element at period 8). ALL 1v1
 # (foreign opponents are 1v1-only). Requires element_weights.npz on the box.
 schema_path = "schema/v1.toml"
-reward_config_path = "configs/reward_v6_winprob_clean.toml"
+reward_config_path = "configs/reward_v7_goal_only.toml"
 curriculum_config_path = "configs/curriculum_v3_match.toml"
 
 [env]
@@ -62,13 +62,13 @@ steps = 500000000
 enabled = true
 kinds = ["element"]
 weights = ["~/.cache/construct/element_weights.npz"]
-decision_periods = [8]     # start easy (champion wins ~0.98 vs Element p8); the
+decision_periods = [4]      # start CONTESTED (champion ~0.375 vs Element p4): crushing an easy opponent + a stale critic = huge advantages = collapse
                            # controller lowers it as we improve
 opponent_frac = 0.35
 
 [foreign.auto_curriculum]
 enabled = true
-band = 10.0                # ep_rew swings ~+/-30 (winning vs losing); adjust when clearly one-sided
+band = 5.0                 # normalised signal ~= 10 * avg net goals/foreign-arena/rollout; adjust when clearly winning/losing
 period_min = 1
 period_max = 12
 adjust_every = 10          # check/adjust every 10 iters

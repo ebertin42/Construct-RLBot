@@ -1,0 +1,26 @@
+# Reward v7 -- PURE GOAL, nothing else. The honest objective.
+#
+# Win-prob shaping (reward_v5/v6) is GAMEABLE: measured 2026-07-23, a policy drove
+# the win-prob potential to ep_rew +510 while getting WORSE at real goals (0.133 vs
+# Element p4 where the champion is 0.375). Potential-based shaping preserves the
+# optimum only in theory; with finite optimisation it trapped the policy in a local
+# optimum that inflates PHI without winning. The champion (goal-based reward) beats
+# every win-prob arm -- the simple reward was right.
+#
+# In match_mode this maximises GOAL DIFFERENTIAL over the match = winning. It is
+# also EXACTLY zero-sum, so self-play cancels and ep_reward_mean is a clean, REAL
+# margin against the foreign opponent -- the honest signal the auto-curriculum
+# controller needs (win-prob ep_rew was decoupled from real winning).
+#
+# Sparser than shaped rewards, but the champion init already scores, and an honest
+# sparse signal beats a dense gameable one.
+goal = 10.0
+touch = 0.0
+vel_to_ball = 0.0
+aggression_bias = 0.0
+touch_accel = 0.0
+vel_ball_to_goal = 0.0
+offensive_potential = 0.0
+team_spirit = 0.0
+opp_spirit = 0.0
+win_prob_weight = 0.0

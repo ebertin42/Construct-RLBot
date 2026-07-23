@@ -336,9 +336,14 @@ class Trainer:
         """
         if not getattr(self, "_ac_on", False) or self._foreign_slots == 0:
             return
-        self._ac_ema = (ep_reward_mean if self._ac_ema is None
+        # Normalise by the foreign-arena count so the band is scale-independent
+        # (raw ep_reward_mean grows with arena count). With a pure-goal reward the
+        # signal is then ~10 * avg net goal margin per foreign arena per rollout.
+        n_for = max(1, round(self._foreign_frac * self.num_arenas))
+        signal = ep_reward_mean / n_for
+        self._ac_ema = (signal if self._ac_ema is None
                         else (1 - self._ac_alpha) * self._ac_ema
-                        + self._ac_alpha * ep_reward_mean)
+                        + self._ac_alpha * signal)
         if it % self._ac_every != 0:
             return
         cur = self._foreign_periods[0]
