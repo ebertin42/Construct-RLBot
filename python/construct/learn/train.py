@@ -324,18 +324,25 @@ class Trainer:
             self._ac_eval = None
             if self._ac_on:
                 try:
-                    # goal-terminated (curriculum_v1) + goal reward so match
-                    # outcomes are detectable; small + all-foreign for a fast,
-                    # clean win-rate vs the current opponent.
+                    # The eval MUST use the SAME regime as training (match_mode via
+                    # the training curriculum) + goal reward so match outcomes are
+                    # detectable. A goal-TERMINATED eval overestimates match skill --
+                    # favorable random-state starts hand out easy goals -- so the
+                    # curriculum ratchets the opponent too hard (measured 2026-07-23:
+                    # goal-eval said 50% at p6 while real match_mode was ~12%).
+                    # match_mode episodes only end at 300s (~4500 steps), so eval_steps
+                    # must span a few matches.
                     ev = Engine(num_arenas=int(ac.get("eval_arenas", 16)),
                                 blue=1, orange=1, schema_path=self.cfg.schema_path,
                                 reward_config_path="configs/reward_v0.toml",
+                                curriculum_config_path=(self.cfg.curriculum_config_path or None),
                                 seed=12345, num_threads=0, net_heads=int(self.cfg.net.get("heads", 4)))
                     ev.set_foreign_opponents(sds, kinds, self._foreign_periods)
-                    self._ac_eval = {"eng": ev, "steps": int(ac.get("eval_steps", 3000)),
+                    self._ac_eval = {"eng": ev, "steps": int(ac.get("eval_steps", 14000)),
                                      "arenas": int(ac.get("eval_arenas", 16))}
-                    print("auto-curriculum: goal-based eval engine built "
-                          f"({self._ac_eval['arenas']} arenas)", flush=True)
+                    print("auto-curriculum: match-mode eval engine built "
+                          f"({self._ac_eval['arenas']} arenas, {self._ac_eval['steps']} steps)",
+                          flush=True)
                 except Exception as e:
                     print(f"auto-curriculum: eval engine failed ({e}); "
                           "falling back to ep_rew signal", flush=True)
