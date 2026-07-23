@@ -694,6 +694,112 @@ impl RenderSession {
     }
 }
 
+/// Bot-vs-bot evaluation: BOTH cars driven by ported foreign bots (no learner),
+/// so we can rank the community bots against EACH OTHER for the difficulty ladder
+/// -- the champion saturates (loses 0.0 to every full bot) and can't discriminate
+/// them. Blue = bot A, orange = bot B; `run` returns blue's per-step reward +
+/// terminated so Python can split into matches (reward_v0 goal spikes) and score
+/// A vs B. Single-threaded (a handful of arenas is plenty for a win-rate).
+#[pyclass(unsendable)]
+struct BotMatch {
+    arenas: Vec<episode::EpisodeArena>,
+    bot_a: foreign::ForeignPolicy,
+    bot_b: foreign::ForeignPolicy,
+}
+
+fn parse_foreign_dict(w: HashMap<String, PyReadonlyArrayDyn<'_, f32>>) -> engine::RawStateDict {
+    w.into_iter()
+        .map(|(k, a)| (k, (a.as_slice().unwrap().to_vec(), a.shape().to_vec())))
+        .collect()
+}
+
+#[pymethods]
+impl BotMatch {
+    #[new]
+    #[pyo3(signature = (kind_a, weights_a, period_a, kind_b, weights_b, period_b,
+                        arenas=16, schema_path="schema/v1.toml",
+                        reward_config_path="configs/reward_v0.toml",
+                        curriculum_config_path="configs/curriculum_v3_match.toml", seed=11))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        kind_a: &str, weights_a: HashMap<String, PyReadonlyArrayDyn<'_, f32>>, period_a: u32,
+        kind_b: &str, weights_b: HashMap<String, PyReadonlyArrayDyn<'_, f32>>, period_b: u32,
+        arenas: usize, schema_path: &str, reward_config_path: &str,
+        curriculum_config_path: Option<&str>, seed: u32,
+    ) -> PyResult<Self> {
+        sim_init::ensure_init(None);
+        let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
+        let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
+        let curriculum = match curriculum_config_path {
+            Some(p) => Some(crate::curriculum::CurriculumConfig::load(p).map_err(PyValueError::new_err)?),
+            None => None,
+        };
+        let mk = |k: &str, w, p: u32| -> PyResult<foreign::ForeignPolicy> {
+            let fk = foreign::ForeignKind::parse(k)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown foreign kind {k:?}")))?;
+            let mut fp = foreign::ForeignPolicy::new(&parse_foreign_dict(w), fk)
+                .map_err(PyValueError::new_err)?;
+            fp.set_decision_period(p);
+            Ok(fp)
+        };
+        let bot_a = mk(kind_a, weights_a, period_a)?;
+        let bot_b = mk(kind_b, weights_b, period_b)?;
+        let arenas_vec = (0..arenas)
+            .map(|i| {
+                episode::EpisodeArena::new_full(
+                    1, 1, sch.tick_skip, cfg.clone(), sch.normalization.clone(),
+                    seed.wrapping_add(i as u32), curriculum.clone(), episode::ObsMode::V1,
+                )
+            })
+            .collect();
+        Ok(BotMatch { arenas: arenas_vec, bot_a, bot_b })
+    }
+
+    /// Run `steps` steps. Returns (rewards, terminated), each shape
+    /// `(steps, arenas)`, from BLUE's (bot A's) perspective.
+    fn run<'py>(
+        &mut self, py: Python<'py>, steps: usize,
+    ) -> (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<bool>>) {
+        use crate::obs_v1::{ENT_FEAT, MAX_ENT, PREV_ACTIONS, Q_FEAT};
+        let n_arenas = self.arenas.len();
+        let mut rewards = vec![0f32; steps * n_arenas];
+        let mut terminated = vec![false; steps * n_arenas];
+        let (ek, mk, qk, pk) = (MAX_ENT * ENT_FEAT, MAX_ENT, Q_FEAT, PREV_ACTIONS);
+        for (ai, ar) in self.arenas.iter_mut().enumerate() {
+            let n = ar.num_agents();
+            let bc = ar.blue_count();
+            let mut rew = vec![0f32; n];
+            let mut flags = vec![episode::StepFlags::default(); n];
+            let mut fe = vec![0f32; n * ek];
+            let mut fm = vec![false; n * mk];
+            let mut fq = vec![0f32; n * qk];
+            let mut fp = vec![0i64; n * pk];
+            let acts = vec![0i64; n]; // ignored: every car is overridden
+            for t in 0..steps {
+                let mut ov = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (cid, _key, ctrl) = if i < bc {
+                        ar.foreign_controls(i, &mut self.bot_a, ai)
+                    } else {
+                        ar.foreign_controls(i, &mut self.bot_b, ai)
+                    };
+                    ov.push((cid, ctrl));
+                }
+                ar.set_foreign_overrides(ov);
+                ar.step_v1(&acts, &mut rew, &mut flags, &mut fe, &mut fm, &mut fq, &mut fp);
+                rewards[t * n_arenas + ai] = rew[0]; // blue = agent 0 = bot A
+                terminated[t * n_arenas + ai] = flags[0].terminated;
+            }
+        }
+        (
+            numpy::ndarray::Array2::from_shape_vec((steps, n_arenas), rewards)
+                .unwrap().into_pyarray(py),
+            numpy::ndarray::Array2::from_shape_vec((steps, n_arenas), terminated)
+                .unwrap().into_pyarray(py),
+        )
+    }
+}
+
 #[pymodule]
 fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(version, m)?)?;
@@ -702,5 +808,6 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(action_table_v1, m)?)?;
     m.add_class::<Engine>()?;
     m.add_class::<RenderSession>()?;
+    m.add_class::<BotMatch>()?;
     Ok(())
 }
