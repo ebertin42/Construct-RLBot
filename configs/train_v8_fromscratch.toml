@@ -55,12 +55,26 @@ checkpoint_dir = "checkpoints_scratch"
 save_every_iters = 20
 log_every_iters = 1
 
+# 2026-07-24: ALL FOUR ported bots in the loop (was Element-only). The engine
+# round-robins foreign arenas across these slots (`-(i % slots) - 2`), so each bot
+# gets ~1/4 of the foreign arenas. Roster + ordering come from the earlier
+# bot-vs-bot / difficulty benchmarks (logs/version_ladder.tsv, opponent_ladder.tsv):
+# period dominates difficulty, so the auto-curriculum keeps ONE shared period knob
+# across all four bots and holds ~50% win-rate vs the MIX. Diversity (Element MLP +
+# Immortal + Necto + Nexto EARL) hardens the net against a single opponent's quirks.
+# decision_periods start at 6 (not the Element-only p3-4 equilibrium): the 4-bot mix
+# is harder on average, so start winnable and let the curriculum tighten.
 [foreign]
 enabled = true
-kinds = ["element"]
-weights = ["~/.cache/construct/element_weights.npz"]
-decision_periods = [12]    # start nearly idle so a random net can score; ratchets up
-opponent_frac = 0.35
+kinds = ["element", "immortal", "necto", "nexto"]
+weights = [
+    "~/.cache/construct/element_weights.npz",
+    "~/.cache/construct/immortal_weights.npz",
+    "~/.cache/construct/necto_weights.npz",
+    "~/.cache/construct/nexto_weights.npz",
+]
+decision_periods = [6, 6, 6, 6]   # shared knob; auto-curriculum tunes all four together
+opponent_frac = 0.40              # ~10% of arenas per bot; self-play stays ~60%
 
 [foreign.auto_curriculum]
 enabled = true
