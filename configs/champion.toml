@@ -29,12 +29,31 @@
 schema_version = 1
 
 # --- the champion -----------------------------------------------------------
-# Seeded with ck_000320471040: the MEASURED strongest checkpoint in the project.
-# The kickstart-era family (100M/200M/320M/440M) is flat within 43-54% of each
-# other and beats everything post-500M by 80-90% (journal ~17:40 tournament);
-# 320M is the one every controlled arm was launched from and measured against,
-# so it is the reference with the most evidence attached to it.
-champion_ck = "checkpoints_entity/ck_000320471040.pt"
+# LINEAGE (newest last). A checkpoint becomes the champion only by BEATING the
+# incumbent in a measured match, never by being newer or having a better ep_rew.
+#
+#  1. ck_000320471040 (seed, 2026-07-19). The measured strongest of the
+#     kickstart-era family (100M/200M/320M/440M, flat within 43-54% of each
+#     other, beating everything post-500M by 80-90% in the ~17:40 tournament).
+#     Every controlled arm was launched from and measured against it. It held
+#     for six days: 22 internal arms all failed to beat it, which is why it was
+#     described as a trapped local optimum -- unbeatable BY FINE-TUNING FROM
+#     ITSELF. It also lost 96-0 to every ported community bot.
+#
+#  2. ck_001171502080 (promoted 2026-07-25) -- CURRENT. From the from-scratch
+#     run (fresh net, per-bot auto-curriculum against Element/Immortal/Necto/
+#     Nexto). matchwin_gate.py: 510W/51D/79L over 640 full 300s matches,
+#     win_share 0.8367 +/- 0.0198 vs threshold 0.55 (null 0.502 sd 0.024) --
+#     PASS by ~14 sd. It also beats ck_000320471040 against every external bot
+#     at a shared p4: element 0.677 vs 0.271, immortal 0.896 vs 0.854, necto
+#     0.615 vs 0.427, nexto 0.146 vs 0.073. So the ceiling was the RECIPE, not
+#     the model: what fine-tuning could not do, training from zero against real
+#     graded opponents did.
+#
+# Kept in checkpoints_champions/ on purpose: the pointer must never reference a
+# live rotating run directory (checkpoints_scratch/ is synced and reshuffled).
+# Verified to load before promotion (total_steps 1171502080, schema_version 1).
+champion_ck = "checkpoints_champions/ck_001171502080.pt"
 
 # --- the bar ----------------------------------------------------------------
 # 0.52 = candidate must take >= 52% of combined goals across BOTH side orders.

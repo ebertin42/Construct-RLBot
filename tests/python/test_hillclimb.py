@@ -27,7 +27,19 @@ import hillclimb  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
-CHAMPION = "checkpoints_entity/ck_000320471040.pt"
+def _committed_champion():
+    """The champion pointer as committed RIGHT NOW -- read, never hardcoded.
+
+    The champion MOVES (promoted ck_000320471040 -> ck_001171502080 on
+    2026-07-25). These tests copy the real configs/champion.toml into a tmp dir,
+    so a literal here turns every legitimate promotion into a test failure.
+    """
+    import tomllib
+    with (REPO / "configs" / "champion.toml").open("rb") as f:
+        return tomllib.load(f)["champion_ck"]
+
+
+CHAMPION = _committed_champion()
 PROMOTED_CK = "checkpoints_hillclimb/hc_a0002_s20260722_ck_000343000000.pt"
 
 

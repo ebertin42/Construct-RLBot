@@ -23,7 +23,21 @@ import h2h_eval  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
-CHAMPION = "checkpoints_entity/ck_000320471040.pt"
+def _committed_champion():
+    """The champion pointer as committed RIGHT NOW.
+
+    Read, never hardcoded: the champion MOVES (a candidate that beats the
+    incumbent gets promoted -- ck_000320471040 -> ck_001171502080 on 2026-07-25).
+    Pinning the literal path made every legitimate promotion fail eight tests
+    here that only ever meant "this pointer did not move", since the fixtures
+    copy the real config.
+    """
+    import tomllib
+    with (REPO / "configs" / "champion.toml").open("rb") as f:
+        return tomllib.load(f)["champion_ck"]
+
+
+CHAMPION = _committed_champion()
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +83,13 @@ def _mock_match(monkeypatch, side1, side2, record=None):
 
 def test_load_config_reads_real_committed_config():
     c = champion_gate.load_config(REPO / "configs" / "champion.toml")
-    assert c["champion_ck"] == CHAMPION          # the measured strongest ck
+    # NOT pinned to a literal path -- the champion moves. What must hold is that
+    # the pointer is a real, loadable checkpoint: a champion_ck naming a file
+    # that does not exist breaks the gate, the KL anchor and the deploy candidate
+    # all at once, and a promotion is exactly when that could regress.
+    ck = c["champion_ck"]
+    assert ck.endswith(".pt"), ck
+    assert (REPO / ck).is_file(), f"champion_ck points at a missing file: {ck}"
     assert c["promote_threshold"] == 0.52
     assert c["steps"] == 5400 and c["arenas"] == 8   # matches the h2h harness
     assert c["registry"].endswith("registry_armc.jsonl")
@@ -403,7 +423,7 @@ def test_history_row_carries_the_h2h_schema_view(tmp_path):
     row = json.loads(lines[0])
     assert row["ts"] == 1784200000
     assert row["ck"] == "ck_999.pt"
-    assert row["ref"] == "ck_000320471040.pt"
+    assert row["ref"] == Path(CHAMPION).name       # follows the moving champion
     assert row["ref_label"] == "champion"
     assert row["goals_ck"] == 93 and row["goals_ref"] == 96
     assert row["share"] == pytest.approx(93 / 189)
@@ -541,7 +561,7 @@ def test_status_runs_and_shows_champion_and_threshold(monkeypatch, cfg, capsys):
     capsys.readouterr()
     assert champion_gate.cmd_status(cfg) == 0
     out = capsys.readouterr().out
-    assert "ck_000320471040.pt" in out
+    assert Path(CHAMPION).name in out               # follows the moving champion
     assert "52.0%" in out
     assert "armA.pt" in out
     assert "FAIL" in out

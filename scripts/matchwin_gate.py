@@ -15,14 +15,73 @@ Promotion threshold comes from the measured null (champion self-play): mean
 0.5023, sd 0.0242 across 20 seeds x ~320 matches (journal 2026-07-21), so 0.55
 sits ~2 sd above chance. A near-miss calls for more matches, never a lower bar.
 
+THE CHAMPION MOVES. `--champion` defaults to `champion_ck` in
+configs/champion.toml -- the project's single champion pointer -- not to a
+hardcoded path, because a gate against a net we already beat 0.837 always passes
+and measures nothing. `--promote-if-pass` moves that pointer on a PASS, through
+champion_gate's atomic staged rewrite, and records `promoted` in the history row.
+Promotion stays OPT-IN (see configs/champion.toml): a human sees every PASS
+before the reference moves.
+
+Deliberately NOT repointed at the moving champion: scripts/instrument_fingerprint.py
+(proves engine bit-identity with a FIXED policy), scripts/match_gate_null.py and
+perturb_null.py (null controls measured with that exact net), scripts/bench_ladder.py
+(logs/opponent_ladder.tsv is champion-referenced). Those are pinned instruments;
+repointing them would silently invalidate published numbers.
+
     matchwin_gate.py <candidate.pt> [--champion <ck>] [--arenas 32]
-        [--steps 45000] [--seed 11] [--threshold 0.55]
+        [--steps 45000] [--seed 11] [--threshold 0.55] [--promote-if-pass]
 """
 from __future__ import annotations
 
 import argparse
 import math
 import sys
+from pathlib import Path
+
+# Seeded champion, used only if configs/champion.toml is unreadable.
+FALLBACK_CHAMPION = "checkpoints_entity/ck_000320471040.pt"
+CHAMPION_CONFIG = "configs/champion.toml"
+
+
+def _repo_root():
+    return Path(__file__).resolve().parent.parent
+
+
+def resolve_champion(config_path=None):
+    """The current champion path from configs/champion.toml.
+
+    Falls back to FALLBACK_CHAMPION (with a warning) rather than refusing to
+    gate: a gate is a measurement, and losing the ability to measure because a
+    pointer file moved is worse than measuring against the seeded reference.
+    champion_gate.py keeps its own strict load_config -- it MUTATES the pointer,
+    so guessing there would be wrong.
+    """
+    cfg = Path(config_path) if config_path else _repo_root() / CHAMPION_CONFIG
+    try:
+        import tomllib
+        with cfg.open("rb") as f:
+            ck = tomllib.load(f)["champion_ck"]
+        return str(ck)
+    except Exception as e:                                  # noqa: BLE001
+        print(f"  (champion pointer unreadable [{cfg}]: {e}; "
+              f"falling back to {FALLBACK_CHAMPION})")
+        return FALLBACK_CHAMPION
+
+
+def promote(candidate, config_path=None):
+    """Move the champion pointer to `candidate` atomically.
+
+    Reuses champion_gate's staged write (temp file + os.replace) so a crash
+    mid-promotion cannot leave a half-written pointer. Returns the previous
+    champion, or raises.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import champion_gate                                    # noqa: PLC0415
+    cfg = Path(config_path) if config_path else _repo_root() / CHAMPION_CONFIG
+    previous = resolve_champion(cfg)
+    champion_gate.write_champion_ck(cfg, str(candidate))
+    return previous
 
 
 def flip_to_candidate(matches):
@@ -92,12 +151,20 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("candidate")
-    ap.add_argument("--champion", default="checkpoints_entity/ck_000320471040.pt")
+    ap.add_argument("--champion", default=None,
+                    help="default: champion_ck from configs/champion.toml")
     ap.add_argument("--arenas", type=int, default=32)
     ap.add_argument("--steps", type=int, default=45000)
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--threshold", type=float, default=0.55)
+    ap.add_argument("--promote-if-pass", action="store_true",
+                    help="on PASS, move configs/champion.toml's champion_ck to the "
+                         "candidate (atomic). Opt-in on purpose.")
+    ap.add_argument("--champion-config", default=None,
+                    help="override configs/champion.toml (tests)")
     args = ap.parse_args(argv)
+    if args.champion is None:
+        args.champion = resolve_champion(args.champion_config)
 
     r = gate(args.candidate, args.champion, args.arenas, args.steps, args.seed,
              args.threshold)
@@ -111,6 +178,16 @@ def main(argv=None):
           f"win_share={r['share']:.4f} +/- {r['se']:.4f}")
     print(f"  verdict: {r['verdict']}  (threshold {r['threshold']:.3f}; "
           f"null mean 0.502 sd 0.024)")
+    r["promoted"] = False
+    if args.promote_if_pass and r["verdict"] == "PASS":
+        try:
+            was = promote(args.candidate, args.champion_config)
+            r["promoted"] = True
+            print(f"  PROMOTED: champion_ck {was} -> {args.candidate}")
+        except Exception as e:                              # noqa: BLE001
+            print(f"  promotion FAILED ({e}); champion pointer unchanged")
+    elif args.promote_if_pass:
+        print("  not promoted (verdict is not PASS)")
     _append_history(args, r)
     return 0
 
@@ -128,6 +205,7 @@ def _append_history(args, r):
         "wins": r["wins"], "draws": r["draws"], "losses": r["losses"], "n": r["n"],
         "win_share": r["share"], "se": r["se"], "threshold": r["threshold"],
         "passed": r["verdict"] == "PASS",
+        "promoted": bool(r.get("promoted")),
         "arenas": args.arenas, "steps": args.steps, "seed": args.seed,
     }
     try:

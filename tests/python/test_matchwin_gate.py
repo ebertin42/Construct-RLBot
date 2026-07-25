@@ -97,3 +97,68 @@ def test_draws_do_not_move_share_off_parity():
     expected = (100 + 0.5 * 199) / 658
     assert r["share"] == pytest.approx(expected)
     assert r["verdict"] == "FAIL"
+
+
+# --- the champion pointer (it MOVES) ----------------------------------------
+#
+# Gating against a net we already beat 0.837 always passes and measures nothing,
+# so the champion has to follow configs/champion.toml rather than a hardcoded
+# path. These pin the resolve/promote pair, because a bug here either measures
+# against the wrong reference or corrupts the project's single champion pointer.
+
+def _cfg(tmp_path, ck):
+    p = tmp_path / "champion.toml"
+    p.write_text(
+        'schema_version = 1\n'
+        f'champion_ck = "{ck}"\n'
+        'promote_threshold = 0.52\n'
+        '[min_games]\nsteps = 5400\narenas = 8\nseed = 11\nmin_total_goals = 20\n'
+        '[watch]\ncandidate_dir = "checkpoints_entity"\npoll_seconds = 300\n'
+        'consecutive_rejects_before_alert = 3\n'
+        '[league]\nregistry = "league/r.jsonl"\nrun = "champion"\n'
+        'reward_config = "configs/reward_v3.toml"\n'
+        '[history]\npath = "logs/champion_history.jsonl"\n'
+    )
+    return p
+
+
+def test_resolve_champion_reads_the_pointer(tmp_path):
+    cfg = _cfg(tmp_path, "checkpoints_scratch/ck_001171502080.pt")
+    assert mg.resolve_champion(cfg) == "checkpoints_scratch/ck_001171502080.pt"
+
+
+def test_resolve_champion_falls_back_when_pointer_unreadable(tmp_path, capsys):
+    """A gate is a MEASUREMENT: losing the ability to measure because a pointer
+    file moved is worse than measuring against the seeded reference. (The
+    mutating path, champion_gate.load_config, is strict instead -- see there.)"""
+    got = mg.resolve_champion(tmp_path / "does_not_exist.toml")
+    assert got == mg.FALLBACK_CHAMPION
+    assert "falling back" in capsys.readouterr().out
+
+
+def test_promote_moves_the_pointer_and_returns_the_previous(tmp_path):
+    cfg = _cfg(tmp_path, "old/champ.pt")
+    previous = mg.promote("new/better.pt", cfg)
+    assert previous == "old/champ.pt"
+    assert mg.resolve_champion(cfg) == "new/better.pt"
+
+
+def test_promote_preserves_every_other_key(tmp_path):
+    """The pointer rewrite must be surgical -- thresholds, min_games and the
+    file's long rationale comments have to survive a promotion."""
+    cfg = _cfg(tmp_path, "old/champ.pt")
+    before = cfg.read_text()
+    mg.promote("new/better.pt", cfg)
+    after = cfg.read_text()
+    assert after.count("\n") == before.count("\n"), "no lines added or dropped"
+    for keep in ("promote_threshold = 0.52", "min_total_goals = 20",
+                 "consecutive_rejects_before_alert = 3", "schema_version = 1"):
+        assert keep in after, f"promotion clobbered {keep!r}"
+    assert "old/champ.pt" not in after
+
+
+def test_promote_is_idempotent(tmp_path):
+    cfg = _cfg(tmp_path, "a.pt")
+    mg.promote("b.pt", cfg)
+    assert mg.promote("b.pt", cfg) == "b.pt"
+    assert mg.resolve_champion(cfg) == "b.pt"
