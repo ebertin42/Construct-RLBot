@@ -44,7 +44,19 @@ seed = 0
 # and Element's obs width is fixed to 1v1. Nexto's and Necto's obs builders ARE
 # team-size generic, so relaxing that guard per-kind is the route to real 2v2/3v3
 # opponents (and a 2v2 gate) later.
-team_size_weights = [0.7, 0.2, 0.1]
+# 2026-07-25 (second sizing): [0.7,0.2,0.1] -> [0.85,0.1,0.05] after a MEASURED
+# 1v1 collapse. At 56% of experience, team play held the gradient majority; once
+# entropy_coef dropped to 0.003 the policy stopped hedging and committed to that
+# majority, specialising away from 1v1. Measured on element p4: 0.469 (coef .01)
+# -> 0.417 -> 0.03-0.11 over the following 52M steps, with 1v1 entropy falling
+# 3.06 -> 2.27 and p(chosen action) rising 0.095 -> 0.197. Immortal p3 was
+# unaffected (0.31), so this was not a general collapse -- element p4 sat at the
+# margin and the specialisation pushed it off.
+#
+# The high entropy at coef 0.01 had been ACCIDENTALLY protecting 1v1 by keeping
+# the policy general. Rather than give that back (which re-breaks team play, see
+# entropy_coef), give 1v1 the gradient majority outright: 73% 1v1 / 27% team.
+team_size_weights = [0.85, 0.1, 0.05]
 
 [net]
 d_model = 128
