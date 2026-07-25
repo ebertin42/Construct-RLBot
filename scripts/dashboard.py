@@ -1,23 +1,31 @@
-"""Multi-run training dashboard. One dark page, a panel per workstream:
+"""Training dashboard for the live from-scratch run. One dark page, a panel per
+workstream:
 
-  main    remote KL-PPO entity run   checkpoints_entity/train_remote.log (synced)
-  h2h     head-to-head skill eval    logs/h2h_history.jsonl (appended by scripts/h2h_eval.py) --
-          the REAL skill ruler (frozen references, side-order-summed); visually primary --
-          self-play goals/min below (relabeled "evals") is behavioral, NOT skill (journal 2026-07-19 ~14:50)
-  bc      local BC pre-training      logs/bc_train.log (multiple runs, banner-split)
-  league  ladder registries          league/registry.jsonl + league/registry_remote.jsonl
-  ssl     SSL replay pull            logs/ssl_pull.log + data/replays/ssl/**/*.replay
-  evals   self-play BEHAVIOR         logs/eval_history.jsonl (+ legacy checkpoints/eval_history.jsonl) --
-          touches/dist/goals-in-mirror-match; NOT a skill ranking, see h2h above
-  system  CPU / RAM / GPU samplers   + Windows-host C: free (powershell, cached)
+  main        the live run             checkpoints_scratch/train_remote.log (synced)
+  curriculum  per-bot difficulty       the same log's auto-curriculum lines --
+              each external opponent's rung + its measured win rate against the
+              target band. THIS is the live skill signal: the bots are fixed
+              external references, so beating a harder rung is real progress.
+  gate        vs the frozen champion   logs/matchwin_history.jsonl (appended by
+              scripts/matchwin_gate.py) -- the absolute ruler, run on demand
+  ssl         SSL replay pull          logs/ssl_pull.log + data/replays/ssl/**/*.replay
+  system      CPU / RAM / GPU samplers + Windows-host C: free (powershell, cached)
+
+Removed 2026-07-25 (dead weight, see the git history for the panels): BC
+pre-training (a human-replay BC net loses 639-0 to the champion, so BC-as-init is
+abandoned), the v0 league ladder (the from-scratch run does not use it), and the
+self-play behaviour panel plus its EvalRunner thread -- self-play goals/min is
+NOT a skill metric, it once hid an 800M-step regression, and the thread was
+burning laptop CPU every 30 min to keep computing it. The old h2h panel went too:
+its references are from the retired lineage; the curriculum + gate panels are the
+current rulers.
 
 Parsing lives in pure functions at the top of this file, tested in
 tests/python/test_dashboard_parsers.py. Slow host queries (powershell C: free,
 the replay walk) run in background sampler threads and are cached — the request
 path never blocks on them. Log parses are cached on (mtime, size).
 
-Usage: python scripts/dashboard.py [port] [--eval-every MINUTES]
-       (default port 8420, eval every 30 min; --no-eval disables)
+Usage: python scripts/dashboard.py [port]     (default 8420)
 From Windows: http://localhost:<port> (WSL2 forwards localhost TCP).
 Stdlib only; the page works offline (no CDN, hand-rolled SVG charts).
 """
@@ -35,21 +43,17 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 # Env-overridable so the dashboard can follow whichever run is live without an
-# edit. Defaults keep the legacy entity run; the from-scratch auto-curriculum run
-# sets CONSTRUCT_DASH_MAIN_LOG / CONSTRUCT_DASH_CKPT_DIR to checkpoints_scratch.
+# edit. Defaults now point at the live from-scratch run, so no env vars are needed
+# for the common case; set CONSTRUCT_DASH_MAIN_LOG / CONSTRUCT_DASH_CKPT_DIR to
+# follow a different lineage.
 import os as _os
 MAIN_LOG = Path(_os.environ.get(
-    "CONSTRUCT_DASH_MAIN_LOG", REPO / "checkpoints_entity" / "train_remote.log"))
+    "CONSTRUCT_DASH_MAIN_LOG", REPO / "checkpoints_scratch" / "train_remote.log"))
 CKPT_DIR = Path(_os.environ.get(
-    "CONSTRUCT_DASH_CKPT_DIR", REPO / "checkpoints_entity"))
-BC_LOG = REPO / "logs" / "bc_train.log"
-LEAGUE_LOCAL = REPO / "league" / "registry.jsonl"
-LEAGUE_REMOTE = REPO / "league" / "registry_remote.jsonl"     # synced by sync_remote.sh
+    "CONSTRUCT_DASH_CKPT_DIR", REPO / "checkpoints_scratch"))
 SSL_LOG = REPO / "logs" / "ssl_pull.log"
 SSL_DIR = REPO / "data" / "replays" / "ssl"
-EVAL_HISTORY = REPO / "logs" / "eval_history.jsonl"           # appended by eval_metrics.py
-EVAL_HISTORY_LEGACY = REPO / "checkpoints" / "eval_history.jsonl"
-H2H_HISTORY = REPO / "logs" / "h2h_history.jsonl"              # appended by h2h_eval.py
+GATE_HISTORY = REPO / "logs" / "matchwin_history.jsonl"        # appended by matchwin_gate.py
 MAX_POINTS = 500
 
 # ---------------------------------------------------------------------------
@@ -67,12 +71,18 @@ ITER_LINE = re.compile(
 RESUME = re.compile(r"resumed at ([\d,]+) steps")
 CONTAINMENT = "physics blowup contained"
 
-BC_BANNER = re.compile(r"bc: (\d+) train / (\d+) val shards, (\d+) batches/epoch x (\d+) epochs")
-BC_BATCH = re.compile(r"bc epoch (\d+) batch (\d+)/(\d+) loss (\S+) lr (\S+) (\d+) samples/s")
-BC_DONE = re.compile(
-    r"bc epoch (\d+) done: train_loss (\S+) val_loss (\S+) top1 (\S+) top3 (\S+) "
-    r"recall_jump (\S+) recall_stall (\S+)"
-)
+# --- per-bot auto-curriculum (the live difficulty ladder) ------------------
+# Banner:   auto-curriculum ON: hold win rate in [0.35,0.65], period in [1,12], ...
+# Roster:   foreign: ['element', 'immortal'] periods=[4, 3] on 77/192 arenas (frac=0.4)
+# Decision: auto-curriculum: element wr0.69/ema0.69 p4->3 | immortal ... p3->2
+#           a slot inside its post-change dwell reads "... p3 dwell1/2" instead.
+AC_BANNER = re.compile(
+    r"auto-curriculum ON: hold win rate in \[([\d.]+),([\d.]+)\], "
+    r"period in \[(\d+),(\d+)\]")
+AC_ROSTER = re.compile(r"foreign: \[([^\]]*)\] periods=\[([^\]]*)\] on (\d+)/(\d+) arenas")
+AC_DECISION = re.compile(r"auto-curriculum: (\w+ wr[\d.]+.*)")
+AC_SEG = re.compile(
+    r"(\w+) wr([\d.]+)/ema([\d.]+) p(\d+)(?:->(\d+))?(?: dwell(\d+)/(\d+))?")
 
 SSL_TS = r"(\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
 SSL_START = re.compile(SSL_TS + r" start: (\d+) replay\(s\) on disk, filling (\S+) \((\d+)/(\d+)\)")
@@ -152,69 +162,71 @@ def downsample(rows, n, tail=0):
     return [rows[int(i * stride)] for i in range(n - 1)] + [rows[-1]]
 
 
-def parse_bc_log(text):
-    """BC log -> list of runs (split on banner lines; anything before the first
-    banner is ignored). Each run: banner fields + batch lines + epoch-done rows.
-    'bc: class-count cache … stale' lines are not banners."""
-    runs = []
-    cur = None
-    for line in text.splitlines():
-        m = BC_BANNER.search(line)
-        if m:
-            cur = {
-                "train_shards": int(m.group(1)), "val_shards": int(m.group(2)),
-                "batches_per_epoch": int(m.group(3)), "epochs": int(m.group(4)),
-                "batches": [], "epochs_done": [],
-            }
-            runs.append(cur)
-            continue
-        if cur is None:
-            continue
-        m = BC_BATCH.search(line)
-        if m:
-            cur["batches"].append({
-                "epoch": int(m.group(1)), "batch": int(m.group(2)), "total": int(m.group(3)),
-                "loss": _f(m.group(4)), "lr": _f(m.group(5)), "samples_s": int(m.group(6)),
-            })
-            continue
-        m = BC_DONE.search(line)
-        if m:
-            cur["epochs_done"].append({
-                "epoch": int(m.group(1)), "train_loss": _f(m.group(2)), "val_loss": _f(m.group(3)),
-                "top1": _f(m.group(4)), "top3": _f(m.group(5)),
-                "recall_jump": _f(m.group(6)), "recall_stall": _f(m.group(7)),
-            })
-    return runs
+def parse_curriculum(text):
+    """Train log -> the live per-bot difficulty ladder.
 
+    Only the CURRENT run is reported: everything before the last
+    'auto-curriculum ON:' banner belongs to an earlier process (the log is
+    appended across restarts) and mixing eras would draw phantom period jumps.
 
-def bc_summary(runs, max_points=300, anchor_ts=None):
-    """Shape parse_bc_log() output for the page: current-run progress + loss
-    series, and epoch-done history across all runs labeled by banner index.
-    With anchor_ts (the log's mtime) each series point gets an estimated wall
-    time (see estimate_bc_times) for the chart tooltips."""
-    history = [{"run": i + 1, **d} for i, run in enumerate(runs) for d in run["epochs_done"]]
-    out = {"runs": len(runs), "history": history, "current": None}
-    if runs:
-        cur = runs[-1]
-        prog = cur["batches"][-1] if cur["batches"] else None
-        frac = None
-        if prog and cur["epochs"] and prog["total"]:
-            frac = (prog["epoch"] * prog["total"] + prog["batch"]) / (cur["epochs"] * prog["total"])
-        times = estimate_bc_times(cur["batches"], anchor_ts) if anchor_ts is not None else None
-        series = []
-        for j, b in enumerate(cur["batches"]):
-            if b["loss"] is None:
-                continue
-            pt = {"gb": b["epoch"] * b["total"] + b["batch"], "loss": b["loss"], "sps": b["samples_s"]}
-            if times is not None:
-                pt["ts_est"] = round(times[j], 1)
-            series.append(pt)
-        out["current"] = {
-            "banner": {k: cur[k] for k in ("train_shards", "val_shards", "batches_per_epoch", "epochs")},
-            "progress": prog, "frac": frac, "loss": downsample(series, max_points),
-            "last_done": cur["epochs_done"][-1] if cur["epochs_done"] else None,
-        }
+    Returns {"band": [lo, hi], "period_min", "period_max", "roster", "arenas",
+    "bots": [{name, wr, ema, period, dwell, dwell_of}], "history": [...]}, where
+    each history row is one eval: {"i": n, "<bot>": period, "<bot>_wr": wr}.
+    """
+    lines = text.splitlines()
+    start = 0
+    band = pmin = pmax = None
+    roster, arenas = [], None
+    for i, line in enumerate(lines):
+        m = AC_BANNER.search(line)
+        if m:
+            start = i
+            band = [_f(m.group(1)), _f(m.group(2))]
+            pmin, pmax = int(m.group(3)), int(m.group(4))
+        m = AC_ROSTER.search(line)
+        if m:
+            roster = [s.strip().strip("'\"") for s in m.group(1).split(",") if s.strip()]
+            arenas = f"{m.group(3)}/{m.group(4)}"
+    out = {"band": band, "period_min": pmin, "period_max": pmax,
+           "roster": roster, "arenas": arenas, "bots": [], "history": []}
+    if band is None:
+        return out
+    for line in lines[start:]:
+        m = AC_DECISION.search(line)
+        if not m:
+            continue
+        snap, row = [], {"i": len(out["history"]) + 1}
+        for name, wr, ema, p_from, p_to, dwell, dwell_of in AC_SEG.findall(m.group(1)):
+            # a moved slot reports p<from>-><to>; a held/dwelling one just p<n>
+            period = int(p_to) if p_to else int(p_from)
+            snap.append({"name": name, "wr": _f(wr), "ema": _f(ema), "period": period,
+                         "dwell": int(dwell) if dwell else None,
+                         "dwell_of": int(dwell_of) if dwell_of else None})
+            row[name] = period
+            row[name + "_wr"] = _f(wr)
+        if snap:
+            out["bots"] = snap                  # last decision wins = current state
+            out["history"].append(row)
     return out
+
+
+def parse_gate_history(text):
+    """logs/matchwin_history.jsonl -> gate rows, newest last. Written by
+    scripts/matchwin_gate.py: the absolute ruler (candidate vs frozen champion,
+    both side orders, full 300s matches)."""
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if "win_share" in d:
+            rows.append(d)
+    rows.sort(key=lambda r: r.get("ts", 0))
+    return rows
 
 
 def estimate_train_times(rows, anchor_ts, restarts=()):
@@ -240,52 +252,6 @@ def estimate_train_times(rows, anchor_ts, restarts=()):
             beyond_boundary = True
         rough[i - 1] = beyond_boundary
     return list(zip(ts, rough))
-
-
-def estimate_bc_times(batches, anchor_ts, batch_size=4096):
-    """Same backward walk for timestamp-less bc batch lines: a gap costs
-    batch_delta * batch_size / samples_per_s seconds. Called per run (banner
-    boundaries reset the walk by construction — the caller passes one run's
-    batches). Returns a ts list aligned to batches."""
-    n = len(batches)
-    if not n:
-        return []
-    ts = [0.0] * n
-    ts[-1] = anchor_ts
-    for i in range(n - 1, 0, -1):
-        prev, cur = batches[i - 1], batches[i]
-        gb_prev = prev["epoch"] * prev["total"] + prev["batch"]
-        gb_cur = cur["epoch"] * cur["total"] + cur["batch"]
-        sps = cur.get("samples_s") or prev.get("samples_s") or 0
-        ts[i - 1] = ts[i] - (max(0, gb_cur - gb_prev) * batch_size / sps if sps > 0 else 0.0)
-    return ts
-
-
-def parse_registry(text, src=""):
-    """League registry jsonl -> rows for the ladder table. Bad lines skipped;
-    schema_version defaults to 0 (pre-v1 entries)."""
-    rows = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(e, dict) or "ck" not in e:
-            continue
-        rows.append({
-            "ck": str(e["ck"]).rsplit("/", 1)[-1],
-            "steps": int(e.get("steps") or 0),
-            "run": str(e.get("run", "?")),
-            "schema_version": int(e.get("schema_version") or 0),
-            "mu": _f(e.get("mu")),
-            "sigma": _f(e.get("sigma")),
-            "games": int(e.get("games") or 0),
-            "src": src,
-        })
-    return rows
 
 
 def _ssl_epoch(mmdd_hms, now):
@@ -368,63 +334,6 @@ def ssl_last_hour(samples, run_start_ts, now):
     if run_start_ts is not None and run_start_ts < pts[0][0]:
         pts.insert(0, (run_start_ts, 0))
     return max(0, round(_counter_at(pts, now) - _counter_at(pts, now - 3600)))
-
-
-def parse_eval_history(text):
-    """Eval-history jsonl -> normalized rows sorted by ts. Accepts both the new
-    eval_metrics.py schema {ts, ck, goals_min, touches_min, dist} and the legacy
-    EvalRunner schema {ts, steps, goals_per_min, touches_per_min, dist_uu}."""
-    rows = []
-    for line in text.splitlines():
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(e, dict) or "ts" not in e:
-            continue
-        ck = e.get("ck") or (f"ck_{e['steps']}" if "steps" in e else "?")
-        rows.append({
-            "ts": int(e["ts"]), "ck": str(ck),
-            "goals_min": _f(e.get("goals_min", e.get("goals_per_min"))),
-            "touches_min": _f(e.get("touches_min", e.get("touches_per_min"))),
-            "dist": _f(e.get("dist", e.get("dist_uu"))),
-        })
-    rows.sort(key=lambda r: r["ts"])
-    return rows
-
-
-def parse_h2h_history(text):
-    """Head-to-head history jsonl (scripts/h2h_eval.py) -> rows sorted by
-    ts. Schema: {ts, ck, ref, ref_label, goals_ck, goals_ref, share, steps,
-    seed} -- see h2h_eval.append_h2h_history. This is the REAL skill ruler
-    (frozen-reference goal share); parse_eval_history above is self-play
-    behavior, not skill -- see the panel labels in PAGE for why that
-    distinction matters (journal 2026-07-19 ~14:50)."""
-    rows = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(e, dict) or "ts" not in e or "ck" not in e:
-            continue
-        goals_ck = int(e.get("goals_ck") or 0)
-        goals_ref = int(e.get("goals_ref") or 0)
-        share = _f(e.get("share"))
-        if share is None:
-            total = goals_ck + goals_ref
-            share = goals_ck / total if total else None
-        rows.append({
-            "ts": int(e["ts"]), "ck": str(e["ck"]), "ref": str(e.get("ref", "?")),
-            "ref_label": str(e.get("ref_label", e.get("ref", "?"))),
-            "goals_ck": goals_ck, "goals_ref": goals_ref, "share": share,
-            "steps": int(e.get("steps") or 0), "seed": int(e.get("seed") or 0),
-        })
-    rows.sort(key=lambda r: r["ts"])
-    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -576,41 +485,8 @@ class SlowSampler(threading.Thread):
             time.sleep(60)
 
 
-class EvalRunner(threading.Thread):
-    """Every N minutes, evals the newest main-run checkpoint it hasn't seen
-    (nice -n 15). eval_metrics.py appends the result to logs/eval_history.jsonl
-    itself; this thread only schedules and dedupes by checkpoint name."""
-
-    def __init__(self, every_min):
-        super().__init__(daemon=True)
-        self.every = every_min * 60
-        self.status = "idle"
-
-    def _evaluated(self):
-        return {row["ck"] for row in parse_eval_history(_read(EVAL_HISTORY))}
-
-    def run(self):
-        while True:
-            cks = sorted(CKPT_DIR.glob("ck_*.pt"))
-            if cks and cks[-1].name not in self._evaluated():
-                latest = cks[-1]
-                self.status = f"evaluating {latest.name}…"
-                try:
-                    proc = subprocess.run(
-                        ["nice", "-n", "15", sys.executable,
-                         str(REPO / "scripts" / "eval_metrics.py"), str(latest)],
-                        capture_output=True, text=True, cwd=REPO, timeout=1800,
-                    )
-                    self.status = "idle" if proc.returncode == 0 else \
-                        f"eval failed (rc {proc.returncode})"
-                except Exception as e:
-                    self.status = f"eval failed: {e}"
-            time.sleep(self.every)
-
-
 SAMPLER = SysSampler()
 SLOW = SlowSampler()
-EVALER = None
 
 
 # ---------------------------------------------------------------------------
@@ -661,28 +537,11 @@ def _ssl_payload(now):
 
 def payload():
     now = time.time()
-    league = []
-    for path, src in ((LEAGUE_LOCAL, "local"), (LEAGUE_REMOTE, "remote")):
-        league += cached_parse(path, lambda t, s=src: parse_registry(t, s), tag="reg_" + src)
-    league.sort(key=lambda e: -(e["mu"] if e["mu"] is not None else float("-inf")))
-    evals = sorted(
-        cached_parse(EVAL_HISTORY_LEGACY, parse_eval_history, tag="ev_legacy")
-        + cached_parse(EVAL_HISTORY, parse_eval_history, tag="ev_new"),
-        key=lambda r: r["ts"],
-    )
-    h2h = cached_parse(H2H_HISTORY, parse_h2h_history, tag="h2h")
-    try:
-        bc_anchor = BC_LOG.stat().st_mtime
-    except OSError:
-        bc_anchor = None
     return {
         "main": _main_payload(now),
-        "bc": bc_summary(cached_parse(BC_LOG, parse_bc_log), anchor_ts=bc_anchor),
-        "league": league,
+        "curriculum": cached_parse(MAIN_LOG, parse_curriculum, tag="curr"),
+        "gate": cached_parse(GATE_HISTORY, parse_gate_history, tag="gate"),
         "ssl": _ssl_payload(now),
-        "evals": evals,
-        "h2h": h2h,
-        "eval_status": EVALER.status if EVALER else "disabled",
         "sys": list(SAMPLER.history),
         "host_free_gb": SLOW.host_free_gb,
     }
@@ -699,7 +558,9 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 :root { --surface:#131312; --panel:#1b1b19; --card:#232320; --ink:#f4f3ec;
         --ink2:#c3c2b7; --muted:#8a897e; --grid:#33322f; --border:#33322f;
         --series:#3987e5; --accent:rgba(57,135,229,.16);
-        --h2h:#e0a730; --h2h-series:#e0a730; --h2h-accent:rgba(224,167,48,.18) }
+        /* the amber accent marks whichever panel is the REAL skill ruler; that is
+           now the curriculum (fixed external opponents) and the champion gate */
+        --rule:#e0a730; --rule-series:#e0a730; --rule-accent:rgba(224,167,48,.18) }
 * { box-sizing:border-box; margin:0 }
 body { background:var(--surface); color:var(--ink);
        font:14px/1.45 system-ui,-apple-system,sans-serif; padding:18px; }
@@ -708,10 +569,32 @@ h1 { font-size:17px; font-weight:650 }
 .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px;
          padding:14px 16px 12px; margin-bottom:14px }
 .panel.main { border-color:#2c5e9e }
-.panel.h2h { border-color:var(--h2h); border-width:2px; box-shadow:0 0 0 1px rgba(224,167,48,.25) }
-.panel.h2h h2 { color:var(--h2h) }
-svg.chart.h2h .line { stroke:var(--h2h-series) }
-svg.chart.h2h .mark, svg.chart.h2h .dot { fill:var(--h2h-series) }
+.panel.rule { border-color:var(--rule); border-width:2px; box-shadow:0 0 0 1px rgba(224,167,48,.25) }
+.panel.rule h2 { color:var(--rule) }
+svg.chart.rule .line { stroke:var(--rule-series) }
+svg.chart.rule .mark, svg.chart.rule .dot { fill:var(--rule-series) }
+/* --- curriculum: one row per opponent, win rate against the target band ---
+   The gauge IS the control law: shaded region = the band the controller holds
+   each bot in, thick mark = its smoothed win rate (what it acts on), thin mark =
+   the latest single measurement (noisy, hence the smoothing). */
+.bot { display:grid; grid-template-columns:96px 92px 1fr 132px; gap:12px;
+       align-items:center; padding:9px 2px; border-top:1px solid var(--border) }
+.bot:first-child { border-top:0 }
+.bot .name { font-weight:600 }
+.bot .rung { font-size:12px; color:var(--ink2); font-variant-numeric:tabular-nums }
+.bot .rung b { color:var(--ink); font-weight:650 }
+.gauge { position:relative; height:24px; background:var(--card); border-radius:5px;
+         border:1px solid var(--border) }
+.gauge .band { position:absolute; top:0; bottom:0; background:var(--accent);
+               border-left:1px solid rgba(57,135,229,.55);
+               border-right:1px solid rgba(57,135,229,.55) }
+.gauge .ema { position:absolute; top:3px; bottom:3px; width:3px; border-radius:2px;
+              background:var(--ink) }
+.gauge .raw { position:absolute; top:8px; bottom:8px; width:2px; background:var(--muted) }
+.bot .verdict { font-size:11.5px; text-align:right; color:var(--ink2) }
+.bot.advancing .verdict { color:var(--series) }
+.bot.easing .verdict { color:var(--rule) }
+.bot .verdict .sub2 { display:block; color:var(--muted); font-size:10.5px }
 .parity { stroke:var(--muted); stroke-width:1; stroke-dasharray:4 3 }
 .panel h2 { font-size:13px; font-weight:650; color:var(--ink2); margin-bottom:10px;
             text-transform:uppercase; letter-spacing:.05em }
@@ -771,40 +654,29 @@ tr.curr td { background:var(--accent) }
 <div class="sub" id="status">loading…</div>
 
 <section class="panel main">
-  <h2>Main run · remote KL-PPO entity<span class="meta" id="main-meta"></span></h2>
+  <h2>Live run · from-scratch vs external bots<span class="meta" id="main-meta"></span></h2>
   <div class="tiles" id="main-tiles"></div>
   <div class="grid" id="main-charts"></div>
   <details><summary>Recent iterations</summary>
     <div class="wrap"><table id="tbl"></table></div></details>
 </section>
 
-<section class="panel h2h">
-  <h2>Head-to-head (skill)<span class="meta" id="h2h-meta"></span></h2>
-  <div class="tiles" id="h2h-tiles"></div>
-  <div class="grid" id="h2h-charts"></div>
-  <div class="wrap"><table id="h2h-hist"></table></div>
+<section class="panel rule">
+  <h2>Curriculum · external opponents<span class="meta" id="curr-meta"></span></h2>
+  <div id="curr-rows"></div>
+  <div class="grid" id="curr-charts"></div>
 </section>
 
 <div class="cols">
-  <section class="panel">
-    <h2>BC training · local<span class="meta" id="bc-meta"></span></h2>
-    <div class="pbar" id="bc-bar"><span>—</span></div>
-    <div class="tiles" id="bc-tiles"></div>
-    <div class="grid" id="bc-charts"></div>
-    <div class="wrap"><table id="bc-hist"></table></div>
-  </section>
-  <section class="panel">
-    <h2>League ladder<span class="meta" id="lg-meta"></span></h2>
-    <div class="wrap"><table id="lg-tbl"></table></div>
+  <section class="panel rule">
+    <h2>Gate vs frozen champion<span class="meta" id="gate-meta"></span></h2>
+    <div class="tiles" id="gate-tiles"></div>
+    <div class="wrap"><table id="gate-tbl"></table></div>
   </section>
   <section class="panel">
     <h2>SSL replay pull<span class="meta" id="ssl-meta"></span></h2>
     <div class="pbar" id="ssl-bar"><span>—</span></div>
     <div class="tiles" id="ssl-tiles"></div>
-  </section>
-  <section class="panel">
-    <h2>Self-play behavior (not a skill metric)<span class="meta" id="evalstatus"></span></h2>
-    <div class="grid" id="evalcharts"></div>
   </section>
 </div>
 
@@ -825,12 +697,6 @@ const MAIN_METRICS = [
   {key:"kl_pri", title:"KL to BC prior (kl_pri)", fmt:v=>v.toFixed(3),
    why:"Post-K4: divergence from the frozen BC prior, penalized at lambda_p. Only iterations from the kl-prior era plot here; the kickstart era logged kick_kl instead."},
 ];
-const BC_METRICS = [
-  {key:"loss", title:"Train loss (current run)", fmt:v=>v.toFixed(3),
-   why:"Running cross-entropy over the current run's batches. x = global batch."},
-  {key:"sps", title:"Samples / sec", fmt:v=>v.toLocaleString(),
-   why:"BC dataloader + GPU throughput. Sustained dips = shard IO or the GPU busy elsewhere."},
-];
 const SYS_METRICS = [
   {key:"gpu", title:"GPU utilization (%)", fmt:v=>Math.round(v)+"%",
    why:"BC training + any local eval. Bursty is normal."},
@@ -838,14 +704,6 @@ const SYS_METRICS = [
    why:"Laptop GPUs throttle around ~87°C."},
   {key:"cpu", title:"CPU utilization (%)", fmt:v=>Math.round(v)+"%",
    why:"Dataloaders, SSL pull, sync loops, RocketSim evals."},
-];
-const EVAL_METRICS = [
-  {key:"goals_min", title:"Goals / min / match (self-play — behavioral, not skill)", fmt:v=>v.toFixed(2), marks:true,
-   why:"SELF-PLAY: both sides run the SAME policy, so this moves with both sides' defense, not skill — better defense suppresses it with zero skill loss, and both-sides-worse leaves it flat. It hid an 800M-step regression and made a 3.5x-weaker policy look like it was improving (journal 2026-07-19 ~14:50). Use the Head-to-head panel above for the real skill ruler."},
-  {key:"touches_min", title:"Ball touches / min / agent", fmt:v=>v.toFixed(1), marks:true,
-   why:"How often the bot contacts the ball. Random baseline 0.0. Behavioral descriptor, not a skill ranking."},
-  {key:"dist", title:"Mean dist to ball (uu)", fmt:v=>v.toFixed(0), marks:true,
-   why:"Average car-to-ball distance. Random baseline 3769 uu; lower = involved in the play. Behavioral descriptor, not a skill ranking."},
 ];
 const tip = document.getElementById("tip");
 const fmtSteps = v => v >= 1e9 ? (v/1e9).toFixed(2)+"B" : v >= 1e6 ? (v/1e6).toFixed(0)+"M" : v.toLocaleString();
@@ -976,52 +834,79 @@ function renderMain(md) {
         (typeof r[c]==="number" && !Number.isInteger(r[c]) ? r[c].toFixed(4) : r[c].toLocaleString())}</td>`).join("")}</tr>`).join("");
 }
 
-function renderBC(bc) {
-  const meta = document.getElementById("bc-meta"), cur = bc.current;
-  if (!cur) { meta.textContent = "no bc_train.log"; return; }
-  meta.textContent = `run ${bc.runs} · ${cur.banner.train_shards.toLocaleString()} train / ${cur.banner.val_shards.toLocaleString()} val shards`;
-  const p = cur.progress;
-  if (p) {
-    const pct = cur.frac != null ? Math.min(100, cur.frac * 100) : 0;
-    document.getElementById("bc-bar").innerHTML =
-      `<div class="pfill" style="width:${pct.toFixed(1)}%"></div>` +
-      `<span>epoch ${p.epoch+1}/${cur.banner.epochs} · batch ${p.batch.toLocaleString()}/${p.total.toLocaleString()} · ${pct.toFixed(1)}%</span>`;
+function renderCurriculum(c) {
+  const meta = document.getElementById("curr-meta");
+  const rows = document.getElementById("curr-rows");
+  if (!c || !c.band || !c.bots.length) {
+    meta.textContent = "no auto-curriculum lines in the live log yet";
+    rows.innerHTML = ""; return;
   }
-  const ld = cur.last_done;
-  tiles(document.getElementById("bc-tiles"), [
-    ["Loss", p && p.loss != null ? p.loss.toFixed(4) : "—", "running train CE"],
-    ["Samples / s", p ? p.samples_s.toLocaleString() : "—", "current throughput"],
-    ["Val top-1", ld ? num(ld.top1, v=>(v*100).toFixed(1)+"%") : "—",
-     ld ? `after epoch ${ld.epoch}` : "no epoch done yet"],
-    ["Val top-3", ld ? num(ld.top3, v=>(v*100).toFixed(1)+"%") : "—",
-     ld && ld.val_loss != null ? "val_loss " + ld.val_loss.toFixed(3) : ""],
-  ]);
-  const grid = grids("bc-charts", BC_METRICS);
-  const kfmt = v => v >= 1000 ? (v/1000).toFixed(0)+"k" : String(Math.round(v));
-  BC_METRICS.forEach((m,i) => {
-    if (cur.loss.length > 1) chart(grid.children[i], cur.loss, m, "gb", kfmt);
-    else grid.children[i].innerHTML = `<h3>${m.title}</h3><div class="why">no batches yet</div>`;
+  const [lo, hi] = c.band;
+  meta.textContent = `${c.bots.length} bots on ${c.arenas||"?"} arenas · `
+    + `hold ${lo}–${hi} · rungs ${c.period_max}(easy)→${c.period_min}(full strength) · `
+    + `${c.history.length} evals this run`;
+  rows.innerHTML = c.bots.map(b => {
+    // above the band -> we beat it comfortably, so it advances a rung next;
+    // below -> it backs off. In band = a fair fight, which is the goal.
+    const state = b.ema > hi ? "advancing" : b.ema < lo ? "easing" : "";
+    const verdict = b.dwell ? `settling ${b.dwell}/${b.dwell_of}`
+      : b.ema > hi ? "→ harder next" : b.ema < lo ? "→ easier next" : "fair fight";
+    const pct = v => (100 * Math.max(0, Math.min(1, v))).toFixed(1) + "%";
+    return `<div class="bot ${state}">
+      <div class="name">${b.name}</div>
+      <div class="rung">rung <b>p${b.period}</b></div>
+      <div class="gauge" title="win rate 0 → 1; shaded = target band ${lo}–${hi}">
+        <div class="band" style="left:${pct(lo)};width:${pct(hi-lo)}"></div>
+        <div class="raw" style="left:${pct(b.wr)}"></div>
+        <div class="ema" style="left:${pct(b.ema)}"></div>
+      </div>
+      <div class="verdict">${(b.ema*100).toFixed(0)}% smoothed
+        <span class="sub2">${verdict}</span></div>
+    </div>`;
+  }).join("");
+
+  // one chart per bot: the rung it is being held at over this run's evals.
+  // Falling = the opponent got harder = the policy improved.
+  const metrics = c.bots.map(b => ({
+    key: b.name, title: `${b.name} · rung over time`, fmt: v => "p" + v,
+    why: "Lower is harder. The controller drops a rung once this bot's smoothed "
+       + "win rate clears the top of the band, so a falling line is real progress "
+       + "against a fixed external opponent.",
+  }));
+  const grid = document.getElementById("curr-charts");
+  while (grid.children.length > metrics.length) grid.lastChild.remove();
+  while (grid.children.length < metrics.length) grid.appendChild(mkcard());
+  metrics.forEach((m, i) => {
+    const rs = c.history.filter(r => r[m.key] != null);
+    if (rs.length > 1) chart(grid.children[i], rs, m, "i", v => "eval " + v, [], "rule");
+    else grid.children[i].innerHTML = `<h3>${m.title}</h3><div class="why">${m.why}</div>`;
   });
-  const h = bc.history, keys = ["train_loss","val_loss","top1","top3","recall_jump","recall_stall"];
-  document.getElementById("bc-hist").innerHTML = h.length ?
-    `<tr><th>run</th><th>epoch</th><th>train</th><th>val</th><th>top1</th><th>top3</th><th>r_jump</th><th>r_stall</th></tr>` +
-    h.slice(-10).reverse().map(e =>
-      `<tr${e.run===bc.runs ? ' class="curr"' : ''}><td>#${e.run}</td><td>${e.epoch}</td>` +
-      keys.map(k=>`<td>${num(e[k], v=>v.toFixed(3))}</td>`).join("") + `</tr>`).join("") : "";
 }
 
-function renderLeague(rows) {
-  const meta = document.getElementById("lg-meta");
-  if (!rows.length) { meta.textContent = "no registry"; return; }
-  const v1 = rows.filter(r=>r.schema_version===1).length;
-  meta.textContent = `${rows.length} entries · ${v1} in v1 pool (highlighted) · by μ`;
-  document.getElementById("lg-tbl").innerHTML =
-    `<tr><th style="text-align:left">checkpoint</th><th>sv</th><th>μ</th><th>σ</th><th>games</th><th>src</th></tr>` +
-    rows.slice(0, 24).map(e =>
-      `<tr${e.schema_version===1 ? ' class="v1"' : ''}>` +
-      `<td style="text-align:left" title="${e.ck}">${e.run} ${fmtSteps(e.steps)}</td>` +
-      `<td>v${e.schema_version}</td><td>${num(e.mu, v=>v.toFixed(1))}</td>` +
-      `<td>${num(e.sigma, v=>v.toFixed(1))}</td><td>${e.games}</td><td>${e.src}</td></tr>`).join("");
+function renderGate(rows) {
+  const meta = document.getElementById("gate-meta");
+  const tbl = document.getElementById("gate-tbl");
+  if (!rows || !rows.length) {
+    meta.textContent = "no gates yet — run scripts/matchwin_gate.py CK";
+    tiles(document.getElementById("gate-tiles"), []);
+    tbl.innerHTML = ""; return;
+  }
+  const last = rows[rows.length - 1];
+  meta.textContent = `${rows.length} gate${rows.length>1?"s":""} · latest ${fmtDay(last.ts)}`;
+  tiles(document.getElementById("gate-tiles"), [
+    ["Win share", (last.win_share*100).toFixed(1) + "%",
+     `${last.wins}W/${last.draws}D/${last.losses}L over ${last.n} matches`],
+    ["Verdict", last.passed ? "PASS" : "FAIL",
+     `threshold ${last.threshold != null ? last.threshold : "0.55"}`],
+    ["Candidate", (last.candidate||"?").split("/").pop(), "vs the frozen champion"],
+  ]);
+  tbl.innerHTML = "<tr><th>when</th><th>candidate</th><th>W/D/L</th>"
+    + "<th>win share</th><th>verdict</th></tr>"
+    + rows.slice().reverse().map(r => `<tr><td>${fmtDay(r.ts)}</td>`
+      + `<td>${(r.candidate||"?").split("/").pop()}</td>`
+      + `<td>${r.wins}/${r.draws}/${r.losses}</td>`
+      + `<td>${(r.win_share*100).toFixed(1)}%</td>`
+      + `<td>${r.passed ? "PASS" : "FAIL"}</td></tr>`).join("");
 }
 
 function renderSSL(s) {
@@ -1042,79 +927,6 @@ function renderSSL(s) {
      s.logged_rate_h != null ? `log says ${s.logged_rate_h}/h` : "from log timestamps"],
     ["Cursor at", s.cursor_oldest ? s.cursor_oldest.slice(0, 10) : "—", "oldest created, walking back"],
   ]);
-}
-
-function renderH2H(rows) {
-  const meta = document.getElementById("h2h-meta");
-  const tiles_ = document.getElementById("h2h-tiles");
-  const grid = document.getElementById("h2h-charts");
-  const hist = document.getElementById("h2h-hist");
-  if (!rows.length) {
-    meta.textContent = "no logs/h2h_history.jsonl yet — run ctl.py h2h CK --refs";
-    tiles_.innerHTML = ""; grid.innerHTML = ""; hist.innerHTML = "";
-    return;
-  }
-  const refLabels = [...new Set(rows.map(r => r.ref_label))];
-  meta.textContent = `${rows.length} match${rows.length===1?"":"es"} · ${refLabels.length} reference${refLabels.length===1?"":"s"} · ` +
-    "the real skill ruler (frozen references, side-order-summed — not self-play)";
-  const last = rows[rows.length-1];
-  tiles(tiles_, [
-    ["Latest share", num(last.share, v=>(v*100).toFixed(1)+"%"),
-     `${last.ck} vs ${last.ref_label}`],
-    ["Latest score", `${last.goals_ck}-${last.goals_ref}`,
-     `${last.steps} steps/side · seed ${last.seed}`],
-    ["References tracked", refLabels.join(", "), "configs/h2h_references.toml"],
-  ]);
-  grid.innerHTML = "";
-  refLabels.forEach(label => {
-    const card = mkcard();
-    grid.appendChild(card);
-    const rs = rows.filter(r => r.ref_label === label && r.share != null);
-    const m = {
-      key: "share", title: `Goal share vs ${label}`, fmt: v => (v*100).toFixed(1)+"%",
-      marks: true, yMin: 0, yMax: 1, refLine: 0.5, refLineLabel: "parity (50%)",
-      why: "Fraction of combined goals won across BOTH side orders, always summed (side bias is real). Above the dashed 50% line = stronger than this frozen reference. This is the real skill ruler — the self-play panel below is not.",
-    };
-    if (rs.length > 1) {
-      chart(card, rs, m, "ts", fmtDay, [], "h2h");
-    } else if (rs.length === 1) {
-      const e0 = rs[0];
-      card.innerHTML = `<h3>${m.title}</h3>
-        <div class="tile" style="border:none;padding:6px 0"><div class="v">${m.fmt(e0.share)}</div>
-        <div class="d">single match (${e0.ck}) — chart appears after the next one</div></div>
-        <div class="why">${m.why}</div>`;
-    } else {
-      card.innerHTML = `<h3>${m.title}</h3><div class="d">no scored matches yet (0-0)</div><div class="why">${m.why}</div>`;
-    }
-  });
-  const cols = ["ck","ref_label","goals_ck","goals_ref","share","steps","seed"];
-  hist.innerHTML =
-    `<tr>${cols.map(c=>`<th${c==="ck"||c==="ref_label"?' style="text-align:left"':""}>${c}</th>`).join("")}</tr>` +
-    rows.slice(-15).reverse().map(r =>
-      `<tr>${cols.map(c => {
-        if (c === "share") return `<td>${num(r.share, v=>(v*100).toFixed(1)+"%")}</td>`;
-        if (c === "ck" || c === "ref_label") return `<td style="text-align:left">${r[c]}</td>`;
-        return `<td>${r[c]}</td>`;
-      }).join("")}</tr>`).join("");
-}
-
-function renderEvals(d) {
-  document.getElementById("evalstatus").textContent = "· " + d.eval_status;
-  const grid = grids("evalcharts", EVAL_METRICS);
-  EVAL_METRICS.forEach((m,i) => {
-    const rows = d.evals.filter(e => e[m.key] != null);
-    if (!rows.length) {
-      grid.children[i].innerHTML = `<h3>${m.title}</h3>
-        <div class="d">no data yet — appears after the next eval</div>
-        <div class="why">${m.why}</div>`;
-    } else if (rows.length === 1) {
-      const e0 = rows[0];
-      grid.children[i].innerHTML = `<h3>${m.title}</h3>
-        <div class="tile" style="border:none;padding:6px 0"><div class="v">${m.fmt(e0[m.key])}</div>
-        <div class="d">single eval (${e0.ck}) — chart appears after the next one</div></div>
-        <div class="why">${m.why}</div>`;
-    } else chart(grid.children[i], rows, m, "ts", fmtDay);
-  });
 }
 
 function renderSys(d) {
@@ -1141,11 +953,9 @@ function renderSys(d) {
 let LAST = null;
 function renderAll(d) {
   renderMain(d.main);
-  renderH2H(d.h2h);
-  renderBC(d.bc);
-  renderLeague(d.league);
+  renderCurriculum(d.curriculum);
+  renderGate(d.gate);
   renderSSL(d.ssl);
-  renderEvals(d);
   renderSys(d);
 }
 async function refresh() {
@@ -1159,8 +969,10 @@ async function refresh() {
 }
 refresh(); setInterval(refresh, 5000);
 addEventListener("resize", () => {
-  ["main-charts","h2h-charts","bc-charts","syscharts","evalcharts"].forEach(id =>
-    document.getElementById(id).innerHTML = "");
+  ["main-charts","curr-charts","syscharts"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = "";           // charts are sized on build, so rebuild
+  });
   if (LAST) renderAll(LAST);  // synchronous — no blank flash while refetching
 });
 </script></body></html>"""
@@ -1190,13 +1002,7 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     args = sys.argv[1:]
     port = int(args[0]) if args and args[0].isdigit() else 8420
-    eval_every = 30
-    if "--eval-every" in args:
-        eval_every = int(args[args.index("--eval-every") + 1])
     SAMPLER.start()
     SLOW.start()
-    if "--no-eval" not in args:
-        EVALER = EvalRunner(eval_every)
-        EVALER.start()
-    print(f"dashboard: http://localhost:{port}  (main log: {MAIN_LOG}, eval every {eval_every}m)")
+    print(f"dashboard: http://localhost:{port}  (main log: {MAIN_LOG})")
     ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()

@@ -384,24 +384,30 @@ def test_history_row_has_the_required_gate_keys():
         assert key in row
 
 
-def test_history_row_is_h2h_schema_compatible(tmp_path):
-    """The dashboard's parse_h2h_history must read champion history unchanged
-    (schema: ts, ck, ref, ref_label, goals_ck, goals_ref, share, steps, seed)."""
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-    import dashboard  # noqa: PLC0415
+def test_history_row_carries_the_h2h_schema_view(tmp_path):
+    """The row must keep h2h_eval's field names/values verbatim
+    (ts, ck, ref, ref_label, goals_ck, goals_ref, share, steps, seed).
 
+    Asserted on the written JSONL directly. This used to go through
+    dashboard.parse_h2h_history, but the dashboard dropped its h2h panel on
+    2026-07-25 (its references were from the retired lineage) -- the schema
+    champion_gate emits is still the contract, so test it at the source instead
+    of through a reader that no longer exists.
+    """
     path = tmp_path / "champion_history.jsonl"
     champion_gate.append_history(path, champion_gate.history_row(
         "checkpoints_entity/ck_999.pt", CHAMPION, 93, 96, champion_gate.FAIL,
         False, "why", steps=5400, seed=11, arenas=8, threshold=0.52, ts=1784200000))
-    rows = dashboard.parse_h2h_history(path.read_text())
-    assert len(rows) == 1
-    assert rows[0]["ck"] == "ck_999.pt"
-    assert rows[0]["ref"] == "ck_000320471040.pt"
-    assert rows[0]["ref_label"] == "champion"
-    assert rows[0]["goals_ck"] == 93 and rows[0]["goals_ref"] == 96
-    assert rows[0]["share"] == pytest.approx(93 / 189)
-    assert rows[0]["steps"] == 5400 and rows[0]["seed"] == 11
+    lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    assert row["ts"] == 1784200000
+    assert row["ck"] == "ck_999.pt"
+    assert row["ref"] == "ck_000320471040.pt"
+    assert row["ref_label"] == "champion"
+    assert row["goals_ck"] == 93 and row["goals_ref"] == 96
+    assert row["share"] == pytest.approx(93 / 189)
+    assert row["steps"] == 5400 and row["seed"] == 11
 
 
 def test_read_history_skips_truncated_tail(tmp_path):

@@ -481,24 +481,27 @@ def test_record_result_row_ref_is_the_vendored_model_filename(tmp_path):
     assert row["ref"] == "necto-model.pt"
 
 
-def test_record_result_row_appended_lines_are_valid_jsonl_and_dashboard_parseable(tmp_path):
-    """Round-trip through scripts/dashboard.py's own parser (imported
-    read-only -- this test never edits dashboard.py) to prove the external
-    rows are indistinguishable in shape from internal h2h rows."""
-    _SCRIPTS_DIR_LOCAL = REPO / "scripts"
-    if str(_SCRIPTS_DIR_LOCAL) not in sys.path:
-        sys.path.insert(0, str(_SCRIPTS_DIR_LOCAL))
-    import dashboard  # noqa: PLC0415
+def test_record_result_row_appended_lines_are_valid_h2h_shaped_jsonl(tmp_path):
+    """External rows must be indistinguishable in shape from internal h2h rows.
 
+    Asserted on the written JSONL directly. This used to round-trip through
+    scripts/dashboard.py's parse_h2h_history, but the dashboard dropped its h2h
+    panel on 2026-07-25 (its references were from the retired lineage). The row
+    schema is still the contract, so check it at the source.
+    """
     history = tmp_path / "h2h_history.jsonl"
     bench_external.record_result_row(
         history, "ck.pt", "nexto", {"blue_score": 3, "orange_score": 1, "match_length_s": 60},
         our_team="blue", seed=2, ts=100,
     )
-    rows = dashboard.parse_h2h_history(history.read_text())
-    assert len(rows) == 1
-    assert rows[0]["ref_label"] == "nexto-GC1"
-    assert rows[0]["share"] == pytest.approx(0.75)
+    lines = [ln for ln in history.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    row = json.loads(lines[0])
+    for key in ("ts", "ck", "ref", "ref_label", "goals_ck", "goals_ref", "share", "seed"):
+        assert key in row, f"missing h2h-schema key {key!r}"
+    assert row["ref_label"] == "nexto-GC1"
+    assert row["share"] == pytest.approx(0.75)
+    assert row["goals_ck"] == 3 and row["goals_ref"] == 1
 
 
 # ---------------------------------------------------------------------------

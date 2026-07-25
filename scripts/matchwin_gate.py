@@ -111,7 +111,32 @@ def main(argv=None):
           f"win_share={r['share']:.4f} +/- {r['se']:.4f}")
     print(f"  verdict: {r['verdict']}  (threshold {r['threshold']:.3f}; "
           f"null mean 0.502 sd 0.024)")
+    _append_history(args, r)
     return 0
+
+
+def _append_history(args, r):
+    """One JSON line per gate to logs/matchwin_history.jsonl, so the dashboard's
+    gate panel can show the absolute ruler over time instead of the number living
+    only in whatever terminal ran it. Never fail the gate over bookkeeping."""
+    import json
+    import time
+    from pathlib import Path
+    row = {
+        "ts": int(time.time()),
+        "candidate": args.candidate, "champion": args.champion,
+        "wins": r["wins"], "draws": r["draws"], "losses": r["losses"], "n": r["n"],
+        "win_share": r["share"], "se": r["se"], "threshold": r["threshold"],
+        "passed": r["verdict"] == "PASS",
+        "arenas": args.arenas, "steps": args.steps, "seed": args.seed,
+    }
+    try:
+        p = Path(__file__).resolve().parent.parent / "logs" / "matchwin_history.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+    except OSError as e:
+        print(f"  (could not append gate history: {e})")
 
 
 if __name__ == "__main__":
