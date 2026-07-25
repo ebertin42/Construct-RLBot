@@ -335,6 +335,17 @@ class Trainer:
             # adjust on a per-slot EMA rather than a single raw measurement.
             self._ac_wr_ema = [None] * self._foreign_slots
             self._ac_wr_alpha = float(ac.get("wr_ema_alpha", 0.3))
+            # DWELL: evals a slot must sit still after a change before it may move
+            # again. One eval scores only ~18 matches per bot, so a single
+            # measurement's sd (~0.118 at wr 0.5) dwarfs a +/-0.05 band -- without
+            # a dwell the controller moves on ~85-90% of evals and wanders over 4
+            # rungs, which is exactly why the logged period turned into unreadable
+            # noise. Dwelling lets the (post-change, freshly reset) EMA accumulate
+            # 2-3 samples before acting: simulated move rate drops to 0.11-0.22 and
+            # the period settles into a 2-rung band at the SAME mean win rate
+            # (~0.5). See the 2026-07-25 controller simulation.
+            self._ac_dwell = int(ac.get("adjust_dwell", 2))
+            self._ac_since = [10 ** 6] * self._foreign_slots   # free to move at start
             self._ac_eval = None
             if self._ac_on:
                 try:
@@ -442,13 +453,23 @@ class Trainer:
                 e = w if e is None else (1 - self._ac_wr_alpha) * e + self._ac_wr_alpha * w
                 self._ac_wr_ema[s] = e
                 cur = self._foreign_periods[s]
+                if self._ac_since[s] < self._ac_dwell:
+                    # still settling after its last change: keep folding
+                    # measurements into the EMA, but don't act on them yet
+                    self._ac_since[s] += 1
+                    parts.append(f"{self._foreign_kinds[s]} wr{w:.2f}/ema{e:.2f} "
+                                 f"p{cur} dwell{self._ac_since[s]}/{self._ac_dwell}")
+                    continue
                 if e > self._ac_win_hi:
                     self._foreign_periods[s] = max(self._ac_period_min, cur - 1)
                 elif e < self._ac_win_lo:
                     self._foreign_periods[s] = min(self._ac_period_max, cur + 1)
                 parts.append(f"{self._foreign_kinds[s]} wr{w:.2f}/ema{e:.2f} "
                              f"p{cur}->{self._foreign_periods[s]}")
-                if self._foreign_periods[s] != cur:
+                if self._foreign_periods[s] == cur:
+                    self._ac_since[s] += 1
+                else:
+                    self._ac_since[s] = 0
                     # The difficulty just changed, so every sample in this slot's
                     # EMA describes the OLD period. Keeping it would ratchet again
                     # on stale evidence -- e.g. seed 0.90 at p4, harden to p3, and

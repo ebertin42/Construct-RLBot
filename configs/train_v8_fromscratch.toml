@@ -91,8 +91,17 @@ period_min = 1
 period_max = 12
 adjust_every = 20          # measure win rate + adjust every 20 iters
 ema_alpha = 0.2            # ep_rew fallback only
-win_lo = 0.45              # target win-rate band (goal-based eval)
-win_hi = 0.55
+# Per-bot target band. WIDER than the old +/-0.05 on purpose: one eval scores only
+# ~18 matches per bot, so a single measurement's sd is ~0.118 -- more than double a
+# 0.05 half-width. With the narrow band the controller moved on ~85-90% of evals
+# and wandered 4 rungs (the logged period became noise). [0.35,0.65] is wider than
+# 1 sd of the measurement, still nowhere near saturated (both sides keep scoring),
+# and with adjust_dwell below the simulated move rate falls to 0.11-0.22 with the
+# period settling into a 2-rung band at the same ~0.5 mean win rate.
+win_lo = 0.35
+win_hi = 0.65
+adjust_dwell = 2           # evals a bot must hold still after a change before
+                           # moving again (lets its reset EMA re-accumulate)
 # Eval arenas are round-robined across the foreign slots (like the training
 # assignment), so EVERY bot is measured -- before 2026-07-25 the eval collected
 # with slot 0 only, leaving the controller blind to bots 2..N. Keep this a
