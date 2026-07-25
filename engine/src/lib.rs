@@ -492,6 +492,12 @@ struct RenderSession {
     // sampled blue-then-orange like training workers).
     rng: sampler::Pcg32,
     net_heads: usize,
+    // Optional ported-bot opponent driving the ORANGE car(s) in `step_policy`
+    // (blue stays the learner). Lets the viewer render the real training
+    // matchup -- Construct vs Element/Immortal/Necto/Nexto -- instead of
+    // self-play. `foreign_kind` is the label the overlay reads back.
+    foreign: Option<foreign::ForeignPolicy>,
+    foreign_kind: Option<String>,
 }
 
 impl RenderSession {
@@ -543,6 +549,8 @@ impl RenderSession {
             policy_v1: None,
             rng: sampler::Pcg32::new((seed as u64) * 1_000_003 + 17),
             net_heads,
+            foreign: None,
+            foreign_kind: None,
         })
     }
 
@@ -597,6 +605,41 @@ impl RenderSession {
         Ok(())
     }
 
+    /// V1 only: drive the ORANGE car(s) with a ported bot instead of the learner,
+    /// so `step_policy` renders the real training matchup. `kind` is one of
+    /// element/immortal/necto/nexto; `decision_period` is the same reaction
+    /// handicap the auto-curriculum applies. Blue stays the `set_weights` learner.
+    #[pyo3(signature = (weights, kind, decision_period=1))]
+    fn set_foreign_opponent(
+        &mut self,
+        weights: HashMap<String, PyReadonlyArrayDyn<'_, f32>>,
+        kind: &str,
+        decision_period: u32,
+    ) -> PyResult<()> {
+        if self.obs_mode != episode::ObsMode::V1 {
+            return Err(PyValueError::new_err("set_foreign_opponent is v1-only"));
+        }
+        let fk = foreign::ForeignKind::parse(kind)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown foreign kind {kind:?}")))?;
+        let mut fp = foreign::ForeignPolicy::new(&parse_foreign_dict(weights), fk)
+            .map_err(PyValueError::new_err)?;
+        fp.set_decision_period(decision_period);
+        self.foreign = Some(fp);
+        self.foreign_kind = Some(kind.to_string());
+        Ok(())
+    }
+
+    /// Revert `step_policy` to self-play (both cars the learner).
+    fn clear_foreign(&mut self) {
+        self.foreign = None;
+        self.foreign_kind = None;
+    }
+
+    #[getter]
+    fn foreign_kind(&self) -> Option<String> {
+        self.foreign_kind.clone()
+    }
+
     /// V1 only: one policy-driven env step — builds the entity obs in-engine,
     /// forwards the `set_weights` EntityPolicy, samples actions, steps the
     /// arena, and streams the frame to RLViser. Returns
@@ -632,11 +675,36 @@ impl RenderSession {
             let row = &logits[a * action_count..(a + 1) * action_count];
             acts[a] = sampler::sample_categorical(row, &mut self.rng).0 as i64;
         }
+        // Ported-bot opponent (if set): overwrite the orange car(s)' sampled
+        // action with the bot's controls for THIS step -- same override path
+        // collect uses. Blue keeps its learner action. `fkeys` lets us reset the
+        // bot's per-car state when the match resets below.
+        let mut fkeys: Vec<u64> = Vec::new();
+        if let Some(mut fpol) = self.foreign.take() {
+            let bc = self.arena.blue_count();
+            let mut ov = Vec::with_capacity(n - bc);
+            for a in bc..n {
+                let (cid, key, controls) = self.arena.foreign_controls(a, &mut fpol, 0);
+                ov.push((cid, controls));
+                fkeys.push(key);
+            }
+            self.arena.set_foreign_overrides(ov);
+            self.foreign = Some(fpol);
+        }
         let mut rew = vec![0f32; n];
         let mut flags = vec![episode::StepFlags::default(); n];
         let (mut fe, mut fm, mut fq, mut fp) =
             (vec![0f32; n * me * ef], vec![false; n * me], vec![0f32; n * qf], vec![0i64; n * pa]);
         self.arena.step_v1(&acts, &mut rew, &mut flags, &mut fe, &mut fm, &mut fq, &mut fp);
+        // On a full-match reset, clear the bot's per-car timers/hold so its obs
+        // restarts clean (match_mode in-match kickoffs keep rolling -- fine).
+        if !fkeys.is_empty() && flags.iter().any(|f| f.terminated || f.truncated) {
+            if let Some(fpol) = self.foreign.as_mut() {
+                for k in &fkeys {
+                    fpol.reset_car(*k);
+                }
+            }
+        }
         let gs = self.arena.game_state();
         if episode::state_is_sane(&gs) {
             let _ = self.stream.send_state(gs);

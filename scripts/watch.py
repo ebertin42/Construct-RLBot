@@ -38,8 +38,24 @@ if "--mode" in sys.argv:
 curriculum = None
 if "--curriculum" in sys.argv:
     curriculum = sys.argv[sys.argv.index("--curriculum") + 1]
+# --foreign <kind> --foreign-weights <npz> --period N: drive the ORANGE car with a
+# ported bot (element/immortal/necto/nexto) so the viewer shows the real training
+# matchup, not self-play. v1 path only. Blue stays the checkpoint's learner.
+foreign_kind = None
+foreign_weights = None
+foreign_period = 1
+if "--foreign" in sys.argv:
+    foreign_kind = sys.argv[sys.argv.index("--foreign") + 1]
+if "--foreign-weights" in sys.argv:
+    foreign_weights = sys.argv[sys.argv.index("--foreign-weights") + 1]
+if "--period" in sys.argv:
+    foreign_period = int(sys.argv[sys.argv.index("--period") + 1])
 ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 is_v1 = int(ck.get("schema_version", 0)) == 1
+
+if foreign_kind and not is_v1:
+    print("note: --foreign is v1-only; ignoring (v0 checkpoint renders self-play).")
+    foreign_kind = None
 
 if is_v1:
     from construct.learn.model_v1 import EntityPolicyNet
@@ -70,6 +86,12 @@ if is_v1:
     sess.set_weights(
         {k: v.detach().cpu().numpy().astype(np.float32) for k, v in net.state_dict().items()}
     )
+    if foreign_kind:
+        import os
+        fw = {k: v.astype(np.float32)
+              for k, v in np.load(os.path.expanduser(foreign_weights)).items()}
+        sess.set_foreign_opponent(fw, foreign_kind, foreign_period)
+        print(f"orange = {foreign_kind} (period {foreign_period})  |  blue = Construct")
     try:
         while True:
             sess.step_policy()

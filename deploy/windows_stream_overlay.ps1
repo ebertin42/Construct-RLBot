@@ -15,7 +15,7 @@ $form.BackColor = [System.Drawing.Color]::Black
 $form.Opacity = 0.78
 $form.ShowInTaskbar = $false
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-$form.Size = New-Object System.Drawing.Size(460, 40)
+$form.Size = New-Object System.Drawing.Size(680, 40)
 $form.Location = New-Object System.Drawing.Point(24, 24)
 
 $label = New-Object System.Windows.Forms.Label

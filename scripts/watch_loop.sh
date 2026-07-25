@@ -36,6 +36,24 @@ WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_scratch checkpoints_entity check
 # legacy episodes when the live arm is a legacy run.
 WATCH_CURRICULUM="${CONSTRUCT_WATCH_CURRICULUM-configs/curriculum_v3_match.toml}"
 
+# From-scratch/foreign runs (1v1): rotate the viewer through the SAME opponent
+# roster the run trains on -- element/immortal/necto/nexto -- plus a self-play
+# slot, at the LIVE auto-curriculum period, so the stream shows the real matchup
+# (blue = Construct learner, orange = the ported bot). The overlay reads the
+# who-is-who label written by announce(). Set CONSTRUCT_WATCH_FOREIGN=0 to force
+# plain self-play.
+FOREIGN_ROSTER=(element immortal necto nexto self)
+FOREIGN_CACHE="${CONSTRUCT_FOREIGN_CACHE:-$HOME/.cache/construct}"
+SCRATCH_LOG="${CONSTRUCT_SCRATCH_LOG:-checkpoints_scratch/train_remote.log}"
+WATCH_FOREIGN="${CONSTRUCT_WATCH_FOREIGN:-1}"
+current_period() {  # last auto-curriculum period in the synced remote log (the
+                    # trailing integer of the newest decision line); default 4.
+    local p
+    p=$(grep -a "auto-curriculum: winrate" "$SCRATCH_LOG" 2>/dev/null \
+        | tail -1 | grep -oE "[0-9]+" | tail -1)
+    echo "${p:-${CONSTRUCT_WATCH_PERIOD:-4}}"
+}
+
 # Status file for the Windows overlay (deploy/windows_stream_overlay.ps1)
 STATUS_FILE="${CONSTRUCT_STREAM_STATUS:-/mnt/c/Users/Elliot/AppData/Local/Construct/current_stream.txt}"
 announce() {  # $1 = label, $2 = ck path
@@ -63,11 +81,24 @@ while true; do
         esac
     fi
     if [ -n "$entity" ]; then
-        announce "LIVE $mode" "$entity"
+        # 1v1 + foreign enabled: rotate the opponent roster at the live period.
+        fargs=()
+        label="LIVE $mode"
+        if [ "$mode" = "1v1" ] && [ "$WATCH_FOREIGN" = "1" ]; then
+            fk="${FOREIGN_ROSTER[$((slot % ${#FOREIGN_ROSTER[@]}))]}"
+            P=$(current_period)
+            if [ "$fk" != "self" ] && [ -f "$FOREIGN_CACHE/${fk}_weights.npz" ]; then
+                fargs=(--foreign "$fk" --foreign-weights "$FOREIGN_CACHE/${fk}_weights.npz" --period "$P")
+                label="Blue=Construct  Orange=${fk}.p${P}"
+            else
+                label="self-play (both Construct)"
+            fi
+        fi
+        announce "$label" "$entity"
         if [ -n "$WATCH_CURRICULUM" ]; then
-            timeout "$ROTATE_SECS" "$PYTHON" scripts/watch.py "$entity" --mode "$mode" --curriculum "$WATCH_CURRICULUM"
+            timeout "$ROTATE_SECS" "$PYTHON" scripts/watch.py "$entity" --mode "$mode" --curriculum "$WATCH_CURRICULUM" "${fargs[@]}"
         else
-            timeout "$ROTATE_SECS" "$PYTHON" scripts/watch.py "$entity" --mode "$mode"
+            timeout "$ROTATE_SECS" "$PYTHON" scripts/watch.py "$entity" --mode "$mode" "${fargs[@]}"
         fi
     fi
     [ -z "$entity" ] && { echo "no live checkpoints yet, waiting..."; sleep 30; }
