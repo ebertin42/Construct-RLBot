@@ -22,7 +22,11 @@
 # a SEPARATE eval engine, so the training reward can be shaped while the curriculum
 # signal stays honest. This is the fix for the win-prob-gaming trap.
 schema_path = "schema/v1.toml"
-reward_config_path = "configs/reward_v0.toml"
+# reward_v0 + team_spirit (a no-op in 1v1, see the config's own proof): needed
+# because the run now trains some 2v2/3v3 arenas, where reward_v0's team_spirit=0
+# would pay every car only for its own touches and teach three bots to chase the
+# same ball. The gate/benches keep using reward_v0 as their untouched tape.
+reward_config_path = "configs/reward_v8_team.toml"
 curriculum_config_path = "configs/curriculum_v3_match.toml"
 
 [env]
@@ -30,7 +34,17 @@ num_arenas = 192
 blue = 1
 orange = 1
 seed = 0
-team_size_weights = [1.0, 0.0, 0.0]   # 1v1 (foreign opponents are 1v1-only)
+# 2026-07-25: a MODEST team share, so the policy keeps seeing teammates instead of
+# specialising into 1v1 and having to be re-taught later. Sized so the external
+# opponents are untouched: arenas are laid out in 1v1/2v2/3v3 blocks and foreign
+# opponents take the FRONT, so with 0.7*192 = 134 1v1 arenas the 77 foreign arenas
+# (opponent_frac 0.40) still all land on 1v1. Only SELF-PLAY arenas convert to team
+# play. Equal weights [1,1,1] would leave 64 1v1 arenas -- fewer than the 77 needed
+# -- and the engine hard-errors ("ported bots are 1v1-only"), because Immortal's
+# and Element's obs width is fixed to 1v1. Nexto's and Necto's obs builders ARE
+# team-size generic, so relaxing that guard per-kind is the route to real 2v2/3v3
+# opponents (and a 2v2 gate) later.
+team_size_weights = [0.7, 0.2, 0.1]
 
 [net]
 d_model = 128

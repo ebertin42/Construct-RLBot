@@ -1,0 +1,35 @@
+# reward_v0 + team-spirit credit sharing, for the run that trains mixed team sizes
+# (2026-07-25). Identical to reward_v0 in every 1v1 arena -- see the proof below --
+# so this changes ONLY what happens in a 2v2/3v3 arena.
+#
+# WHY: with team_spirit = 0 (reward_v0's default) every car in a team arena is paid
+# purely for its OWN touches and goals. There is no credit for passing, rotating or
+# holding position, so the predicted outcome of switching on team arenas is three
+# bots all chasing the same ball -- actively teaching a habit we would then have to
+# untrain. Credit sharing is the minimum needed for team arenas to be worth running.
+#
+# The blend (engine/src/episode.rs::blend_team_spirit) is
+#     r_i' = (1 - tau) * r_i + tau * mean(own team) - opp_spirit * mean(other team)
+# In a 1v1 arena each "team" is a single car, so mean(own team) == r_i and with
+# opp_spirit = 0 this collapses to r_i' = (1-tau)*r_i + tau*r_i == r_i.
+#
+# In REAL arithmetic that is exactly r_i; in float32 it is not quite. Measured
+# (2026-07-25, two `setarch -R` processes, 1v1, seed 7): identical to within
+# 3.7e-09 max absolute difference, i.e. last-bit rounding of 0.7*r + 0.3*r, not a
+# behavioural change. That is ~9 orders of magnitude below the goal reward, so goal
+# detection (GOAL_THRESHOLD 9.4 vs a 10.0 payout) and every learning signal are
+# unaffected. Do NOT describe this file as byte-identical to reward_v0.
+#
+# The gate, the 1v1 benches and the auto-curriculum eval all keep pointing at
+# reward_v0.toml anyway, so their neutral scoring tape is untouched by definition.
+#
+# tau = 0.3 is a deliberately mild start: enough to pay for helping a teammate,
+# not enough to drown out a car's own contribution while the policy has never seen
+# a teammate before. Raise it once team arenas are measurable (a 2v2 gate).
+goal = 10.0          # +goal for scoring team, -goal for conceding team
+touch = 0.5          # flat, on new ball contact
+vel_to_ball = 0.05   # max(0, dot(vel, unit(ball-car))) / 2300, in [0,1]
+
+team_spirit = 0.3    # share 30% of reward with teammates (no-op in 1v1)
+opp_spirit = 0.0     # keep the opponent term off: it would make the reward
+                     # non-zero-sum in a way the win-rate signal does not expect
