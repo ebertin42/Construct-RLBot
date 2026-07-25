@@ -29,8 +29,46 @@ perturb_null.py (null controls measured with that exact net), scripts/bench_ladd
 (logs/opponent_ladder.tsv is champion-referenced). Those are pinned instruments;
 repointing them would silently invalidate published numbers.
 
+TEAM SIZES (--mode 1|2|3). This gate is NET vs NET (Engine.set_opponents), and
+that is precisely why team gating is possible here and nowhere else: our entity
+net is team-size agnostic, while bench_foreign / bench_ladder / version_ladder /
+bot_tournament are structurally 1v1 because the ported bots' obs width is fixed
+at one other car and the engine refuses them above 1v1
+(engine/src/engine.rs:319-325). Four things to know before reading a team number:
+
+  * n DOES NOT GROW WITH m. Matches per side order are arenas * floor(steps/4500)
+    at every team size, so 2v2 buys no extra samples -- only ~1.5x (m=2) to ~2x
+    (m=3) more wall clock for the same SE.
+  * SHORT RECORDS ARE CENSUSED AND REPORTED, at every mode -- 1v1 is not immune.
+    A contained physics blowup (engine/src/episode.rs:779-807) terminates the
+    arena and rebuilds it, so a record closes tens of steps into a match instead
+    of at 4500. It is NOT a 0-0 draw, and treating it as one is how this census
+    was wrong before: the blowup branch zeroes only THAT STEP's reward and
+    returns before the `if terminated { ... start_match() }` block, so nothing
+    resets the score -- split_matches' accumulators still hold every goal scored
+    earlier in the match, and a blowup after 2-1 emits a WIN (seen live: a real
+    m=2 tape returned a short record of (0,1), a loss). The contamination
+    therefore has no known sign, and a short record enters n as if it were a
+    completed match, so se = sqrt(0.25/n) is quoted on a count of RECORDS rather
+    than of matches -- which is why n_full is printed beside n. Rates measured:
+    0-1.6% at m=1 and 3-22% at m=2/3 on 32 arenas x 9000 steps -- but 29% (m=1)
+    and 62% (m=2) on a 4-arena run on a LOADED box, so the rate is a property of
+    the run, not of the team size, and is not reproducible for a fixed seed.
+    They are counted, never filtered: filtering would also move the 1v1 numbers
+    and break comparability with every published gate result. Read a heavy
+    census as "re-run on an idle box", never as a close call to correct for.
+  * PROMOTION IS REFUSED ABOVE 1v1, at argparse time (see main).
+  * DETERMINISM DOES NOT HOLD ABOVE 1v1. Arenas with 2+ cars per team are not
+    bit-reproducible across independently constructed engines even at a fixed
+    seed: RocketSim's ResetToRandomKickoff groups same-team cars by iterating a
+    std::unordered_set<Car*>, so kickoff slot assignment follows heap addresses
+    (tests/python/test_team_curriculum.py:28-50). 1v1 has no grouping ambiguity
+    and stays reproducible. At --mode 2/3 a fixed --seed is a SAMPLE, not a
+    fingerprint -- do not quote two team runs at one seed as a repeat measurement.
+
     matchwin_gate.py <candidate.pt> [--champion <ck>] [--arenas 32]
-        [--steps 45000] [--seed 11] [--threshold 0.55] [--promote-if-pass]
+        [--steps 45000] [--seed 11] [--threshold 0.55] [--mode 1]
+        [--promote-if-pass]
 """
 from __future__ import annotations
 
@@ -42,6 +80,22 @@ from pathlib import Path
 # Seeded champion, used only if configs/champion.toml is unreadable.
 FALLBACK_CHAMPION = "checkpoints_entity/ck_000320471040.pt"
 CHAMPION_CONFIG = "configs/champion.toml"
+
+# A full match is 300s at 120Hz with tick_skip 8 -> MAX_TICKS/tick_skip
+# (engine/src/episode.rs:21). Any record shorter than this did not end on the
+# clock; the only other producer of `terminated` is the contained-blowup path,
+# which rebuilds the arena but does NOT reset the match score or restart the
+# match clock (it returns before start_match()), so the record it closes carries
+# the partial score rather than 0-0. Used for the census, never as a filter.
+FULL_MATCH_STEPS = 4500
+
+# The null is a property of a POLICY and a REGIME, so it cannot be borrowed
+# across team sizes. Measured only at 1v1: champion self-play, 20 seeds x ~320
+# matches (journal 2026-07-21). 2v2/3v3 are deliberately absent rather than
+# guessed -- printing the 1v1 null next to a 2v2 share would launder an
+# uncalibrated verdict. Run scripts/match_gate_null.py --mode M --both-orders
+# to fill one in.
+NULL_BY_MODE = {1: (0.502, 0.024)}
 
 
 def _repo_root():
@@ -111,10 +165,12 @@ def _ck_provenance(ck):
 
 
 def flip_to_candidate(matches):
-    """Order 2 plays the CHAMPION in the learner row, so its (goals_a, goals_b)
-    are (champion, candidate). Swap each pair so every match record is from the
-    CANDIDATE's perspective before the two orders are summed. Getting this
-    backwards silently inverts the verdict."""
+    """Order 2 plays the CHAMPION in the learner rows (the whole blue team, at
+    any team size), so its (goals_a, goals_b) are (champion, candidate). Swap
+    each pair so every match record is from the CANDIDATE's perspective before
+    the two orders are summed. Getting this backwards silently inverts the
+    verdict. Team-size free: split_matches has already reduced each arena's m
+    cars to one record per match."""
     return [(b, a) for (a, b) in matches]
 
 
@@ -137,14 +193,90 @@ def aggregate(order1_wdl, order2_wdl, threshold):
             "verdict": "PASS" if share >= threshold else "FAIL"}
 
 
-def _play_order(champion_sd, candidate_sd, arenas, seed, steps, as_candidate_weights):
-    """One side order. Returns (cand_wins, draws, cand_losses) over the matches
-    played this order. `as_candidate_weights` True => candidate drives the
-    learner row (its goals are the +spikes); False => champion does, and we
-    flip the sign so the record is always from the CANDIDATE's perspective."""
+def _short_record_line(r):
+    """The blowup census, printed at EVERY mode -- 1v1 is NOT immune. A raw
+    data-quality flag on the run, deliberately with NO correction attached.
+
+    A contained physics blowup (engine/src/episode.rs:779-807) terminates every
+    car in the arena and rebuilds it, so split_matches closes a record tens of
+    steps into a match instead of at 4500.
+
+    WHAT A SHORT RECORD IS NOT: a 0-0 draw. This census used to say it was, and
+    concluded from that "contamination is all draws, so it pulls the share toward
+    0.5 and can never cause a false promotion". episode.rs says otherwise. The
+    blowup branch sets `rewards[a] = 0.0` for the CURRENT STEP only and then
+    `return`s -- before the `if terminated || truncated { ... start_match() }`
+    block -- so score_blue/score_orange are never reset, and, what actually
+    matters here, split_matches' own Python-side accumulators still hold every
+    goal scored earlier in that match (in match mode a goal does NOT terminate,
+    so nothing has flushed them). The emitted record is the partial match's real
+    score: a blowup at 2-1 emits (2,1), a WIN. Nor is this a corner case -- the
+    blowup this containment is named for is the mirrored-KICKOFF pinch, and in
+    match mode a kickoff follows every goal, so blowups concentrate precisely
+    where goals have already accumulated.
+
+    Measured, not argued: real champion-self-play tapes (4 arenas, m=2) returned
+    short records (0,0)@10 steps, (0,0)@22 and (0,1)@90 -- two draws and a LOSS.
+    One decided result is all it takes; "all draws" was never true.
+
+    Two consequences, and neither has a sign we can claim:
+      * the contaminating records are ordinary wins/draws/losses drawn from a
+        DIFFERENT (truncated-match) distribution, so the direction of the bias is
+        unknown, not "toward 0.5";
+      * a short record is a match that never finished, yet it enters n as if it
+        had, so se = sqrt(0.25/n) is quoted on a denominator that is a count of
+        RECORDS rather than of completed matches. (Whether the total yield also
+        grows depends on where the shifted boundary lands: on that same tape,
+        with --steps a whole number of matches, each short record DISPLACED a
+        full one and the yield stayed at nominal.)
+    Hence n_full is printed next to n, and a heavy census means RE-RUN ON AN IDLE
+    BOX -- never "close call, correct for it".
+
+    Durations are a census key, not a measurement of how much match was lost:
+    rebuild_arena restarts the fresh arena's tick_count at 0 while
+    match_start_tick keeps its old value, so after the FIRST match the
+    `cur.tick_count - self.match_start_tick` at episode.rs:852 underflows (u64)
+    and the next step terminates immediately. Pre-existing engine behaviour,
+    outside this gate, but it is why a duration is only ever read as
+    "< FULL_MATCH_STEPS" here and never as a quantity.
+
+    THE RATE IS NOT A CONSTANT AND NOT REPRODUCIBLE. 0-1.6% at m=1 and 3-22% at
+    m=2/3 on 32 arenas x 9000 steps; 29% (m=1) and 62% (m=2) on a 4-arena x
+    9000-step run on a LOADED box; 0%/37.5%/12.5% at m=1/2/3 on 4 arenas x 9000
+    on an idle one; and 0% over 16 arenas x 45000 at m=2. So: never budget
+    against a remembered figure -- census every run.
+    """
+    n, short = r.get("records") or 0, r.get("short_records") or 0
+    if not n:
+        return "  short records: n/a (no records)"
+    frac = short / n
+    line = (f"  short records: {short}/{n} ({frac * 100:.1f}%)  n_full={n - short}"
+            f"  [duration < {FULL_MATCH_STEPS} steps = contained physics blowups; "
+            f"each carries the match's PARTIAL score, not 0-0]")
+    if frac > 0.02:
+        # No magnitude, no direction: both would be inventions. What IS known is
+        # that these records came from truncated matches and that n counts them
+        # as though they were completed ones.
+        line += ("\n    heavy census: the verdict is contaminated by an unknown "
+                 "amount in an unknown direction, and se is understated because "
+                 "n counts short records -- re-run on an idle box")
+    return line
+
+
+def _play_order(champion_sd, candidate_sd, arenas, seed, steps, as_candidate_weights,
+                mode=1):
+    """One side order. Returns ((cand_wins, draws, cand_losses), census) over the
+    matches played this order. `as_candidate_weights` True => candidate drives the
+    learner rows (its goals are the +spikes); False => champion does, and we
+    flip the sign so the record is always from the CANDIDATE's perspective.
+
+    The W/D/L stays a plain 3-tuple so aggregate()'s pinned contract is untouched;
+    the census rides alongside rather than inside it."""
+    import numpy as np                                       # noqa: PLC0415
+
     from construct.league.matches import MatchRunner, match_record, split_matches
 
-    mr = MatchRunner(num_arenas=arenas, seed=seed, mode=1, schema_version=1,
+    mr = MatchRunner(num_arenas=arenas, seed=seed, mode=mode, schema_version=1,
                      net_heads=4, reward_config="configs/reward_v0.toml",
                      curriculum_config="configs/curriculum_v3_match.toml")
     if as_candidate_weights:
@@ -154,22 +286,42 @@ def _play_order(champion_sd, candidate_sd, arenas, seed, steps, as_candidate_wei
         mr.eng.set_weights(champion_sd)
         mr.eng.set_opponents([candidate_sd])
     out = mr.eng.collect(steps, arena_opponents=mr.assignment)
-    matches = split_matches(out["rewards"], out["terminated"])
+    rew = np.asarray(out["rewards"])
+    # mr.assignment is all-zeros (a native league opponent), so EVERY arena
+    # contributes exactly `mode` learner columns and arena k owns
+    # [k*mode, (k+1)*mode). One self-play (-1) arena would be 2*mode wide and
+    # split_matches' reshape would silently mis-group every arena after it --
+    # and divisibility alone does NOT catch that (31*2 + 4 = 66 is still even).
+    # This equality does.
+    assert rew.shape[1] == arenas * mode, (
+        f"expected {arenas * mode} learner columns, got {rew.shape[1]}")
+    matches, durations = split_matches(out["rewards"], out["terminated"],
+                                       team_size=mode, with_durations=True)
     if not as_candidate_weights:
         matches = flip_to_candidate(matches)
     rec = match_record(matches)
-    return rec["wins"], rec["draws"], rec["losses"]
+    # Short records are matches cut off by a contained physics blowup, and they
+    # keep whatever score had accumulated (see _short_record_line). Counted,
+    # never dropped: a filter would also change the 1v1 numbers every published
+    # gate result sits on.
+    census = {"records": len(durations),
+              "short": sum(1 for d in durations if d < FULL_MATCH_STEPS)}
+    return (rec["wins"], rec["draws"], rec["losses"]), census
 
 
-def gate(candidate, champion, arenas, steps, seed, threshold):
+def gate(candidate, champion, arenas, steps, seed, threshold, mode=1):
     from construct.league.matches import load_sd
 
     champ_sd = load_sd(champion)
     cand_sd = load_sd(candidate)
-    o1 = _play_order(champ_sd, cand_sd, arenas, seed, steps, True)
-    o2 = _play_order(champ_sd, cand_sd, arenas, seed + 1000, steps, False)
+    o1, c1 = _play_order(champ_sd, cand_sd, arenas, seed, steps, True, mode=mode)
+    o2, c2 = _play_order(champ_sd, cand_sd, arenas, seed + 1000, steps, False,
+                         mode=mode)
     r = aggregate(o1, o2, threshold)
     r["order1"], r["order2"] = o1, o2
+    r["records"] = c1["records"] + c2["records"]
+    r["short_records"] = c1["short"] + c2["short"]
+    r["short_frac"] = (r["short_records"] / r["records"]) if r["records"] else None
     return r
 
 
@@ -182,19 +334,46 @@ def main(argv=None):
     ap.add_argument("--arenas", type=int, default=32)
     ap.add_argument("--steps", type=int, default=45000)
     ap.add_argument("--seed", type=int, default=11)
+    # The threshold does NOT move with team size. Measured z for 0.55 on the
+    # n=640 two-order statistic is 2.80 / 2.75 / 2.84 at m=1/2/3 -- n is
+    # team-size independent and only the draw rate shifts (0.155 -> 0.205), so
+    # forcing the operator to retype a threshold at m>1 would fragment the
+    # history file's scale for no statistical gain. What IS mode-aware is the
+    # printed null (NULL_BY_MODE), which refuses to quote the 1v1 number.
     ap.add_argument("--threshold", type=float, default=0.55)
+    ap.add_argument("--mode", type=int, choices=(1, 2, 3), default=1,
+                    help="team size per side (1=1v1, 2=2v2, 3=3v3). NET vs NET "
+                         "only -- ported foreign bots are refused above 1v1 by "
+                         "the engine (engine/src/engine.rs:319-325). Default 1 "
+                         "keeps every existing invocation unchanged.")
     ap.add_argument("--promote-if-pass", action="store_true",
                     help="on PASS, move configs/champion.toml's champion_ck to the "
-                         "candidate (atomic). Opt-in on purpose.")
+                         "candidate (atomic). Opt-in on purpose. 1v1 only.")
     ap.add_argument("--champion-config", default=None,
                     help="override configs/champion.toml (tests)")
     args = ap.parse_args(argv)
+    # Refused HERE, not after the run: at --mode 2 the gate is 20-30 minutes of
+    # engine time, and finding out afterwards that the result cannot promote is
+    # the expensive way to learn it.
+    if args.promote_if_pass and args.mode != 1:
+        ap.error("--promote-if-pass is 1v1-only. configs/champion.toml's "
+                 "champion_ck feeds the KL anchor, the league pool seed and the "
+                 "deploy candidate, all measured in the 1v1 regime, and "
+                 "league/registry_champions.jsonl has no team-size field -- a "
+                 "2v2-gated net would silently become a 1v1 training opponent. "
+                 "The team gate also measures a DIFFERENT quantity: the champion "
+                 "scores 7.1 goals/match at 1v1 and 4.5 at 3v3, and has never had "
+                 "a teammate, so 3v3 is out-of-distribution for it. "
+                 "Re-run at --mode 1 to promote.")
     if args.champion is None:
         args.champion = resolve_champion(args.champion_config)
 
     r = gate(args.candidate, args.champion, args.arenas, args.steps, args.seed,
-             args.threshold)
-    print(f"candidate {args.candidate} vs champion {args.champion}")
+             args.threshold, mode=args.mode)
+    # Mode in the header so a pasted terminal block is self-identifying -- a 2v2
+    # share read as the 1v1 ruler is the hazard this whole flag introduces.
+    print(f"candidate {args.candidate} vs champion {args.champion}  "
+          f"[{args.mode}v{args.mode}]")
     if r["share"] is None:
         print(f"  {r['reason']} -> {r['verdict']}")
         return 1
@@ -202,8 +381,12 @@ def main(argv=None):
     print(f"  order2 (swapped)      W/D/L: {r['order2']}")
     print(f"  TOTAL {r['wins']}W/{r['draws']}D/{r['losses']}L  n={r['n']}  "
           f"win_share={r['share']:.4f} +/- {r['se']:.4f}")
-    print(f"  verdict: {r['verdict']}  (threshold {r['threshold']:.3f}; "
-          f"null mean 0.502 sd 0.024)")
+    print(_short_record_line(r))
+    null = NULL_BY_MODE.get(args.mode)
+    ann = (f"null mean {null[0]:.3f} sd {null[1]:.3f}" if null else
+           f"null UNMEASURED at {args.mode}v{args.mode} -- run "
+           f"scripts/match_gate_null.py --mode {args.mode} --both-orders")
+    print(f"  verdict: {r['verdict']}  (threshold {r['threshold']:.3f}; {ann})")
     r["promoted"] = False
     if args.promote_if_pass and r["verdict"] == "PASS":
         try:
@@ -221,7 +404,15 @@ def main(argv=None):
 def _append_history(args, r):
     """One JSON line per gate to logs/matchwin_history.jsonl, so the dashboard's
     gate panel can show the absolute ruler over time instead of the number living
-    only in whatever terminal ran it. Never fail the gate over bookkeeping."""
+    only in whatever terminal ran it. Never fail the gate over bookkeeping.
+
+    ONE FILE, no backfill. Every mode goes in the same log because the threshold
+    is the same at every team size, so the rows are on one scale; and rewriting
+    already-published rows to add `mode` is worse than normalising on read.
+    Readers treat a missing `mode` as 1 (scripts/dashboard.py::parse_gate_history).
+    `records`/`short_records` are what let a reader tell a blowup-contaminated
+    run from a genuinely close one after the fact.
+    """
     import json
     import time
     from pathlib import Path
@@ -233,6 +424,8 @@ def _append_history(args, r):
         "passed": r["verdict"] == "PASS",
         "promoted": bool(r.get("promoted")),
         "arenas": args.arenas, "steps": args.steps, "seed": args.seed,
+        "mode": args.mode,
+        "records": r.get("records"), "short_records": r.get("short_records"),
     }
     try:
         p = Path(__file__).resolve().parent.parent / "logs" / "matchwin_history.jsonl"

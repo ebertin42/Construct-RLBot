@@ -20,6 +20,16 @@ from construct._engine import Engine
 # by up to +0.55 (touch 0.5 + vel_to_ball 0.05), so a concede row can be as small
 # as -9.45 in magnitude. Non-goal rows never exceed |0.55|. 9.4 sits safely
 # inside the [0.55, 9.45] gap on both sides.
+#
+# 9.4 SURVIVES AT 2v2/3v3 UNCHANGED, and that is a property of the reward config,
+# not of the team size: matches force reward_v0, whose team_spirit/opp_spirit are
+# 0.0 (engine/src/reward.rs:267,393, asserted by the Rust test at :572), so nothing
+# blends across teammates on the scoring tape and EVERY car of the scoring team
+# gets a raw +/-10 row. THE TRAP, by name: configs/reward_v8_team.toml:33 sets
+# team_spirit = 0.3, which turns a lone scorer's spike into 0.7*10 + 0.3*(10/m)
+# = 8.0 at m=2 -- BELOW this bar, so goals would silently vanish from the tape.
+# The gate must never be repointed at a blended reward; _all_or_nothing() below is
+# the detector if someone tries.
 GOAL_THRESHOLD = 9.4
 
 _SCHEMA_PATHS = {0: "schema/v0.toml", 1: "schema/v1.toml"}
@@ -38,6 +48,11 @@ def _engine_kwargs(num_arenas, seed, reward_config, mode, schema_version, net_he
     default (None) omits the `curriculum_config_path` key entirely rather
     than passing None, so legacy single-goal-boundary matches (the existing
     goal-share gate) stay byte-for-byte unchanged.
+
+    `mode` is the team size per side and goes straight into blue=/orange=, so
+    mode=2 builds 2v2 arenas and mode=3 builds 3v3. No code change was needed
+    for team matches here -- the fix lives in the per-arena reduction in
+    MatchRunner.play / split_matches, not in engine construction.
     """
     engine_kwargs = dict(
         num_arenas=num_arenas, blue=mode, orange=mode,
@@ -66,17 +81,36 @@ def load_sd(ck_path):
 class MatchRunner:
     def __init__(self, num_arenas=8, seed=0, reward_config="configs/reward_v0.toml", mode=1,
                  schema_version=0, net_heads=4, curriculum_config=None):
-        # Goal events pay every learner agent on the scoring team in that arena.
-        # At mode=1 (1v1) each opponent arena has exactly one learner row (blue),
-        # so the GOAL_THRESHOLD count below is exact. 2v2+ would multi-count (both
-        # teammates get paid the same goal reward) -- divide by team size when that
-        # arrives. YAGNI today: assert mode==1 until then.
-        assert mode == 1, "MatchRunner only supports 1v1 (mode=1); 2v2+ would multi-count goals"
+        # Goal events pay EVERY learner agent on the scoring team in that arena at
+        # the same step, so a raw `(rew >= GOAL_THRESHOLD).sum()` over the whole
+        # tape counts one 2v2 goal twice and one 3v3 goal three times. That is why
+        # mode>1 used to be refused. It is now handled instead of forbidden: every
+        # league-opponent arena contributes exactly `mode` learner columns, laid
+        # out contiguously (arena k owns [k*mode, (k+1)*mode) -- measured live at
+        # m=2: goal-step column groups [6,7],[4,5],[0,1]; at m=3: [6,7,8],[3,4,5]),
+        # so reducing per (step, arena) BEFORE summing counts each goal exactly
+        # once. See play() and split_matches().
+        #
+        # The uniform column width is a PRECONDITION, not a fact of the engine:
+        # self.assignment below is all-zeros (a native league opponent), and only
+        # that makes every arena `mode` wide. A single self-play (-1) arena
+        # contributes blue+orange = 2*mode learner rows instead
+        # (engine/src/engine.rs:1408-1410), which would slide every later arena's
+        # columns and silently mis-group the reshape. Callers that build their own
+        # assignment must assert ncol == num_arenas * mode (see
+        # scripts/matchwin_gate.py::_play_order).
+        assert mode in (1, 2, 3), f"MatchRunner mode must be 1, 2 or 3 (got {mode})"
         assert schema_version in _SCHEMA_PATHS, (
             f"MatchRunner schema_version must be one of {sorted(_SCHEMA_PATHS)}, "
             f"got {schema_version}"
         )
         self.schema_version = schema_version
+        # Both consumed downstream: play() needs `mode` for the per-arena reshape,
+        # and `num_arenas` lets a caller assert the exact learner-column count
+        # (divisibility alone is NOT enough -- 31 arenas at m=2 plus one self-play
+        # arena is 31*2 + 4 = 66 columns, still even, still mis-grouped).
+        self.mode = mode
+        self.num_arenas = num_arenas
         # curriculum_config is None by default: omitting curriculum_config_path
         # entirely (not passing it as None) keeps legacy construction -- and
         # therefore the existing goal-share gate's per-goal boundaries --
@@ -102,8 +136,19 @@ class MatchRunner:
         self.eng.set_opponents([sd_b])
         out = self.eng.collect(steps, arena_opponents=self.assignment)
         rew = np.asarray(out["rewards"])
-        goals_a = int((rew >= GOAL_THRESHOLD).sum())
-        goals_b = int((rew <= -GOAL_THRESHOLD).sum())
+        # One goal pays all `mode` cars of the scoring team on the same step, so
+        # reduce per (step, arena) BEFORE summing or both counts come out m-times
+        # inflated. The RATIO survives that inflation, which is exactly why it
+        # would have gone unnoticed: an h2h goal share would look fine while the
+        # absolute totals were wrong -- and those totals feed champion_gate's
+        # min_total_goals sample-size guard (m x easier to satisfy), gate_stats'
+        # Wilson n, and the goal counts written to logs/h2h_history.jsonl.
+        # At mode=1 reshape(T, -1, 1).any(axis=2) is the identity, so this is
+        # arithmetically the old `(rew >= TH).sum()` -- including for a 1-D tape,
+        # which reshape(T, -1, 1) absorbs the same way the old .sum() did.
+        by_arena = rew.reshape(rew.shape[0], -1, self.mode)
+        goals_a = int((by_arena >= GOAL_THRESHOLD).any(axis=2).sum())
+        goals_b = int((by_arena <= -GOAL_THRESHOLD).any(axis=2).sum())
         return goals_a, goals_b
 
 
@@ -133,7 +178,28 @@ def play_entries(mr: "MatchRunner", entry_a: dict, entry_b: dict, steps: int = 2
     return mr.play(load_sd(entry_a["ck"]), load_sd(entry_b["ck"]), steps=steps)
 
 
-def split_matches(rewards, terminated, threshold=GOAL_THRESHOLD):
+def _all_or_nothing(mask, team_size):
+    """True iff, in every arena, all `team_size` cars agree.
+
+    A goal pays EVERY car on the scoring team at the same step, and reward_v0
+    does not blend (team_spirit 0.0), so a group is all-fired or none-fired --
+    verified live at m=1,2,3 (per-column blue-goal totals [87,87] and
+    [53,53,53] within an arena). A PARTIAL group means the tape is not a clean
+    scoring tape; the known cause is a team-spirit-blended reward config
+    (reward_v8_team, tau=0.3 -> a lone scorer's spike drops to 8.0, under
+    GOAL_THRESHOLD). Refusing there is the whole point: a blended tape would
+    still produce plausible-looking win shares, just silently missing goals.
+
+    This is the reason the per-arena reduction is `any` rather than `sum // m`.
+    Both are exact while the assumption holds; only `any` leaves a place to
+    check that it still does.
+    """
+    k = mask.sum(axis=1)
+    return bool(((k == 0) | (k == team_size)).all())
+
+
+def split_matches(rewards, terminated, threshold=GOAL_THRESHOLD, team_size=1,
+                  with_durations=False):
     """Group a reward tape into per-match (goals_a, goals_b) using terminated
     flags as match boundaries.
 
@@ -142,32 +208,115 @@ def split_matches(rewards, terminated, threshold=GOAL_THRESHOLD):
     always run reward_v0 as a neutral scoring tape (see module doc), so this
     holds whatever the policies trained on.
 
-    Records are PER ARENA: each arena plays its own sequence of matches, and a
+    Records are PER ARENA, *NOT* per column -- the distinction is invisible at
+    1v1, where an arena is exactly one learner column, and is the whole content
+    of the team-size fix. Each arena plays its own sequence of matches, and a
     300s clock makes all arenas terminate on the same step, so a naive
     `terminated.any()` + arena-summed count would collapse all N arenas' goals
     into ONE record -- N-fold fewer samples, and an aggregate-goal comparison
     rather than the per-match W/D/L we want. Accumulate and emit per arena.
 
+    `team_size` (m) is how many learner columns one arena owns. At m>1 the old
+    per-column code was wrong TWICE: it counted every goal m times (all m
+    teammates get paid) AND emitted m duplicate records per arena. The duplicate
+    records each carried the CORRECT score, so `win_share` was unbiased and the
+    bug was invisible in the headline number -- but n was m x too large, so every
+    SE and CI derived from it was understated by sqrt(m). That is what
+    test_se_matches_binomial_at_half exists to protect.
+
+    Match YIELD is team-size independent: n_matches = arenas * floor(steps/4500)
+    per side order at every m (measured: 64 records at m=1, 2 and 3 for 32 arenas
+    x 9000 steps). Team size therefore buys no extra samples -- aggregate()'s se
+    does not move with m, only wall clock does (x1.49 at m=2, x1.96 at m=3).
+
+    Column layout is arena-major / car-minor: arena k owns columns
+    [k*m, (k+1)*m), so a plain reshape IS the grouping. GUARD LIMIT: the
+    `ncol % team_size` check below is NECESSARY BUT NOT SUFFICIENT -- 31 arenas
+    at m=2 plus one self-play (-1) arena gives 31*2 + 4 = 66 columns, still
+    divisible by 2 and still mis-grouped. The sufficient check is
+    `ncol == num_arenas * team_size` and it belongs at the call site, where
+    num_arenas is known (scripts/matchwin_gate.py::_play_order does it).
+
     A trailing partial match is DISCARDED: it has no outcome, and scoring it as
     a draw would bias every gate toward 0.5.
+
+    `with_durations=True` additionally returns per-record durations in steps,
+    aligned one-to-one with the records BY CONSTRUCTION (same loop, same append)
+    rather than by two loops kept in lockstep. Durations are how the caller
+    censuses contained physics blowups: engine/src/episode.rs:779-807 sets
+    terminated on every car of a blown-up arena and rebuilds it, so a record
+    closes tens of steps into a match instead of at 4500.
+
+    A short record is NOT a 0-0 draw, and the accumulators below are the reason.
+    The blowup branch zeroes only the CURRENT step's reward and returns before
+    the engine's `start_match()`, and in match mode a goal never terminates, so
+    `a`/`b` still hold every goal scored earlier in that match when the
+    terminated flag arrives. What gets emitted is the partial match's real score
+    -- a blowup at 2-1 emits (2,1). Callers must treat short records as
+    unsigned contamination (scripts/matchwin_gate.py::_short_record_line), not as
+    draws that conveniently pull toward 0.5.
+
+    The default return type is unchanged (a plain list of 2-tuples) because
+    flip_to_candidate and match_record both destructure 2-tuples.
     """
     rewards = np.asarray(rewards)
     terminated = np.asarray(terminated)
     if rewards.ndim == 1:            # a single-arena tape may arrive as (T,)
+        # A (T,) tape is unambiguous only at 1v1. At m>1 it could be one m-car
+        # arena or m single-car arenas and nothing in the array distinguishes
+        # them -- refuse rather than guess.
+        if team_size != 1:
+            raise ValueError("a 1-D reward tape is ambiguous at team_size > 1")
         rewards = rewards[:, None]
         terminated = terminated[:, None]
-    T, n = rewards.shape
-    out = []
-    a = np.zeros(n, dtype=int)       # per-ARENA accumulators -- NOT summed
+    T, ncol = rewards.shape
+    if ncol % team_size:
+        raise ValueError(
+            f"{ncol} learner columns is not a whole number of {team_size}-car "
+            f"arenas -- the engine's team size disagrees with team_size={team_size}"
+        )
+    n = ncol // team_size
+    out, durations = [], []
+    a = np.zeros(n, dtype=int)       # per-ARENA accumulators -- NOT per column
     b = np.zeros(n, dtype=int)
+    start = np.zeros(n, dtype=int)
     for t in range(T):
-        a += (rewards[t] >= threshold).astype(int)
-        b += (rewards[t] <= -threshold).astype(int)
-        for arena in np.nonzero(terminated[t])[0]:
+        # arena-major, car-minor, so reshape alone is the right gather: engine.rs
+        # builds learner_idx by walking arenas in order, and the multi-thread
+        # merge preserves it because workers own contiguous arena ranges.
+        sa = (rewards[t] >= threshold).reshape(n, team_size)
+        sb = (rewards[t] <= -threshold).reshape(n, team_size)
+        ends = terminated[t].reshape(n, team_size)
+        if team_size != 1:
+            # Vacuous at m=1 (a group of one is always all-or-nothing), so it is
+            # skipped there. The reshape+any that replaced the flat compare does
+            # cost something -- measured 0.16s -> 0.43s over a real 45000x32 gate
+            # tape -- but that is 0.3s against ~10 min of engine time per side
+            # order, and it buys one implementation instead of two.
+            for m_, what in ((sa, "blue goal"), (sb, "orange goal"), (ends, "terminated")):
+                if not _all_or_nothing(m_, team_size):
+                    raise ValueError(
+                        f"{what} fired for only SOME cars of an arena at step {t}; "
+                        f"the tape is not an unblended reward_v0 scoring tape"
+                    )
+        # .any(axis=1) over a width-1 group is the identity map on booleans, so
+        # m=1 goes through literally the old expression with no float arithmetic
+        # reordered; .astype(int) is kept verbatim so the accumulator dtype and
+        # the add are the old ones too.
+        a += sa.any(axis=1).astype(int)
+        b += sb.any(axis=1).astype(int)
+        # `any`, not `all`: the two differ only once the all-or-nothing
+        # assumption is already broken, and LOSING a boundary desynchronises that
+        # arena from the 4500-step grid for the rest of the tape. Failing toward
+        # "keep the boundary" is the recoverable direction; the check above is
+        # what reports the anomaly rather than the split absorbing it silently.
+        for arena in np.nonzero(ends.any(axis=1))[0]:
             out.append((int(a[arena]), int(b[arena])))
+            durations.append(t + 1 - int(start[arena]))
             a[arena] = 0
             b[arena] = 0
-    return out
+            start[arena] = t + 1
+    return (out, durations) if with_durations else out
 
 
 def match_record(matches):

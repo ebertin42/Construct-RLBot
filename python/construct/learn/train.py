@@ -415,6 +415,15 @@ class Trainer:
         term = _np.asarray(out["terminated"])
         wrs: list[float | None] = []
         for s in range(slots):
+            # WARNING: this uses ARENA indices as COLUMN indices, which is only
+            # true because the eval engine is blue=1 (one learner column per
+            # arena). It is latent-safe today because foreign arenas above 1v1
+            # are refused outright (engine/src/engine.rs:319-325), so this eval
+            # can never be built at m>1. If that ever changes, each slot would be
+            # handed some OTHER slot's arenas' columns -- a mis-attribution, not
+            # a mis-scaling, silently mis-tuning every bot's decision period.
+            # The fix would be the same reshape split_matches now does:
+            # rew.reshape(T, arenas, m) and select whole arenas.
             cols = [i for i, k in enumerate(assign) if k == -(s) - 2]
             rec = match_record(split_matches(rew[:, cols], term[:, cols]))
             n = rec["wins"] + rec["draws"] + rec["losses"]

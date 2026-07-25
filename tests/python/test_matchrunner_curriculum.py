@@ -10,6 +10,7 @@ engine build is a separate step (G2, tracked elsewhere). `_engine_kwargs` is
 extracted out of MatchRunner.__init__ specifically so this can be verified
 without ever touching construct._engine.Engine.
 """
+import inspect
 import sys
 from pathlib import Path
 
@@ -59,6 +60,72 @@ def test_engine_kwargs_unchanged_fields_v0_no_net_heads():
         "schema_path": "schema/v0.toml", "reward_config_path": "configs/reward_v0.toml",
         "seed": 7, "curriculum_config_path": "configs/curriculum_v3_match.toml",
     }
+
+
+def test_engine_kwargs_mode_2_builds_2v2_arenas():
+    # The team-gate path: mode is the per-side team size and goes straight into
+    # blue=/orange=. Asserted as a FULL dict so an accidental extra kwarg (which
+    # would change engine construction) cannot slip through.
+    kw = _engine_kwargs(
+        num_arenas=4, seed=7, reward_config="configs/reward_v0.toml",
+        mode=2, schema_version=1, net_heads=4,
+        curriculum_config="configs/curriculum_v3_match.toml",
+    )
+    assert kw == {
+        "num_arenas": 4, "blue": 2, "orange": 2,
+        "schema_path": "schema/v1.toml", "reward_config_path": "configs/reward_v0.toml",
+        "seed": 7, "net_heads": 4,
+        "curriculum_config_path": "configs/curriculum_v3_match.toml",
+    }
+
+
+def test_engine_kwargs_mode_1_is_byte_identical():
+    # The strongest guard that adding 2v2/3v3 support did not disturb 1v1
+    # construction: full-dict equality at mode=1, unchanged from before the
+    # team gate existed. Every published gate number was measured through this.
+    kw = _engine_kwargs(
+        num_arenas=4, seed=7, reward_config="configs/reward_v0.toml",
+        mode=1, schema_version=1, net_heads=4,
+        curriculum_config="configs/curriculum_v3_match.toml",
+    )
+    assert kw == {
+        "num_arenas": 4, "blue": 1, "orange": 1,
+        "schema_path": "schema/v1.toml", "reward_config_path": "configs/reward_v0.toml",
+        "seed": 7, "net_heads": 4,
+        "curriculum_config_path": "configs/curriculum_v3_match.toml",
+    }
+
+
+def test_matchrunner_no_longer_rejects_team_modes():
+    """mode 2/3 used to be refused outright ("MatchRunner only supports 1v1").
+    Construction must now get PAST the mode check and fail (if at all) inside
+    Engine, not on an assert about the mode."""
+    import re
+
+    from construct.league.matches import MatchRunner
+    src = inspect.getsource(MatchRunner.__init__)
+    assert "only supports 1v1" not in src
+    assert re.search(r"assert mode in \(1, 2, 3\)", src)
+
+
+def test_matchrunner_still_rejects_mode_4():
+    """The engine has no 4v4; a typo'd --mode must not reach Engine."""
+    import pytest
+
+    from construct.league.matches import MatchRunner
+    with pytest.raises(AssertionError, match="mode must be 1, 2 or 3"):
+        MatchRunner(num_arenas=1, mode=4, schema_version=1)
+
+
+def test_matchrunner_exposes_mode_and_num_arenas():
+    """play() reshapes by self.mode, and callers assert
+    ncol == num_arenas * mode (divisibility alone misses a stray self-play
+    arena: 31*2 + 4 = 66 is still even). Both must be attributes, checked by
+    reading the source rather than building a live engine."""
+    from construct.league.matches import MatchRunner
+    src = inspect.getsource(MatchRunner.__init__)
+    assert "self.mode = mode" in src
+    assert "self.num_arenas = num_arenas" in src
 
 
 def test_matchrunner_init_accepts_curriculum_config_kwarg():

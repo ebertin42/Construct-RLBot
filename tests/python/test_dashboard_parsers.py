@@ -258,3 +258,22 @@ def test_parse_gate_history_sorted_and_skips_junk():
     rows = parse_gate_history(text)
     assert [r["ts"] for r in rows] == [100, 200], "sorted by ts, rows without win_share dropped"
     assert rows[-1]["passed"] is True
+
+
+def test_parse_gate_history_defaults_mode_to_1v1():
+    """Every row written before the team gate existed was 1v1 and carries no
+    `mode`. Normalise on READ -- backfilling published records would be worse --
+    so the renderer can label a 2v2 run without hiding the old ones."""
+    rows = parse_gate_history(
+        '{"ts": 100, "win_share": 0.84, "wins": 510, "draws": 51, "losses": 79, '
+        '"n": 640, "passed": true}\n')
+    assert rows[0]["mode"] == 1
+
+
+def test_parse_gate_history_keeps_an_explicit_team_mode():
+    """A 2v2 win share is a DIFFERENT quantity from the 1v1 ruler, so the row has
+    to stay distinguishable all the way to the tile."""
+    rows = parse_gate_history(
+        '{"ts": 100, "win_share": 0.60, "wins": 300, "draws": 100, "losses": 240, '
+        '"n": 640, "passed": true, "mode": 2, "records": 640, "short_records": 71}\n')
+    assert rows[0]["mode"] == 2 and rows[0]["short_records"] == 71

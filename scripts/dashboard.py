@@ -213,7 +213,13 @@ def parse_curriculum(text):
 def parse_gate_history(text):
     """logs/matchwin_history.jsonl -> gate rows, newest last. Written by
     scripts/matchwin_gate.py: the absolute ruler (candidate vs frozen champion,
-    both side orders, full 300s matches)."""
+    both side orders, full 300s matches).
+
+    Rows predate the `mode` key (1v1 was the only option), so it is normalised to
+    1 on READ rather than backfilled into the file -- rewriting published records
+    is worse than defaulting them. The renderer LABELS the mode instead of
+    filtering by it: filtering hides runs, whereas a label makes it impossible to
+    misread a 2v2 share as the 1v1 ruler."""
     rows = []
     for line in text.splitlines():
         line = line.strip()
@@ -224,6 +230,7 @@ def parse_gate_history(text):
         except ValueError:
             continue
         if "win_share" in d:
+            d.setdefault("mode", 1)
             rows.append(d)
     rows.sort(key=lambda r: r.get("ts", 0))
     return rows
@@ -893,17 +900,22 @@ function renderGate(rows) {
   }
   const last = rows[rows.length - 1];
   meta.textContent = `${rows.length} gate${rows.length>1?"s":""} · latest ${fmtDay(last.ts)}`;
+  // Team size is LABELLED, never filtered. A 2v2 win share is a different
+  // quantity from the 1v1 ruler (the net has never had a teammate; goals/match
+  // falls 7.1 -> 4.5), so the tile and every row have to say which one they are.
+  const lm = last.mode || 1;
   tiles(document.getElementById("gate-tiles"), [
     ["Win share", (last.win_share*100).toFixed(1) + "%",
-     `${last.wins}W/${last.draws}D/${last.losses}L over ${last.n} matches`],
+     `${last.wins}W/${last.draws}D/${last.losses}L over ${last.n} matches · ${lm}v${lm}`],
     ["Verdict", last.passed ? "PASS" : "FAIL",
      `threshold ${last.threshold != null ? last.threshold : "0.55"}`],
     ["Candidate", (last.candidate||"?").split("/").pop(), "vs the frozen champion"],
   ]);
-  tbl.innerHTML = "<tr><th>when</th><th>candidate</th><th>W/D/L</th>"
+  tbl.innerHTML = "<tr><th>when</th><th>candidate</th><th>mode</th><th>W/D/L</th>"
     + "<th>win share</th><th>verdict</th></tr>"
     + rows.slice().reverse().map(r => `<tr><td>${fmtDay(r.ts)}</td>`
       + `<td>${(r.candidate||"?").split("/").pop()}</td>`
+      + `<td>${r.mode||1}v${r.mode||1}</td>`
       + `<td>${r.wins}/${r.draws}/${r.losses}</td>`
       + `<td>${(r.win_share*100).toFixed(1)}%</td>`
       + `<td>${r.passed ? "PASS" : "FAIL"}</td></tr>`).join("");

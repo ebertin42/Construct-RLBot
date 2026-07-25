@@ -218,9 +218,21 @@ def append_h2h_history(path, ck, ref, ref_label, goals_ck, goals_ref, steps, see
 # pure functions above + one real-engine smoke in test_h2h.py)
 # ---------------------------------------------------------------------------
 
-def _build_runner(meta, arenas, seed):
+def _build_runner(meta, arenas, seed, mode=1):
+    # `mode` is trailing AND defaulted on purpose: champion_gate.py:358 calls this
+    # positionally with three args, and the goal-share gate must stay untouched.
+    #
+    # There is deliberately NO --mode CLI flag on this script. h2h measures goal
+    # SHARE, not match wins, so it is not where a team gate belongs
+    # (scripts/matchwin_gate.py --mode is), and logs/h2h_history.jsonl carries
+    # ABSOLUTE goal counts with no mode field -- adding the flag without that
+    # schema change would silently mix 1v1 and 2v2 goal scales in one file. The
+    # DETERMINISM paragraph in this module's docstring is likewise false at m>=2
+    # (2+ cars per team are not bit-reproducible) but true for every invocation
+    # that can actually occur, since mode never leaves 1 without a CLI surface.
+    # Revisit all three together.
     return MatchRunner(
-        num_arenas=arenas, seed=seed, mode=1,
+        num_arenas=arenas, seed=seed, mode=mode,
         schema_version=meta["schema_version"],
         net_heads=meta["heads"] if meta["heads"] is not None else 4,
     )

@@ -208,3 +208,150 @@ def test_promote_can_skip_the_league(tmp_path, monkeypatch):
     mg.promote("new/better.pt", cfg, add_to_league=False)
     assert called == [], "add_to_league=False must not touch the pool"
     assert mg.resolve_champion(cfg) == "new/better.pt"
+
+
+# --- team sizes (--mode) -----------------------------------------------------
+#
+# The gate is NET vs NET, so it works at any team size; the hazards are all about
+# not letting a 2v2 number stand in for the 1v1 ruler. These pin the two that
+# would be silent: promotion at m>1, and the history row's scale.
+
+def _parse(argv):
+    """Build the parsed args without running a gate (main() only reaches the
+    engine after parse + the promotion refusal)."""
+    import contextlib
+    import io
+
+    seen = {}
+
+    def spy(candidate, champion, arenas, steps, seed, threshold, mode=1):
+        seen.update(locals())
+        raise SystemExit(99)                 # stop before touching an engine
+
+    old = mg.gate
+    mg.gate = spy
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            mg.main(argv)
+    except SystemExit as e:
+        if e.code != 99:
+            raise
+    finally:
+        mg.gate = old
+    return seen
+
+
+def test_mode_defaults_to_1(tmp_path):
+    """Every existing invocation must be unchanged, so the flag's absence has to
+    mean exactly what the code did before it existed."""
+    cfg = _cfg(tmp_path, "old/champ.pt")
+    assert _parse(["cand.pt", "--champion-config", str(cfg)])["mode"] == 1
+
+
+def test_mode_2_is_threaded_through(tmp_path):
+    cfg = _cfg(tmp_path, "old/champ.pt")
+    assert _parse(["cand.pt", "--mode", "2", "--champion-config", str(cfg)])["mode"] == 2
+
+
+def test_mode_4_is_rejected_by_argparse(tmp_path):
+    with pytest.raises(SystemExit) as e:
+        _parse(["cand.pt", "--mode", "4"])
+    assert e.value.code == 2
+
+
+def test_promote_if_pass_above_1v1_is_refused_before_any_compute(tmp_path, capsys):
+    """The refusal is at PARSE time on purpose: a 2v2 gate is 20+ minutes of
+    engine time, and champion_ck feeds the KL anchor, the league pool seed and
+    the deploy candidate -- all 1v1 quantities. The pointer must not move."""
+    cfg = _cfg(tmp_path, "old/champ.pt")
+    with pytest.raises(SystemExit) as e:
+        mg.main(["cand.pt", "--mode", "2", "--promote-if-pass",
+                 "--champion-config", str(cfg)])
+    assert e.value.code == 2
+    assert "1v1-only" in capsys.readouterr().err
+    assert mg.resolve_champion(cfg) == "old/champ.pt", "pointer must not move"
+
+
+def test_promote_if_pass_at_1v1_still_promotes(tmp_path, monkeypatch, capsys):
+    """The refusal must not have broken the real path."""
+    cfg = _cfg(tmp_path, "old/champ.pt")
+    # Keep league enrolment inside tmp_path -- promote() really does write the
+    # registry, and a test must never touch the project's opponent pool.
+    cfg.write_text(cfg.read_text().replace('registry = "league/r.jsonl"',
+                                           f'registry = "{tmp_path / "pool.jsonl"}"'))
+    monkeypatch.setattr(mg, "gate", lambda *a, **k: {
+        "wins": 400, "draws": 40, "losses": 200, "n": 640, "share": 0.656,
+        "se": 0.0198, "threshold": 0.55, "verdict": "PASS",
+        "order1": (200, 20, 100), "order2": (200, 20, 100),
+        "records": 640, "short_records": 3, "short_frac": 3 / 640})
+    monkeypatch.setattr(mg, "_append_history", lambda *a, **k: None)
+    monkeypatch.setattr(mg, "_ck_provenance", lambda ck: (1, 1))
+    assert mg.main(["cand.pt", "--champion-config", str(cfg)]) == 0
+    assert mg.resolve_champion(cfg) is not None
+    mg.main(["cand.pt", "--promote-if-pass", "--champion-config", str(cfg)])
+    assert mg.resolve_champion(cfg) == "cand.pt"
+
+
+def test_history_row_carries_mode_and_the_blowup_census(tmp_path, monkeypatch):
+    """One history file for every mode (the threshold is the same at every team
+    size), so the row itself has to say which scale it is on -- and carry the
+    short-record census, the only after-the-fact way to tell a blowup-contaminated
+    run from a genuinely close one."""
+    import argparse
+    import json
+
+    args = argparse.Namespace(candidate="c.pt", champion="ch.pt", arenas=32,
+                              steps=45000, seed=11, mode=2)
+    r = {"wins": 300, "draws": 100, "losses": 240, "n": 640, "share": 0.547,
+         "se": 0.0198, "threshold": 0.55, "verdict": "FAIL", "promoted": False,
+         "records": 640, "short_records": 71}
+    monkeypatch.setattr(mg, "__file__", str(tmp_path / "scripts" / "matchwin_gate.py"))
+    mg._append_history(args, r)
+    row = json.loads((tmp_path / "logs" / "matchwin_history.jsonl").read_text())
+    assert row["mode"] == 2
+    assert row["records"] == 640 and row["short_records"] == 71
+
+
+# --- the blowup census line --------------------------------------------------
+
+def test_short_record_line_reports_the_count_and_fraction():
+    line = mg._short_record_line({"records": 640, "short_records": 7, "share": 0.84})
+    assert "7/640 (1.1%)" in line
+    assert "heavy census" not in line, "1.1% is below the 2% annotation bar"
+
+
+def test_short_record_line_reports_n_full_beside_n():
+    """A blowup adds a RECORD without adding a match, so n (and therefore
+    aggregate's se = sqrt(0.25/n)) is inflated by the census. n_full is what lets
+    a reader see how much of the denominator is truncated matches."""
+    line = mg._short_record_line({"records": 640, "short_records": 40, "share": 0.84})
+    assert "n_full=600" in line
+
+
+def test_short_record_line_claims_no_direction_for_the_contamination():
+    """The old census said short records were 0-0 draws, so contamination could
+    only pull the share toward 0.5 and "never cause a false promotion".
+    episode.rs:779-807 zeroes only the blowup step's reward and returns before
+    start_match(), so the record carries the partial score -- a blowup at 2-1 is
+    a WIN. Neither a magnitude nor a direction is knowable; printing one was the
+    bug. Both a strong candidate and a weak one must get the same unsigned flag."""
+    strong = mg._short_record_line({"records": 100, "short_records": 22, "share": 0.84})
+    weak = mg._short_record_line({"records": 100, "short_records": 60, "share": 0.31})
+    for line in (strong, weak):
+        assert "heavy census" in line and "idle box" in line
+        assert "unknown direction" in line
+        assert "0-0" in line and "not 0-0" in line
+        assert "pulled toward 0.5" not in line
+        assert "biased LOW" not in line and "biased HIGH" not in line
+
+
+def test_short_record_line_needs_no_share_to_flag_a_heavy_census():
+    """The flag is about the TAPE, not the verdict: it must still fire on a run
+    whose share never got computed."""
+    assert "heavy census" in mg._short_record_line(
+        {"records": 100, "short_records": 22, "share": None})
+
+
+def test_short_record_line_survives_no_records():
+    assert "n/a" in mg._short_record_line({"records": 0, "short_records": 0,
+                                           "share": None})
