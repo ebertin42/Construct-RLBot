@@ -69,19 +69,45 @@ def resolve_champion(config_path=None):
         return FALLBACK_CHAMPION
 
 
-def promote(candidate, config_path=None):
-    """Move the champion pointer to `candidate` atomically.
+def promote(candidate, config_path=None, add_to_league=True):
+    """Move the champion pointer to `candidate` atomically, and enrol it in the
+    league opponent pool so the CHAMPION ROTATES INTO TRAINING.
 
-    Reuses champion_gate's staged write (temp file + os.replace) so a crash
-    mid-promotion cannot leave a half-written pointer. Returns the previous
-    champion, or raises.
+    Two separate effects, deliberately in this order:
+      1. the pointer (what the next gate measures against) -- via champion_gate's
+         staged write (temp file + os.replace), so a crash mid-promotion cannot
+         leave a half-written pointer;
+      2. the league registry (what the trainer plays against). Without this the
+         pointer moves but the opponent pool never changes, so "rotating
+         champion" would be rotating in name only.
+
+    A registry failure does NOT undo the promotion -- the pointer is the
+    authoritative record and the pool is a training convenience -- but it is
+    reported. Returns the previous champion.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import champion_gate                                    # noqa: PLC0415
-    cfg = Path(config_path) if config_path else _repo_root() / CHAMPION_CONFIG
-    previous = resolve_champion(cfg)
-    champion_gate.write_champion_ck(cfg, str(candidate))
+    cfg_path = Path(config_path) if config_path else _repo_root() / CHAMPION_CONFIG
+    previous = resolve_champion(cfg_path)
+    champion_gate.write_champion_ck(cfg_path, str(candidate))
+    if add_to_league:
+        try:
+            cfg = champion_gate.load_config(cfg_path)
+            steps, schema_version = _ck_provenance(candidate)
+            champion_gate.add_to_league(cfg, str(candidate), steps, schema_version)
+        except Exception as e:                              # noqa: BLE001
+            print(f"  (champion pointer moved, but league enrolment failed: {e})")
     return previous
+
+
+def _ck_provenance(ck):
+    """(total_steps, schema_version) from a checkpoint. schema_version MUST be
+    right: the trainer only ever considers pool entries tagged with its own
+    schema version, since v0 and v1 policies cannot play each other (different
+    obs). A mistagged entry is silently never selected."""
+    import torch                                            # noqa: PLC0415
+    d = torch.load(ck, map_location="cpu", weights_only=False)
+    return int(d.get("total_steps", 0)), int(d.get("schema_version", 0))
 
 
 def flip_to_candidate(matches):

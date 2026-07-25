@@ -58,6 +58,12 @@ def cfg(cfg_path, tmp_path):
     c = champion_gate.load_config(cfg_path)
     c["history"] = str(tmp_path / "champion_history.jsonl")
     c["candidate_dir"] = str(tmp_path / "candidates")
+    # MUST be redirected too. `registry` in the committed config is a RELATIVE
+    # path, so a promotion in a test resolved it against the repo root and wrote
+    # a bogus opponent ("cand.pt", steps 1) into the LIVE league pool -- which is
+    # where the junk in the old league/registry_armc.jsonl came from. The trainer
+    # skips unloadable picks, so it degraded quietly instead of failing loudly.
+    c["registry"] = str(tmp_path / "registry.jsonl")
     return c
 
 
@@ -92,7 +98,10 @@ def test_load_config_reads_real_committed_config():
     assert (REPO / ck).is_file(), f"champion_ck points at a missing file: {ck}"
     assert c["promote_threshold"] == 0.52
     assert c["steps"] == 5400 and c["arenas"] == 8   # matches the h2h harness
-    assert c["registry"].endswith("registry_armc.jsonl")
+    # The pool file is a jsonl under league/. Not pinned to a filename: it moved
+    # off registry_armc.jsonl on 2026-07-25 (that file held only a test artifact),
+    # and the trainer reads whatever this points at.
+    assert c["registry"].startswith("league/") and c["registry"].endswith(".jsonl")
 
 
 def test_load_config_missing_file_raises_not_defaults(tmp_path):
@@ -609,3 +618,15 @@ def test_confirmation_success_allows_promotion(monkeypatch, cfg):
     row = cg.gate_one(cfg, "cand.pt", promote_if_pass=True, quiet=True, n_confirm=1)
     assert row["promoted"] is True
     assert "confirmed on 1 independent seed" in row["reason"]
+
+
+def test_tests_never_write_to_the_live_league_registry(cfg):
+    """Guard the leak that polluted the real pool.
+
+    `registry` in the committed config is relative, so an unredirected fixture
+    resolves it against the repo root and a test promotion enrols a nonexistent
+    opponent in the LIVE pool. The trainer skips unloadable picks, so this fails
+    silently -- exactly how "cand.pt, steps 1" ended up in the shipped registry.
+    """
+    assert Path(cfg["registry"]).is_absolute(), cfg["registry"]
+    assert str(REPO / "league") not in cfg["registry"]

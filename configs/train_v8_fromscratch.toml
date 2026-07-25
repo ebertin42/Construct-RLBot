@@ -140,3 +140,38 @@ wr_ema_alpha = 0.3         # per-slot win-rate smoothing (few matches per bot pe
 # ep_rew EMA). 14000 -> ~3 matches/arena x 16 arenas ~= 48 matches. Fixed 2026-07-23
 # alongside the goal-terminated->match_mode eval fix in train.py.
 eval_steps = 14000
+
+# --- league: the rotating champion as a training opponent (2026-07-25) -------
+# Elliot's call: give a quarter of the self-play arenas a real opponent instead of
+# a mirror of the current policy. 22 of the 86 self-play arenas (28 1v1 + 38 2v2 +
+# 20 3v3) = frac 0.115.
+#
+# WHERE THEY LAND: _refresh_opponents assigns league arenas from the BACK, and
+# arenas are ordered in 1v1/2v2/3v3 blocks, so these 22 are all 20 of the 3v3
+# arenas plus 2 of the 2v2. That is deliberate: mirrored 3v3 self-play is the least
+# informative regime in the mix (six near-identical cars, none of which has a
+# trained teammate channel), and a FROZEN opponent breaks the co-adaptation
+# symmetry that plain self-play cannot escape. Foreign arenas (106) are never
+# touched -- league takes the tail, foreign takes the front, and the trainer
+# asserts the two cannot overlap.
+#
+# WHY THE LEAGUE AND NOT MORE PORTED BOTS: the four external bots are 1v1-only
+# (fixed obs width for Immortal/Element), so team arenas have no external
+# opposition available at all. League opponents are our OWN architecture, so they
+# work at any team size -- currently the only non-self opponent a 2v2/3v3 arena
+# can have.
+#
+# HONEST EXPECTATION: the current champion (ck_001171502080) was itself trained
+# 1v1-only, so in team arenas it is also near-random (~95% of max entropy). The
+# immediate gain is symmetry-breaking, not skill transfer; the real value arrives
+# once a TEAM-trained checkpoint gets promoted, and compounds from there. Note
+# also that an own-checkpoint league was tried once before and failed its gate
+# (0.4570) -- that was 1v1 with near-identical trapped checkpoints, a different
+# situation from team arenas with no alternative opponent, but it is the one prior
+# attempt at this idea.
+[league]
+enabled = true
+opponent_frac = 0.115      # 22 arenas ~= 1/4 of the 86 self-play arenas
+slots = 4                  # pool size cap; grows as the champion lineage does
+registry = "league/registry_champions.jsonl"   # same file champion promotions write
+refresh_iters = 200        # re-read the registry (promotions land out-of-process)

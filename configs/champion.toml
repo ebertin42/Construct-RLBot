@@ -101,11 +101,24 @@ consecutive_rejects_before_alert = 3
 
 # --- where promotions are recorded ------------------------------------------
 [league]
-# New champions are appended here so the opponent pool tracks the champion
-# lineage (construct.league.registry.Registry.add, schema_version=1).
-registry = "league/registry_armc.jsonl"
+# New champions are appended here so the opponent POOL tracks the champion
+# lineage (construct.league.registry.Registry.add). This is what makes the
+# champion actually rotate into training: configs/train_v8_fromscratch.toml
+# points [league].registry at the same file, so a promotion both moves the gate's
+# reference AND enrols the new champion as a training opponent.
+#
+# Moved off registry_armc.jsonl on 2026-07-25: that file only ever held one test
+# artifact ("cand.pt", steps 1) from an arm-C era test run, which as a pool entry
+# would be a broken opponent. Starting a clean file is cheaper than auditing it.
+#
+# Entries MUST be tagged with the trainer's schema_version (1 for the entity
+# nets) -- the trainer only considers pool entries matching its own version,
+# because v0 and v1 policies cannot play each other (different obs), and a
+# mistagged entry is silently never selected. matchwin_gate.promote() reads the
+# version off the checkpoint rather than assuming.
+registry = "league/registry_champions.jsonl"
 run = "champion"
-reward_config = "configs/reward_v3.toml"   # the regime arm D held parity under
+reward_config = "configs/reward_v8_team.toml"   # the regime the live run trains in
 
 [history]
 path = "logs/champion_history.jsonl"

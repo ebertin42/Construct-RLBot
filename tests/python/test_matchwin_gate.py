@@ -5,6 +5,7 @@ here: the side-order flip (order 2 plays the champion, so its records must be
 inverted to the candidate's perspective before summing) and the win-share /
 threshold arithmetic. A bug in either silently promotes or rejects.
 """
+import json
 import math
 import sys
 from pathlib import Path
@@ -162,3 +163,48 @@ def test_promote_is_idempotent(tmp_path):
     mg.promote("b.pt", cfg)
     assert mg.promote("b.pt", cfg) == "b.pt"
     assert mg.resolve_champion(cfg) == "b.pt"
+
+
+# --- the champion must rotate into the OPPONENT POOL, not just the pointer ----
+
+def test_promote_enrols_the_new_champion_in_the_league(tmp_path, monkeypatch):
+    """Moving the pointer alone would be 'rotating champion' in name only -- the
+    trainer plays whatever is in the registry, not whatever the pointer says."""
+    cfg = _cfg(tmp_path, "old/champ.pt")
+    reg = tmp_path / "pool.jsonl"
+    cfg.write_text(cfg.read_text().replace('registry = "league/r.jsonl"',
+                                           f'registry = "{reg}"'))
+    monkeypatch.setattr(mg, "_ck_provenance", lambda ck: (1_171_502_080, 1))
+    mg.promote("new/better.pt", cfg)
+
+    rows = [json.loads(l) for l in reg.read_text().splitlines() if l.strip()]
+    assert [r["ck"] for r in rows] == ["new/better.pt"]
+    assert rows[0]["steps"] == 1_171_502_080
+    # schema_version MUST match the trainer's, or the entry is silently never
+    # selected (v0 and v1 policies cannot play each other -- different obs).
+    assert rows[0]["schema_version"] == 1
+    assert rows[0]["run"] == "champion"
+
+
+def test_promote_still_moves_the_pointer_if_league_enrolment_fails(tmp_path, monkeypatch, capsys):
+    """The pointer is the authoritative record; the pool is a convenience. A
+    registry problem must not leave the gate measuring against a stale champion."""
+    cfg = _cfg(tmp_path, "old/champ.pt")
+
+    def boom(ck):
+        raise RuntimeError("unreadable checkpoint")
+    monkeypatch.setattr(mg, "_ck_provenance", boom)
+
+    previous = mg.promote("new/better.pt", cfg)
+    assert previous == "old/champ.pt"
+    assert mg.resolve_champion(cfg) == "new/better.pt", "pointer must still move"
+    assert "league enrolment failed" in capsys.readouterr().out
+
+
+def test_promote_can_skip_the_league(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path, "old/champ.pt")
+    called = []
+    monkeypatch.setattr(mg, "_ck_provenance", lambda ck: called.append(ck) or (1, 1))
+    mg.promote("new/better.pt", cfg, add_to_league=False)
+    assert called == [], "add_to_league=False must not touch the pool"
+    assert mg.resolve_champion(cfg) == "new/better.pt"
