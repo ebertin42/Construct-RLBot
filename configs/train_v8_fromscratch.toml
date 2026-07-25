@@ -96,7 +96,17 @@ weights = [
 # the band (immortal harder, nexto easier) and let the per-slot controller tune
 # each from its own measured win rate.
 decision_periods = [4, 3, 4, 5]   # element, immortal, necto, nexto
-opponent_frac = 0.40              # ~10% of arenas per bot; self-play stays ~60%
+# 0.40 -> 0.55 (2026-07-25), sized by share of LEARNER EXPERIENCE, not arenas.
+# A foreign arena yields ONE learner row (its opponent is bot-driven and does not
+# learn) while a 2v2/3v3 self-play arena yields 4-6. So after adding team arenas the
+# external-bot signal had quietly fallen from 25.1% to 16.6% of experience even
+# though its arena count was unchanged -- and that signal is what broke the 1v1
+# plateau. 0.55 = 106 of the 134 1v1 arenas, restoring external bots to ~24.4% while
+# team play stays ~63%. The cost falls on 1v1 SELF-PLAY (24.6% -> 12.9%), which is
+# the least valuable regime in the mix: unopposed 1v1 self-play is exactly what
+# produced the trapped champion. Ceiling is the 1v1 arena count (foreign is
+# 1v1-only), i.e. frac <= 134/192 = 0.69 at these team weights.
+opponent_frac = 0.55
 
 [foreign.auto_curriculum]
 enabled = true
