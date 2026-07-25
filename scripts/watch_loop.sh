@@ -46,11 +46,18 @@ FOREIGN_ROSTER=(element immortal necto nexto self)
 FOREIGN_CACHE="${CONSTRUCT_FOREIGN_CACHE:-$HOME/.cache/construct}"
 SCRATCH_LOG="${CONSTRUCT_SCRATCH_LOG:-checkpoints_scratch/train_remote.log}"
 WATCH_FOREIGN="${CONSTRUCT_WATCH_FOREIGN:-1}"
-current_period() {  # last auto-curriculum period in the synced remote log (the
-                    # trailing integer of the newest decision line); default 4.
-    local p
-    p=$(grep -a "auto-curriculum: winrate" "$SCRATCH_LOG" 2>/dev/null \
-        | tail -1 | grep -oE "[0-9]+" | tail -1)
+current_period() {  # $1 = bot kind. Periods are PER BOT since 2026-07-25, so the
+                    # viewer must read that bot's own rung out of the newest
+                    # decision line, which looks like:
+                    #   auto-curriculum: element wr0.69/ema0.69 p4->3 | immortal ... p3->2
+                    # a held slot instead reads "... p4 dwell1/2". The previous
+                    # parser grepped the retired "auto-curriculum: winrate ..."
+                    # format, so it silently froze on a stale pre-restart value.
+    local seg p
+    seg=$(grep -a "auto-curriculum: .*wr[0-9]" "$SCRATCH_LOG" 2>/dev/null | tail -1 \
+          | tr '|' '\n' | grep -aE "(^| )$1 " | tail -1)
+    p=$(printf '%s' "$seg" | grep -oE 'p[0-9]+->[0-9]+' | grep -oE '[0-9]+$')   # moved
+    [ -z "$p" ] && p=$(printf '%s' "$seg" | grep -oE 'p[0-9]+' | head -1 | tr -d 'p')
     echo "${p:-${CONSTRUCT_WATCH_PERIOD:-4}}"
 }
 
@@ -86,7 +93,7 @@ while true; do
         label="LIVE $mode"
         if [ "$mode" = "1v1" ] && [ "$WATCH_FOREIGN" = "1" ]; then
             fk="${FOREIGN_ROSTER[$((slot % ${#FOREIGN_ROSTER[@]}))]}"
-            P=$(current_period)
+            P=$(current_period "$fk")   # that bot's OWN rung, not a shared one
             if [ "$fk" != "self" ] && [ -f "$FOREIGN_CACHE/${fk}_weights.npz" ]; then
                 fargs=(--foreign "$fk" --foreign-weights "$FOREIGN_CACHE/${fk}_weights.npz" --period "$P")
                 label="Blue=Construct  Orange=${fk}.p${P}"
