@@ -73,7 +73,15 @@ weights = [
     "~/.cache/construct/necto_weights.npz",
     "~/.cache/construct/nexto_weights.npz",
 ]
-decision_periods = [6, 6, 6, 6]   # shared knob; auto-curriculum tunes all four together
+# PER-BOT periods (2026-07-25), seeded from a 48-match bench of ck_001171502080
+# with all four at a shared p4: immortal 0.896, element 0.677, necto 0.615,
+# nexto 0.146. Difficulty is NOT ordered like the bot-vs-bot ladder -- vs OUR net
+# immortal is the easiest and nexto is by far the hardest -- so a shared period
+# parks immortal as a punching bag and nexto as an unwinnable wall, and only
+# element/necto produce useful gradient. Seed the two outliers one rung toward
+# the band (immortal harder, nexto easier) and let the per-slot controller tune
+# each from its own measured win rate.
+decision_periods = [4, 3, 4, 5]   # element, immortal, necto, nexto
 opponent_frac = 0.40              # ~10% of arenas per bot; self-play stays ~60%
 
 [foreign.auto_curriculum]
@@ -85,7 +93,14 @@ adjust_every = 20          # measure win rate + adjust every 20 iters
 ema_alpha = 0.2            # ep_rew fallback only
 win_lo = 0.45              # target win-rate band (goal-based eval)
 win_hi = 0.55
-eval_arenas = 16           # separate goal-based eval engine for the win-rate signal
+# Eval arenas are round-robined across the foreign slots (like the training
+# assignment), so EVERY bot is measured -- before 2026-07-25 the eval collected
+# with slot 0 only, leaving the controller blind to bots 2..N. Keep this a
+# MULTIPLE of the bot count so each gets the same number of arenas: 24/4 = 6
+# arenas per bot -> ~18 matches per bot per eval at eval_steps below.
+eval_arenas = 24
+wr_ema_alpha = 0.3         # per-slot win-rate smoothing (few matches per bot per
+                           # eval); reset for a slot whenever its period changes
 # The eval runs in MATCH_MODE (same regime as training + bench). A match only ends
 # at 300s (~4500 steps), so eval_steps must span several full matches or NO match
 # completes and the win-rate signal is None (silently falling back to the gameable

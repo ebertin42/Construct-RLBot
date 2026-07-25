@@ -321,6 +321,20 @@ class Trainer:
             self._ac_band = float(ac.get("band", 5.0))     # ep_rew fallback only
             self._ac_ema = None
             self._ac_alpha = float(ac.get("ema_alpha", 0.2))
+            # PER-BOT control (2026-07-25). Each foreign slot gets its OWN period,
+            # tuned from its OWN measured win rate, because difficulty is wildly
+            # uneven at a shared period: measured at p4 on ck_001171502080 we beat
+            # immortal 0.896 and element 0.677 but lose to nexto 0.146. One shared
+            # knob cannot put four different bots in the same band -- it parks two
+            # of them as punching bags and one as an unwinnable wall, and only the
+            # middle pair produce useful gradient. Per-slot integer knobs also
+            # restore RESOLUTION: a single shared knob saturates once the true
+            # equilibrium falls between two integers (observed: period thrashing
+            # 3<->4 for 258M steps while the real win rate kept creeping up).
+            # Each slot's win rate is noisy (few matches per bot per eval), so
+            # adjust on a per-slot EMA rather than a single raw measurement.
+            self._ac_wr_ema = [None] * self._foreign_slots
+            self._ac_wr_alpha = float(ac.get("wr_ema_alpha", 0.3))
             self._ac_eval = None
             if self._ac_on:
                 try:
@@ -357,10 +371,22 @@ class Trainer:
                 self.opt.load_state_dict(_state["optimizer"])
             self.total_steps = _state["total_steps"]
 
-    def _measure_foreign_winrate(self) -> float | None:
-        """Blue goal-share vs the foreign opponent at the current period, on the
+    def _measure_foreign_winrates(self) -> list[float | None] | None:
+        """PER-SLOT blue win share, each bot at its own current period, on the
         goal-based eval engine (decoupled from the training reward). ~0.5 = even.
-        Returns None if no eval engine or no completed episodes."""
+
+        Eval arenas are round-robined across the foreign slots exactly like the
+        training assignment (`_apply_foreign`), so every bot is measured -- the
+        pre-2026-07-25 version collected with `[-2] * arenas`, i.e. slot 0 ONLY,
+        so the controller was blind to every bot but the first and adding three
+        more opponents moved the period by exactly nothing.
+
+        `collect` returns ONE reward column per arena (verified: 8 arenas /
+        16 agents -> shape (T, 8)), and column i is arena i, so slicing the
+        columns assigned to a slot attributes matches to that bot. Returns a
+        list aligned with `self._foreign_kinds` (None for a slot with no
+        completed match), or None if there is no eval engine.
+        """
         ev = self._ac_eval
         if ev is None:
             return None
@@ -371,18 +397,26 @@ class Trainer:
         ev["eng"].set_weights(sd)
         ev["eng"].set_foreign_opponents(
             self._foreign_sds, self._foreign_kinds, self._foreign_periods)
-        out = ev["eng"].collect(ev["steps"], arena_opponents=[-2] * ev["arenas"])
-        rec = match_record(split_matches(out["rewards"], out["terminated"]))
-        n = rec["wins"] + rec["draws"] + rec["losses"]
-        if n == 0:
-            return None
-        return (rec["wins"] + 0.5 * rec["draws"]) / n
+        slots = self._foreign_slots
+        assign = [-(i % slots) - 2 for i in range(ev["arenas"])]
+        out = ev["eng"].collect(ev["steps"], arena_opponents=assign)
+        rew = _np.asarray(out["rewards"])
+        term = _np.asarray(out["terminated"])
+        wrs: list[float | None] = []
+        for s in range(slots):
+            cols = [i for i, k in enumerate(assign) if k == -(s) - 2]
+            rec = match_record(split_matches(rew[:, cols], term[:, cols]))
+            n = rec["wins"] + rec["draws"] + rec["losses"]
+            wrs.append((rec["wins"] + 0.5 * rec["draws"]) / n if n else None)
+        return wrs
 
     def _auto_curriculum_step(self, it: int, ep_reward_mean: float):
-        """Hold the foreign opponent near a ~50% win rate by tuning its
-        decision_period. Preferred signal is a GOAL-based win rate on a separate
-        eval engine (clean regardless of the training reward). Falls back to the
-        zero-sum ep_reward_mean margin if the eval engine is absent."""
+        """Hold EACH foreign opponent near a ~50% win rate by tuning ITS OWN
+        decision_period. Preferred signal is a per-bot GOAL-based win rate on a
+        separate eval engine (clean regardless of the training reward), smoothed
+        per slot by an EMA because each bot gets only a few matches per eval.
+        Falls back to the zero-sum ep_reward_mean margin (one shared knob) if the
+        eval engine is absent or no match completed."""
         if not getattr(self, "_ac_on", False) or self._foreign_slots == 0:
             return
         # ep_rew fallback signal accumulates every iter (EMA)
@@ -393,21 +427,49 @@ class Trainer:
                         + self._ac_alpha * signal)
         if it % self._ac_every != 0:
             return
+        wrs = self._measure_foreign_winrates()
+        if wrs is not None and any(w is not None for w in wrs):
+            # PER-BOT: each slot's period follows its OWN smoothed win rate, so a
+            # punching bag gets harder while an unwinnable wall gets easier in the
+            # same pass (they used to share one knob and fight each other).
+            old = list(self._foreign_periods)
+            parts = []
+            for s, w in enumerate(wrs):
+                if w is None:
+                    parts.append(f"{self._foreign_kinds[s]} n/a p{old[s]}")
+                    continue
+                e = self._ac_wr_ema[s]
+                e = w if e is None else (1 - self._ac_wr_alpha) * e + self._ac_wr_alpha * w
+                self._ac_wr_ema[s] = e
+                cur = self._foreign_periods[s]
+                if e > self._ac_win_hi:
+                    self._foreign_periods[s] = max(self._ac_period_min, cur - 1)
+                elif e < self._ac_win_lo:
+                    self._foreign_periods[s] = min(self._ac_period_max, cur + 1)
+                parts.append(f"{self._foreign_kinds[s]} wr{w:.2f}/ema{e:.2f} "
+                             f"p{cur}->{self._foreign_periods[s]}")
+                if self._foreign_periods[s] != cur:
+                    # The difficulty just changed, so every sample in this slot's
+                    # EMA describes the OLD period. Keeping it would ratchet again
+                    # on stale evidence -- e.g. seed 0.90 at p4, harden to p3, and
+                    # the still-0.66 EMA immediately hardens to p2 having never
+                    # measured p3 (caught by test_auto_curriculum). Smoothing is
+                    # for noise at a FIXED difficulty; a change invalidates it.
+                    self._ac_wr_ema[s] = None
+            if self._foreign_periods != old:
+                self.engine.set_foreign_opponents(
+                    self._foreign_sds, self._foreign_kinds, self._foreign_periods)
+            print("auto-curriculum: " + " | ".join(parts), flush=True)
+            return
+        # fallback: ep_rew margin (no eval engine / no completed match) -- one
+        # shared knob, as before, since there is no per-bot signal to split on.
         cur = self._foreign_periods[0]
         new = cur
-        wr = self._measure_foreign_winrate()
-        if wr is not None:
-            if wr > self._ac_win_hi:
-                new = max(self._ac_period_min, cur - 1)   # winning -> harder
-            elif wr < self._ac_win_lo:
-                new = min(self._ac_period_max, cur + 1)    # losing -> easier
-            reason = f"winrate {wr:.3f}"
-        else:  # fallback: ep_rew margin
-            if self._ac_ema > self._ac_band:
-                new = max(self._ac_period_min, cur - 1)
-            elif self._ac_ema < -self._ac_band:
-                new = min(self._ac_period_max, cur + 1)
-            reason = f"ep_rew_ema {self._ac_ema:+.2f}"
+        if self._ac_ema > self._ac_band:
+            new = max(self._ac_period_min, cur - 1)
+        elif self._ac_ema < -self._ac_band:
+            new = min(self._ac_period_max, cur + 1)
+        reason = f"ep_rew_ema {self._ac_ema:+.2f}"
         if new != cur:
             self._foreign_periods = [new] * len(self._foreign_kinds)
             self.engine.set_foreign_opponents(
