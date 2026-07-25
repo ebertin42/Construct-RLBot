@@ -58,7 +58,31 @@ gamma = 0.9954
 lam = 0.95
 lr = 3e-4                # a touch higher than the fine-tune 2e-4: from scratch
 clip = 0.2
-entropy_coef = 0.01
+# 0.01 -> 0.003 (2026-07-25). The entropy bonus is a CONSTANT pull toward uniform,
+# but the per-car learning signal shrinks with team size, so once team arenas were
+# added the bonus started winning in them. Measured on ck_001283829760:
+#
+#   mode   mean|reward|   mean|TD advantage|   advantage / entropy_coef
+#   1v1        0.0493              0.2275              22.7x
+#   2v2        0.0101              0.0322               3.2x
+#   3v3        0.0074              0.0240               2.4x
+#
+# With six cars and one ball each car is near it ~3x less often, so touch and
+# vel_to_ball fire far less per car, and team_spirit averages what is left across
+# teammates. At 2.4x the bonus is the same order as the real gradient, so the 3v3
+# policy collapsed to near-uniform within 22M steps of team arenas appearing
+# (entropy 3.04 -> 4.31 of a 4.52 maximum) and sat there for 86M more -- a stable
+# pathological equilibrium, not slow learning. The pre-team champion, which had
+# never seen a teammate, was at 3.04 in 3v3, so this is a REGRESSION caused by the
+# bonus, not an untrained-input problem.
+#
+# 0.003 restores the ratio to ~8x in 3v3 and ~76x in 1v1. Nearly free for 1v1,
+# where at 22.7x the bonus was already negligible.
+#
+# NOTE: on a resume the CHECKPOINT's ppo block wins over this file, so changing
+# this value here does NOTHING for the live run -- it must be passed as
+# `resume_train.py --entropy-coef 0.003` (see that flag's help).
+entropy_coef = 0.003
 value_coef = 1.0
 epochs = 3
 minibatch_size = 8192
