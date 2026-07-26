@@ -185,8 +185,14 @@ struct WorkerOut {
     debug_json: Option<String>,
     error: Option<String>,
     collect: Option<CollectOut>,
-    /// `Cmd::RewardTerms` reply: this worker's arenas' counters, summed.
-    terms: Option<[f64; crate::reward::N_TERMS]>,
+    /// `Cmd::RewardTerms` reply: this worker's arenas' counters, summed --
+    /// (every agent, learner rows only, opponent-driven cars only). All three
+    /// are read-and-reset together so they always cover the same window;
+    /// returning only one would leave the others accumulating across an unknown
+    /// number of iterations. The three do NOT sum to the first: a partial
+    /// foreign team's mirror cars are in neither of the last two.
+    terms: Option<([f64; crate::reward::N_TERMS], [f64; crate::reward::N_TERMS],
+                   [f64; crate::reward::N_TERMS])>,
 }
 
 impl WorkerOut {
@@ -301,6 +307,44 @@ pub fn parse_state_dict(
     Ok(PolicyWeights { trunk, policy, value })
 }
 
+/// Tell every arena how its agents divide into the three kinds of car, from the
+/// collect's OWN learner map. The arena needs it to split its reward telemetry
+/// (`EpisodeArena::set_learner_agents`), and deriving it here rather than
+/// re-deriving the assignment inside the arena is what stops the split from ever
+/// disagreeing with the rows that actually become training data.
+///
+/// `opp_cnt[li]` is how many of arena `li`'s cars a bot or a frozen
+/// opponent-pool net drives. `None` means "every non-learner row", which is
+/// exact for the v0 arm -- it has no foreign branch, so it has no mirror cars.
+///
+/// WHY THE COUNT IS PASSED IN AND NOT DERIVED FROM `learner_col`. A partial
+/// foreign team (E4) has three kinds of car and `learner_col` only distinguishes
+/// two: a mirror car is `None` there exactly like a bot car, so
+/// "non-learner == opponent" silently lumps 39% of our own policy's rows into the
+/// opponent column in v9's shipped config. See `EpisodeArena::reward_terms_opp`.
+///
+/// Called once per collect, not per step: the assignment is fixed for the
+/// duration of a `Cmd::Collect`.
+fn declare_learner_rows(
+    arenas: &mut [EpisodeArena],
+    arena_sizes: &[(usize, usize)],
+    learner_col: &[Option<usize>],
+    opp_cnt: Option<&[usize]>,
+) {
+    let mut a_off = 0usize;
+    for (li, &(b, o)) in arena_sizes.iter().enumerate() {
+        let n = b + o;
+        let cnt = (a_off..a_off + n).filter(|&a| learner_col[a].is_some()).count();
+        // Learner rows are a PREFIX of each arena in every assignment branch
+        // (blue first in agent order, and a foreign/native opponent only ever
+        // takes orange), which is what makes a count sufficient.
+        debug_assert!((a_off..a_off + cnt).all(|a| learner_col[a].is_some()),
+                      "learner rows are not a prefix of arena {li}");
+        arenas[li].set_learner_agents(cnt, opp_cnt.map(|c| c[li]));
+        a_off += n;
+    }
+}
+
 /// One worker's v1 (entity-obs) rollout: the exact structure of the v0
 /// `Cmd::Collect` arm — per-round {build obs for all agents, ONE batched
 /// learner forward + one per used opponent slot, sample EVERY agent from its
@@ -364,6 +408,13 @@ fn collect_v1_worker(
     // Arenas whose ORANGE cars are (partly) driven by a foreign (ported) bot:
     // (local arena index, foreign slot, first agent index of the arena).
     let mut foreign_arenas: Vec<(usize, usize, usize)> = Vec::new();
+    // Per arena, how many cars something OTHER THAN our live policy drives: the
+    // bot's `fcars` in a foreign arena, all of orange against a native opponent
+    // slot, 0 in self-play. Built in the same loop as `learner_idx` and
+    // `fwd_idx` for the same reason they are -- it is the third face of one
+    // assignment, and re-deriving it anywhere else is how the reward telemetry
+    // would come to disagree with who was actually driving.
+    let mut opp_cnt: Vec<usize> = Vec::with_capacity(arena_sizes.len());
     {
         let mut a_off = 0usize;
         for (li, &(b, o)) in arena_sizes.iter().enumerate() {
@@ -431,6 +482,7 @@ fn collect_v1_worker(
                 for i in (b + fcars)..(b + o) {
                     fwd_idx.push(a_off + i); // mirror: forwarded, not learned from
                 }
+                opp_cnt.push(fcars);
                 foreign_arenas.push((li, fslot, a_off));
             } else if k < 0 {
                 for i in 0..(b + o) {
@@ -438,6 +490,7 @@ fn collect_v1_worker(
                     learner_team_size.push(b.max(o) as i8);
                     fwd_idx.push(a_off + i);
                 }
+                opp_cnt.push(0);
             } else {
                 let slot = k as usize;
                 for i in 0..b {
@@ -448,6 +501,7 @@ fn collect_v1_worker(
                 for i in b..(b + o) {
                     opp_idx[slot].push(a_off + i);
                 }
+                opp_cnt.push(o);
             }
             a_off += b + o;
         }
@@ -455,6 +509,7 @@ fn collect_v1_worker(
             learner_col[a] = Some(col);
         }
     }
+    declare_learner_rows(arenas, arena_sizes, &learner_col, Some(&opp_cnt));
     let n_learner = learner_idx.len();
     let n_fwd = fwd_idx.len();
     debug_assert_eq!(learner_team_size.len(), n_learner);
@@ -923,12 +978,22 @@ impl MultiEngine {
                         }
                         Cmd::RewardTerms => {
                             let mut sums = [0.0f64; crate::reward::N_TERMS];
+                            let mut learner = [0.0f64; crate::reward::N_TERMS];
+                            let mut opp = [0.0f64; crate::reward::N_TERMS];
                             for ar in arenas.iter_mut() {
                                 for (s, v) in sums.iter_mut().zip(ar.take_reward_terms()) {
                                     *s += v;
                                 }
+                                for (s, v) in learner.iter_mut().zip(ar.take_reward_terms_learner()) {
+                                    *s += v;
+                                }
+                                for (s, v) in opp.iter_mut().zip(ar.take_reward_terms_opp()) {
+                                    *s += v;
+                                }
                             }
-                            let _ = otx.send(WorkerOut { terms: Some(sums), ..WorkerOut::empty() });
+                            let _ = otx.send(WorkerOut {
+                                terms: Some((sums, learner, opp)), ..WorkerOut::empty()
+                            });
                         }
                         Cmd::Debug { local_idx } => {
                             let ar = &mut arenas[local_idx];
@@ -1114,6 +1179,10 @@ impl MultiEngine {
                                     learner_col[a] = Some(col);
                                 }
                             }
+                            // `None`: the v0 arm has no foreign branch, so every
+                            // non-learner car IS an opponent -- there are no
+                            // mirror rows to keep out of the opponent column.
+                            declare_learner_rows(&mut arenas, &arena_sizes, &learner_col, None);
                             let n_learner = learner_idx.len();
 
                             let mut out = CollectOut::zeros(steps, n_learner, d);
@@ -1710,11 +1779,28 @@ impl MultiEngine {
     /// buffers' shapes are load-bearing for the merge arithmetic and for the
     /// determinism regression tests, and telemetry must never be able to perturb
     /// them.
-    pub fn reward_terms(&mut self) -> Result<[f64; crate::reward::N_TERMS], String> {
+    /// Returns (every agent, LEARNER ROWS ONLY, OPPONENT-DRIVEN CARS ONLY).
+    ///
+    /// The second is the one to read when the question is about our policy's
+    /// behaviour rather than the arena's; the third is the ported bot's (or a
+    /// frozen opponent-pool net's) own share.
+    ///
+    /// THE THREE DO NOT SUM TO THE FIRST, deliberately. A partial foreign team
+    /// mirrors the orange cars the bot cannot drive through our own net and then
+    /// discards their experience, so those cars are neither learner rows nor
+    /// opponent rows -- in v9's shipped config they are 31 of 79 non-learner
+    /// rows. That is precisely why the third array is counted rather than
+    /// obtained by subtracting the second from the first.
+    pub fn reward_terms(
+        &mut self,
+    ) -> Result<([f64; crate::reward::N_TERMS], [f64; crate::reward::N_TERMS],
+                 [f64; crate::reward::N_TERMS]), String> {
         for w in &self.workers {
             w.tx.send(Cmd::RewardTerms).map_err(|e| e.to_string())?;
         }
         let mut sums = [0.0f64; crate::reward::N_TERMS];
+        let mut learner = [0.0f64; crate::reward::N_TERMS];
+        let mut opp = [0.0f64; crate::reward::N_TERMS];
         let mut first_err: Option<String> = None;
         for w in &self.workers {
             let out = w.rx.recv().map_err(|e| e.to_string())?;
@@ -1724,15 +1810,21 @@ impl MultiEngine {
                 }
                 continue;
             }
-            if let Some(t) = out.terms {
+            if let Some((t, l, o)) = out.terms {
                 for (s, v) in sums.iter_mut().zip(t) {
+                    *s += v;
+                }
+                for (s, v) in learner.iter_mut().zip(l) {
+                    *s += v;
+                }
+                for (s, v) in opp.iter_mut().zip(o) {
                     *s += v;
                 }
             }
         }
         match first_err {
             Some(e) => Err(e),
-            None => Ok(sums),
+            None => Ok((sums, learner, opp)),
         }
     }
 

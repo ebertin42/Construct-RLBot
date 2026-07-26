@@ -178,7 +178,29 @@ aerial_z_hi = 1400.0
 # (the shared potential gamma; it MUST equal [ppo] gamma or the run silently
 # optimises a different objective -- checked at trainer startup, and the engine
 # refuses air_setup with a zero gamma outright).
-air_setup = 0.0
+# ENABLED 2026-07-26 at 222M steps, on the trigger above. MEASURED over the 300
+# iterations before the change (~30M steps): air_tch_frac mean 0.0237, max 0.0770
+# -- under the 5% threshold and FLAT since ~40M steps, so the 104-row air table
+# was necessary but not sufficient. It made a full-height takeoff 237x more
+# reachable (1-in-97,336 decisions -> 1-in-410), which is what lets exploration
+# FIND the manoeuvre; it does not create a gradient that pulls the policy toward
+# it, and aerial_touch alone is chicken-and-egg (it only pays once you can already
+# reach a high ball). air_setup is the potential-based term that supplies that
+# gradient, and being potential-based (Ng/Harada/Russell) it cannot change the
+# optimal policy -- loitering at altitude costs w(gamma-1)PHI per step, so there
+# is no hover farm.
+#
+# SINGLE-VARIABLE: nothing else changed in this file or the train config. If the
+# airborne-touch fraction does not move within ~50M steps, air_setup is the thing
+# to revert, with no confound to unpick (contrast the 2026-07-20 two-variable
+# confound).
+air_setup = 0.3
+# REQUIRED co-requisite, not a free knob: air_setup's potential is discounted by
+# win_prob_gamma, which MUST equal [ppo] gamma (0.9954 in
+# configs/train_v9_fromscratch.toml) or the shaping telescopes against a different
+# discount and the run silently optimises something else. reward.rs:207 hard-errors
+# on air_setup != 0 with gamma <= 0, and train.py re-checks the equality at startup.
+win_prob_gamma = 0.9954
 
 # --- team credit sharing (unchanged from reward_v8_team.toml) --------------
 # r_i' = (1-tau)*r_i + tau*mean(own team). In a 1v1 arena each team is one car,

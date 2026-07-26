@@ -259,6 +259,40 @@ pub struct EpisodeArena {
     /// arithmetic, and the whole point is that turning the telemetry on cannot
     /// perturb the rollout. Read + reset from the trainer once per iteration.
     reward_terms: [f64; reward::N_TERMS],
+    /// The same counters, restricted to agents whose experience is actually
+    /// TRAINED ON. `reward_terms` above counts every car in the arena including
+    /// the ported bot's, which makes it the wrong instrument for "is OUR policy
+    /// doing this": measured on the champion, its own share of r_aerial_touch
+    /// over 24,000 learner steps was exactly 0.0000 and every unit of the
+    /// arena-wide +2.23 was nexto's. Read arena-wide, that number says "aerial
+    /// play is happening here"; it just is not ours.
+    reward_terms_learner: [f64; reward::N_TERMS],
+    /// The same counters again, restricted to agents driven by something that is
+    /// NOT our live policy -- a ported bot, or a frozen opponent-pool net.
+    ///
+    /// NOT `reward_terms - reward_terms_learner`, and that is the whole reason
+    /// it exists. A PARTIAL foreign team (E4) has a third kind of car: orange
+    /// cars the bot cannot drive are mirrored through OUR net and then dropped
+    /// from the training set. In v9's shipped config (`foreign_cars = [1; 12]`
+    /// with four mode-2 and four mode-3 slots) 31 of the 79 non-learner rows --
+    /// 39% -- are those mirrors. Subtracting the learner array therefore blends
+    /// our own policy into the "opponent" column and pulls it toward our value:
+    /// at a true bot rate of 0.24 and ours of 0.02 the subtraction prints 0.153.
+    /// Counting the bot's cars directly is the only way the number means what a
+    /// reader takes it to mean.
+    reward_terms_opp: [f64; reward::N_TERMS],
+    /// How many of this arena's agents are learner rows. Agent order is blue
+    /// then orange (`blue_count`), and in every opponent arena the learner rows
+    /// are exactly the blue prefix, so a count is enough. Defaults to ALL
+    /// agents, which is the self-play case and every non-collect caller
+    /// (lib.rs's single-arena Env, every test) -- so the split is inert unless
+    /// `set_learner_agents` is called.
+    learner_agents: usize,
+    /// How many agents STARTING AT `learner_agents` are opponent-driven. The
+    /// three groups are contiguous in agent order in every assignment branch --
+    /// learner prefix, then the bot's cars, then our mirrors -- so two counts
+    /// classify all three. Defaults to 0 (self-play: nothing is an opponent).
+    opp_agents: usize,
 }
 
 impl EpisodeArena {
@@ -369,6 +403,10 @@ impl EpisodeArena {
             blowup_count: 0,
             jitter_enabled: true,
             reward_terms: [0.0; reward::N_TERMS],
+            reward_terms_learner: [0.0; reward::N_TERMS],
+            reward_terms_opp: [0.0; reward::N_TERMS],
+            learner_agents: blue + orange,
+            opp_agents: 0,
         };
         // Positive confirmation, mirroring the "[curriculum] replay pool ..."
         // line. On 2026-07-20 an arm ran fully INERT because a missing
@@ -765,6 +803,41 @@ impl EpisodeArena {
         std::mem::replace(&mut self.reward_terms, [0.0; reward::N_TERMS])
     }
 
+    /// The learner-only twin of `take_reward_terms`, same units, also reset on
+    /// read. Equal to it, term for term, in a self-play arena.
+    pub fn take_reward_terms_learner(&mut self) -> [f64; reward::N_TERMS] {
+        std::mem::replace(&mut self.reward_terms_learner, [0.0; reward::N_TERMS])
+    }
+
+    /// The opponent-only twin, same units, also reset on read. All zeros in a
+    /// self-play arena (nothing has been declared an opponent), and NOT the
+    /// arena-wide total minus the learner one whenever a partial foreign team
+    /// mirrors some of its orange cars through our net -- see `reward_terms_opp`.
+    pub fn take_reward_terms_opp(&mut self) -> [f64; reward::N_TERMS] {
+        std::mem::replace(&mut self.reward_terms_opp, [0.0; reward::N_TERMS])
+    }
+
+    /// Declare how many of this arena's agents are learner rows (the blue
+    /// prefix), and how many of the agents after them are OPPONENT-driven.
+    /// Called once per collect from the assignment the trainer sends, so it
+    /// costs nothing per step and cannot drift from the rows that are actually
+    /// trained on.
+    ///
+    /// `n_opp = None` means "everything after the learner prefix", which is
+    /// correct for a full foreign team and for a native opponent-pool arena, and
+    /// is what every non-collect caller wants. Pass `Some(fcars)` for a PARTIAL
+    /// foreign team, where the cars past the bot's are our own policy mirrored
+    /// in and belong in neither column.
+    ///
+    /// Both counts are clamped rather than asserted: a caller that gets this
+    /// wrong should mis-attribute telemetry, never abort a training run.
+    pub fn set_learner_agents(&mut self, n: usize, n_opp: Option<usize>) {
+        let total = self.num_agents();
+        self.learner_agents = n.min(total);
+        let rest = total - self.learner_agents;
+        self.opp_agents = n_opp.map_or(rest, |k| k.min(rest));
+    }
+
     /// Queue per-car controls overrides for the NEXT step (consumed and cleared
     /// by it). Used to drive foreign-opponent cars.
     pub fn set_foreign_overrides(&mut self, o: Vec<(u32, [f32; 8])>) {
@@ -957,8 +1030,15 @@ impl EpisodeArena {
 
         for a in 0..n {
             let ci = self.agent_car_index(&cur, a);
+            // Per-agent scratch, folded into the arena-wide counters and
+            // (for learner rows only) into the learner ones. compute_terms is
+            // called EXACTLY ONCE per agent either way -- the split must never
+            // become a second evaluation of the reward function, which is the
+            // same reason `compute` is written as `compute_terms` with the
+            // counters discarded.
+            let mut t = [0.0f64; reward::N_TERMS];
             let mut r = reward::compute_terms(
-                &self.prev_state, &cur, ci, scored, &self.reward_cfg, &mut self.reward_terms,
+                &self.prev_state, &cur, ci, scored, &self.reward_cfg, &mut t,
             );
             if self.match_mode() {
                 let wp = reward::win_prob_shaping(
@@ -966,7 +1046,7 @@ impl EpisodeArena {
                     self.reward_cfg.win_prob_gamma, &self.reward_cfg,
                 );
                 r += wp;
-                self.reward_terms[reward::T_WIN_PROB] += wp as f64;
+                t[reward::T_WIN_PROB] += wp as f64;
             }
             // v9 aerial-setup shaping. UNCONDITIONAL (unlike win_prob_shaping,
             // which needs a match layer to have a score at all): PHI is a
@@ -985,7 +1065,23 @@ impl EpisodeArena {
                 &self.prev_state, &cur, ci, self.reward_cfg.win_prob_gamma, &self.reward_cfg,
             );
             r += air;
-            self.reward_terms[reward::T_AIR_SETUP] += air as f64;
+            t[reward::T_AIR_SETUP] += air as f64;
+            for (dst, v) in self.reward_terms.iter_mut().zip(t.iter()) {
+                *dst += v;
+            }
+            // THREE-WAY, not learner/not-learner: a partial foreign team's
+            // mirror cars are ours but untrained, so they belong in neither
+            // column. They fall through both branches and are counted only in
+            // the arena-wide array.
+            if a < self.learner_agents {
+                for (dst, v) in self.reward_terms_learner.iter_mut().zip(t.iter()) {
+                    *dst += v;
+                }
+            } else if a < self.learner_agents + self.opp_agents {
+                for (dst, v) in self.reward_terms_opp.iter_mut().zip(t.iter()) {
+                    *dst += v;
+                }
+            }
             rewards[a] = r;
             flags[a] = StepFlags { terminated, truncated };
         }
@@ -2040,5 +2136,94 @@ mod replay_reset_tests {
         for _ in 0..100 {
             one.debug_force_reset();
         }
+    }
+
+    #[test]
+    fn reward_telemetry_splits_learner_from_opponent() {
+        // The counters are summed over EVERY car in the arena, which is the
+        // wrong instrument for "is OUR policy doing this": in an arena with a
+        // ported bot on the orange side, the bot's touches and its share of
+        // every shaping term land in the same total as ours. Measured on the
+        // champion, the arena-wide r_aerial_touch was +2.23 and its OWN share
+        // of that was 0.0000 -- all of it was nexto's.
+        //
+        // `set_learner_agents(1, None)` is what a 1v1 opponent arena declares:
+        // blue is trained on, orange is the opponent.
+        let mut a = mk(1, 1, 21, None);
+        a.take_reward_terms();
+        a.take_reward_terms_learner();
+        a.take_reward_terms_opp();
+        a.set_learner_agents(1, None);
+        let (mut r, mut f, mut fo) = (vec![0.0; 2], vec![StepFlags::default(); 2],
+                                      vec![0.0; 2 * OBS_SIZE]);
+        for _ in 0..10 {
+            a.step(&[0, 0], &mut r, &mut f, &mut fo);
+        }
+        let all = a.take_reward_terms();
+        let learner = a.take_reward_terms_learner();
+        let opp = a.take_reward_terms_opp();
+        assert_eq!(all[reward::T_AGENT_STEPS], 20.0, "2 cars x 10 steps");
+        assert_eq!(learner[reward::T_AGENT_STEPS], 10.0,
+                   "only the blue car's steps are learner rows");
+        assert_eq!(opp[reward::T_AGENT_STEPS], 10.0,
+                   "and at a FULL opponent team the other car's are all the opponent's");
+    }
+
+    #[test]
+    fn a_partial_foreign_teams_mirror_cars_are_in_neither_column() {
+        // THE MIS-ATTRIBUTION THIS THIRD ARRAY EXISTS FOR. A 3v3 arena whose
+        // foreign slot has `cars_in_arena == 1` has three kinds of car: three
+        // blue learner rows, ONE orange car the bot drives, and TWO orange
+        // "mirror" cars run through our own net and then dropped from the
+        // training set (engine.rs `fwd_idx`). Under the old
+        // opponent-is-everything-not-a-learner-row rule those two mirrors were
+        // counted as the bot: in v9's shipped config that is 31 of 79
+        // non-learner rows, 39%, so an "opponent" aerial rate printed 0.153
+        // where the bot's own was 0.24 and a reader attributed all of it to
+        // nexto.
+        let mut a = mk(3, 3, 23, None);
+        a.take_reward_terms();
+        a.take_reward_terms_learner();
+        a.take_reward_terms_opp();
+        a.set_learner_agents(3, Some(1));
+        let (mut r, mut f, mut fo) = (vec![0.0; 6], vec![StepFlags::default(); 6],
+                                      vec![0.0; 6 * OBS_SIZE]);
+        for _ in 0..10 {
+            a.step(&[0; 6], &mut r, &mut f, &mut fo);
+        }
+        let all = a.take_reward_terms();
+        let learner = a.take_reward_terms_learner();
+        let opp = a.take_reward_terms_opp();
+        assert_eq!(all[reward::T_AGENT_STEPS], 60.0, "6 cars x 10 steps");
+        assert_eq!(learner[reward::T_AGENT_STEPS], 30.0, "the three blue cars");
+        assert_eq!(opp[reward::T_AGENT_STEPS], 10.0,
+                   "the ONE car the bot drives -- not 30, which is what \
+                    (all - learner) would have said");
+        assert_eq!(all[reward::T_AGENT_STEPS]
+                   - learner[reward::T_AGENT_STEPS]
+                   - opp[reward::T_AGENT_STEPS], 20.0,
+                   "the two mirror cars are ours, untrained, and in neither column");
+    }
+
+    #[test]
+    fn learner_split_is_the_identity_in_a_self_play_arena() {
+        // The default, and the property that keeps every non-collect caller
+        // (lib.rs's single-arena Env, every bench, every test) unaffected by
+        // the split existing: an arena nobody has told about an opponent counts
+        // every agent as a learner row, so the two arrays are equal term for
+        // term and the old key in the telemetry dict means exactly what it did.
+        // The opponent array stays all-zero, which is what lets the trainer
+        // suppress the `opp` column entirely rather than print zeros.
+        let mut a = mk(2, 2, 22, None);
+        a.take_reward_terms();
+        a.take_reward_terms_learner();
+        a.take_reward_terms_opp();
+        let (mut r, mut f, mut fo) = (vec![0.0; 4], vec![StepFlags::default(); 4],
+                                      vec![0.0; 4 * OBS_SIZE]);
+        for _ in 0..8 {
+            a.step(&[0, 0, 0, 0], &mut r, &mut f, &mut fo);
+        }
+        assert_eq!(a.take_reward_terms(), a.take_reward_terms_learner());
+        assert_eq!(a.take_reward_terms_opp(), [0.0; reward::N_TERMS]);
     }
 }

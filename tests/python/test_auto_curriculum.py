@@ -16,7 +16,8 @@ from construct.learn.train import Trainer
 
 
 def _stub(win_rates, periods, kinds=None, alpha=1.0, dwell=0,
-          ladder=None, cars=None, modes=None, big=1.0):
+          ladder=None, cars=None, modes=None, big=1.0,
+          warmup=0, total_steps=0, start_steps=0):
     """Minimal object carrying only what `_auto_curriculum_step` touches.
 
     alpha=1.0 makes the per-slot EMA equal the raw win rate, so a single call
@@ -31,6 +32,10 @@ def _stub(win_rates, periods, kinds=None, alpha=1.0, dwell=0,
 
     `big` defaults to 1.0 so |ema - 0.5| can never exceed it and the 2-rung jump
     stays out of the legacy tests' way.
+
+    `warmup` defaults to 0 = OFF, for the same reason: the D5 rung warmup gates
+    the controller on experience gathered since the process started, and every
+    test above is about the control law rather than the gate in front of it.
     """
     kinds = kinds or [f"bot{i}" for i in range(len(periods))]
     n = len(periods)
@@ -56,6 +61,9 @@ def _stub(win_rates, periods, kinds=None, alpha=1.0, dwell=0,
         _ac_ladder=list(ladder) if ladder else None,
         _ac_pidx=pidx,
         _ac_big=big,
+        _ac_warmup_steps=warmup,
+        _ac_start_steps=start_steps,
+        total_steps=total_steps,
         _ac_cycle=0,
         _ac_stagger=False,
         _foreign_periods=list(periods),
@@ -286,3 +294,47 @@ def test_dwell_and_independence_still_hold_on_the_ladder():
         assert s._foreign_periods == [10, 16], "dwell must block further moves"
     _step(s)
     assert s._foreign_periods == [8, 20], "after the dwell both may move again"
+
+
+# ---------------------------------------------------------------- D5 --------
+# The rung WARMUP: nothing moves in a process's first `_ac_warmup_steps` steps.
+
+
+def test_no_rung_moves_inside_the_warmup_window():
+    """MEASURED, repeatedly, across restarts: the first eval a process runs
+    reads 0.11-0.28 and the next reads 0.67-0.92, one rung apart -- the first
+    measurement moves the rung and the second has to undo it. Inside the window
+    the eval is not run at all, so a slot cannot move and cannot have garbage
+    folded into its EMA either."""
+    s = _stub([0.90], [4], warmup=20_000_000, total_steps=5_000_000, start_steps=0)
+    _step(s)
+    assert s._foreign_periods[0] == 4, "a 0.90 read inside the warmup must not harden"
+    assert s._ac_wr_ema[0] is None, "and must not be folded into the EMA"
+
+
+def test_the_rung_moves_once_the_warmup_is_served():
+    s = _stub([0.90], [4], warmup=20_000_000, total_steps=20_000_000, start_steps=0)
+    _step(s)
+    assert s._foreign_periods[0] == 3, "at exactly the threshold the controller is live"
+
+
+def test_the_warmup_is_measured_from_this_process_not_the_lineage():
+    """A resume at 275M is gated to 295M. Gating on `total_steps` alone would
+    make the warmup a no-op on every resume -- which is the only case the
+    measurement above was taken in."""
+    s = _stub([0.90], [4], warmup=20_000_000,
+              total_steps=275_000_000, start_steps=275_000_000)
+    _step(s)
+    assert s._foreign_periods[0] == 4, "275M of LINEAGE is not 20M of this process"
+    s.total_steps = 295_000_000
+    _step(s)
+    assert s._foreign_periods[0] == 3
+
+
+def test_a_config_without_a_warmup_is_completely_unaffected():
+    """Adding a knob must never silently change a run that predates it: with
+    `_ac_warmup_steps` absent (or 0) the gate is not even evaluated."""
+    s = _stub([0.90], [4])
+    del s._ac_warmup_steps
+    _step(s)
+    assert s._foreign_periods[0] == 3

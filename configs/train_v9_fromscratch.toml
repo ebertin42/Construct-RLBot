@@ -509,9 +509,48 @@ enabled = true
 # them) and they are appended at the EASY end so every existing ladder index is
 # unchanged. The 3v3 sweep says the knob still has authority out there: nexto
 # 3v3 goal share p12/p24/p48/p96 = 0.092/0.256/0.314/0.371.
-period_ladder = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48]
+#
+# TRIMMED BACK TO p24 AS THE FLOOR (2026-07-26, second edit). The extension
+# above was reasoned from a COLD-START measurement -- a random net that could
+# not reach the band at p24 -- and it was right about that. What it did not
+# anticipate is what a trained net does with an escape hatch: v9's element/1v1
+# slot walked DOWN to p32 and then sat at a comfortable 0.567 for 210M steps,
+# inside the band and therefore never touched again. A rung the controller is
+# happy with is a rung the policy is never forced past. v8's ladder floor was
+# p12 and its 1v1 slots had to learn their way out of it; that is the difference
+# the exploration diagnosis is pointing at (67 of 104 action rows dead here
+# against 2 of 92 in v8 at the same stage).
+#
+# THE PRICE, stated because it is the exact risk the extension was added for:
+# a slot that genuinely cannot hold 0.35 at 1c/p24 is now pinned at the easiest
+# expressible rung and will sit below the band losing. M0's weakest cold-start
+# reads were necto/3v3 0.278/0.222 and immortal/1v1 0.295. If a slot parks under
+# 0.35 for tens of millions of steps AFTER the warmup, the honest response is to
+# put its rung back (a two-character edit), not to widen the band.
+#
+# TRIM SAFETY, checked rather than assumed: p24 is `decision_periods`' seed and
+# is the LAST entry here, so a cold start seeds every slot at index 11 and no
+# index can run off the end -- `_rung_harder` only ever decrements from a valid
+# index or resets to len-1, `_rung_easier` only increments below len-1 or resets
+# to 0. A checkpoint whose stored rung was p32 (5 team slots were expected
+# there) restores onto the NEAREST surviving entry, p24 -- one rung in the old
+# ladder -- because `_restore_curriculum_state` re-derives the index from the
+# stored PERIOD whenever the stored index no longer names it. p48 would land on
+# p24 as well, which is two rungs; nothing is measured to be out there, but that
+# is the one case where a restore moves a slot further than one step.
+period_ladder = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24]
 band = 5.0                 # ep_rew fallback only
-adjust_every = 20
+# 20 -> 40 (2026-07-26). With `eval_stagger` a slot is measured every
+# `adjust_every * n_modes` iters, so this sets the measurement cadence at 120
+# iters/slot rather than 60. Two reasons. (1) COST: the eval engines now run 12
+# slots at 6 arenas each instead of 8, and every measurement is wall time not
+# spent training. (2) The pairing with `adjust_dwell` below -- halving the
+# cadence and halving the dwell leaves the time a slot must sit still before it
+# may move UNCHANGED at ~120 iters, while cutting the number of full eval passes
+# in half. The band arithmetic (one eval's sd 0.085-0.118 against a
+# [0.35,0.65] half-width of 0.15) is a property of the 18 matches per slot, not
+# of the cadence, so it is untouched.
+adjust_every = 40
 ema_alpha = 0.2            # ep_rew fallback only
 wr_ema_alpha = 0.3
 # Band and dwell are v8's, and they are ONLY valid because matches-per-slot is
@@ -520,7 +559,16 @@ wr_ema_alpha = 0.3
 # either without redoing that arithmetic.
 win_lo = 0.35
 win_hi = 0.65
-adjust_dwell = 2
+# 2 -> 1 (2026-07-26), and ONLY valid alongside `adjust_every` 20 -> 40 above.
+# The dwell is denominated in MEASUREMENTS but what it is protecting against is
+# acting on a policy that has not changed since the last decision, which is a
+# quantity of ITERATIONS. At 20/2 a slot sat still 3 measurements x 60 iters =
+# 180 iters between moves; at 40/1 it is 2 x 120 = 240. The dwell is shorter and
+# the wait is LONGER, so the L4 simulation's conclusion (move rate 0.11-0.22, a
+# 2-rung settled band at the same mean win rate) is not being weakened here --
+# a slot still folds two independent measurements into its EMA before acting,
+# which is the property that arithmetic actually turned on.
+adjust_dwell = 1
 # ONE EXTENSION to the tested law: a 2-rung move when |ema - 0.5| > 0.35, i.e.
 # ~3 sd outside the band. That is not a noise-driven move, and it buys back the
 # ratchet speed lost to the staggered eval below.

@@ -397,13 +397,38 @@ impl Engine {
     /// `agent_steps`) that the farming tripwires are computed from --
     /// touches/min/car and the airborne-touch fraction have no other source.
     ///
-    /// Counts EVERY agent-step, including foreign- and opponent-driven cars:
-    /// it describes the reward function, not the training set.
+    /// The bare `TERM_NAMES` keys count EVERY agent-step, including foreign-
+    /// and opponent-driven cars: they describe the reward function, not the
+    /// training set.
+    ///
+    /// A `learner_`-prefixed twin of every key carries the same counter
+    /// restricted to LEARNER ROWS. Read those when the question is about our
+    /// policy: the champion's own share of an arena-wide r_aerial_touch of
+    /// +2.23 was exactly 0.0000 -- the whole term was the ported bot's -- and
+    /// there was no way to see that from this dict before 2026-07-26. In a run
+    /// with no opponents the two are equal term for term.
+    ///
+    /// An `opp_`-prefixed twin carries the counter restricted to cars driven by
+    /// something that is NOT our live policy -- a ported bot, or a frozen
+    /// opponent-pool net. It is NOT `bare - learner_`, and reading it as though
+    /// it were is a real mis-attribution: a PARTIAL foreign team mirrors the
+    /// orange cars the bot cannot drive through our own net and discards their
+    /// experience, so they are neither learner rows nor opponent rows. In v9's
+    /// shipped config (`foreign_cars = [1; 12]`, four mode-2 and four mode-3
+    /// slots) 31 of the 79 non-learner rows -- 39% -- are ours, and subtracting
+    /// would print an "opponent" aerial rate of 0.153 where the bot's own is
+    /// 0.24. All zeros in a run with no opponents.
     fn reward_terms<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let sums = self.inner.reward_terms().map_err(PyValueError::new_err)?;
+        let (sums, learner, opp) = self.inner.reward_terms().map_err(PyValueError::new_err)?;
         let d = PyDict::new(py);
         for (name, v) in reward::TERM_NAMES.iter().zip(sums.iter()) {
             d.set_item(*name, *v)?;
+        }
+        for (name, v) in reward::TERM_NAMES.iter().zip(learner.iter()) {
+            d.set_item(format!("learner_{name}"), *v)?;
+        }
+        for (name, v) in reward::TERM_NAMES.iter().zip(opp.iter()) {
+            d.set_item(format!("opp_{name}"), *v)?;
         }
         Ok(d)
     }

@@ -93,7 +93,7 @@ pub struct RewardConfig {
 /// The last four entries are COUNTS, not reward: they are what the §8.3
 /// farming tripwires (touches/min/car, airborne-touch fraction, reward per
 /// goal) are computed from.
-pub const N_TERMS: usize = 13;
+pub const N_TERMS: usize = 14;
 pub const T_GOAL: usize = 0;
 pub const T_TOUCH: usize = 1;
 pub const T_VEL_TO_BALL: usize = 2;
@@ -107,6 +107,26 @@ pub const T_TOUCH_EVENTS: usize = 9;
 pub const T_AIRBORNE_TOUCH_EVENTS: usize = 10;
 pub const T_GOAL_EVENTS: usize = 11;
 pub const T_AGENT_STEPS: usize = 12;
+/// Touches that pass `aerial_touch`'s OWN gate: airborne AND on a ball above
+/// `aerial_z_lo`. APPENDED at the end (2026-07-26) so every existing index,
+/// and the `T_GOAL..=T_AERIAL_TOUCH` reward slice, is untouched.
+///
+/// It exists because `airborne_touch_events` is an ANTI-CORRELATED instrument
+/// and was being read as if it measured air play. Measured: a RANDOM policy
+/// scores 0.87-0.93 on it -- the curriculum's random resets start half the cars
+/// airborne, and a tumbling car's contacts are all "airborne" -- while the
+/// champion, which makes 63x more real aerial touches than v9, scores 0.0117.
+/// The missing half of the gate is the height: the champion's airborne touches
+/// are ALL under the z_lo = 400 ramp, which is exactly why its own share of
+/// r_aerial_touch is 0.0000. This counter applies the height too, so it moves
+/// with the behaviour the reward pays for.
+///
+/// The touch COOLDOWN is deliberately not applied: this is a volume signal for
+/// "is the manoeuvre happening", not a payout, and gating it would make a
+/// carry read as one aerial. Stays 0 on any tape that does not configure the
+/// ramp (reward_v0's zeros would otherwise make `height_ramp` a 0/0 inf and
+/// count every airborne touch).
+pub const T_AERIAL_TOUCH_EVENTS: usize = 13;
 pub const TERM_NAMES: [&str; N_TERMS] = [
     "goal",
     "touch",
@@ -121,6 +141,7 @@ pub const TERM_NAMES: [&str; N_TERMS] = [
     "airborne_touch_events",
     "goal_events",
     "agent_steps",
+    "gated_aerial_touch_events",
 ];
 
 /// Ball radius. The `aerial_z_lo` floor in `validate`: a ramp whose bottom is
@@ -320,6 +341,13 @@ pub fn compute_terms(
         terms[T_TOUCH_EVENTS] += 1.0;
         if !me.state.is_on_ground {
             terms[T_AIRBORNE_TOUCH_EVENTS] += 1.0;
+            // `aerial_touch`'s own gate, minus the cooldown -- see
+            // T_AERIAL_TOUCH_EVENTS. The `hi > lo` test is what keeps this at
+            // zero on a tape with no ramp configured rather than counting every
+            // airborne touch through a 0/0 height_ramp.
+            if cfg.aerial_z_hi > cfg.aerial_z_lo && cur.ball.pos.z > cfg.aerial_z_lo {
+                terms[T_AERIAL_TOUCH_EVENTS] += 1.0;
+            }
         }
         if cooldown_ok {
             r += cfg.touch;
@@ -1297,6 +1325,35 @@ mod tests {
         RewardConfig::load("../configs/reward_v9_aerial.toml").unwrap()
     }
 
+    /// `[ppo] gamma` read out of a TRAIN config. The reward tape and the trainer
+    /// are two files that have to agree on one number and nothing in the loader
+    /// makes them: `air_setup`'s potential is discounted by `win_prob_gamma`, so
+    /// if that drifts from the discount GAE actually uses, the shaping no longer
+    /// telescopes against the return it is shaping and the run optimises a
+    /// different objective with every log line looking normal.
+    fn trainer_gamma(path: &str) -> f32 {
+        let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let v: toml::Value = text.parse().unwrap_or_else(|e| panic!("{path}: {e}"));
+        v.get("ppo")
+            .and_then(|p| p.get("gamma"))
+            .and_then(|g| g.as_float())
+            .unwrap_or_else(|| panic!("{path}: no [ppo] gamma")) as f32
+    }
+
+    /// The `air_setup` CO-REQUISITE, as a predicate so the design test and its
+    /// own negative case share one implementation rather than two copies that
+    /// can drift apart.
+    ///
+    /// A weight of zero needs nothing (`air_shaping` returns a literal 0.0). A
+    /// NONZERO weight needs a gamma that is both present and the trainer's:
+    /// `validate()` already refuses gamma <= 0 outright, but it cannot see the
+    /// train config, so "0.99 next to a trainer running 0.9954" is the failure
+    /// mode that survives every existing check.
+    fn air_setup_is_consistent(c: &RewardConfig, trainer_gamma: f32) -> bool {
+        c.air_setup == 0.0
+            || (c.win_prob_gamma > 0.0 && (c.win_prob_gamma - trainer_gamma).abs() < 1e-6)
+    }
+
     /// A 1v1 arena with the car placed at `car` moving at `car_v`, the ball at
     /// `ball` moving at `ball_v`, stepped once so a contact registers. Returns
     /// (prev, cur, car_idx).
@@ -1397,9 +1454,99 @@ mod tests {
         assert_eq!(c.aerial_touch, 1.5);
         assert_eq!(c.aerial_z_lo, 400.0);
         assert_eq!(c.aerial_z_hi, 1400.0);
-        assert_eq!(c.air_setup, 0.0, "STAGED OFF at launch -- two new terms at once is unattributable");
         assert_eq!(c.team_spirit, 0.3);
         assert_eq!(c.opp_spirit, 0.0);
+        // `air_setup` USED TO BE PINNED AT 0.0 here. That assertion encoded a
+        // schedule, not a design: the term is a STAGED lever, documented in the
+        // config to switch on when the airborne-touch fraction stalls below ~5%
+        // at 150M steps, and it was pulled on that trigger at 222M (0.0 -> 0.3).
+        // A literal that has to be edited every time the value legitimately
+        // moves teaches the next reader to edit the number instead of checking
+        // the design -- the opposite of what a guard is for.
+        //
+        // What must NEVER drift is the co-requisite, so pin THAT instead: a
+        // nonzero air_setup requires a positive win_prob_gamma (validate() gets
+        // that far) that also EQUALS the trainer's [ppo] gamma. Nothing else in
+        // the repo compares those two files, and the failure is silent -- the
+        // potential telescopes against the wrong discount and the run optimises
+        // something other than the return it is shaping.
+        let g = trainer_gamma("../configs/train_v9_fromscratch.toml");
+        assert!(
+            air_setup_is_consistent(&c, g),
+            "air_setup={} needs win_prob_gamma == the trainer's [ppo] gamma {g}, got {}",
+            c.air_setup, c.win_prob_gamma
+        );
+    }
+
+    #[test]
+    fn air_setup_consistency_check_catches_a_gamma_drift() {
+        // Teeth for the assertion above: it must reject the two ways the pair
+        // can disagree, and stay out of the way when the lever is staged off.
+        let trainer = 0.9954f32;
+        let mut c = v9_cfg();
+        c.air_setup = 0.3;
+        c.win_prob_gamma = trainer;
+        assert!(air_setup_is_consistent(&c, trainer), "the shipped pairing must pass");
+        c.win_prob_gamma = 0.99;
+        assert!(!air_setup_is_consistent(&c, trainer),
+                "a gamma that is merely DIFFERENT is the silent failure -- must be caught");
+        c.win_prob_gamma = 0.0;
+        assert!(!air_setup_is_consistent(&c, trainer), "a missing gamma must be caught");
+        // staged off: the gamma is then nobody's business
+        c.air_setup = 0.0;
+        assert!(air_setup_is_consistent(&c, trainer));
+    }
+
+    /// One car, airborne, forged contact, ball at `ball_z`. Returns the counters.
+    fn airborne_touch_terms(cfg: &RewardConfig, ball_z: f32) -> [f64; N_TERMS] {
+        let (p, c) = synth(
+            [0.0, 0.0, ball_z], [0.0, 0.0, 0.0], [0.0, 1800.0, 0.0],
+            &[(Team::Blue, [0.0, -200.0, ball_z - 100.0], true)],
+        );
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&p, &c, 0, None, cfg, &mut t);
+        assert!(t[T_TOUCH_EVENTS] > 0.0, "precondition: the forged contact registers");
+        t
+    }
+
+    #[test]
+    fn the_gated_aerial_counter_separates_real_aerials_from_airborne_contact() {
+        // WHY THIS COUNTER EXISTS. `airborne_touch_events` reads 0.87-0.93 on a
+        // RANDOM policy (the curriculum starts half the cars in the air, and a
+        // tumbling car's contacts are all "airborne") and 0.0117 on the
+        // champion, which makes 63x more real aerial touches -- it is
+        // ANTI-CORRELATED with the skill it was being read as measuring. The
+        // missing half of the gate is the height.
+        let cfg = v9_cfg();          // aerial_z_lo = 400
+        let high = airborne_touch_terms(&cfg, 1000.0);
+        assert_eq!(high[T_AIRBORNE_TOUCH_EVENTS], 1.0);
+        assert_eq!(high[T_AERIAL_TOUCH_EVENTS], 1.0, "a real high strike must count");
+        assert!(high[T_AERIAL_TOUCH] > 0.0, "and the term itself pays for it");
+
+        // The champion's ENTIRE airborne-touch population: off the ground, but
+        // on a ball under the ramp. The old counter says 1; the new one says 0,
+        // which is the number that matches its measured r_aerial_touch share of
+        // exactly 0.0000 over 24,000 learner steps.
+        let low = airborne_touch_terms(&cfg, 300.0);
+        assert_eq!(low[T_AIRBORNE_TOUCH_EVENTS], 1.0,
+                   "the old counter cannot tell these two apart -- that is the bug");
+        assert_eq!(low[T_AERIAL_TOUCH_EVENTS], 0.0);
+        assert_eq!(low[T_AERIAL_TOUCH], 0.0, "the reward gate agrees: h = 0 here");
+    }
+
+    #[test]
+    fn the_gated_aerial_counter_is_zero_on_a_tape_with_no_ramp() {
+        // reward_v0 -- the tape the gate, the benches, the league and the
+        // auto-curriculum eval all score with -- leaves aerial_z_lo/hi at 0,
+        // where `height_ramp` is a 0/0 inf that clamps to 1.0. Without the
+        // `hi > lo` test this counter would silently equal the airborne one on
+        // every instrument in the repo.
+        let cfg = RewardConfig::load("../configs/reward_v0.toml").unwrap();
+        assert_eq!((cfg.aerial_z_lo, cfg.aerial_z_hi), (0.0, 0.0), "precondition");
+        let t = airborne_touch_terms(&cfg, 1000.0);
+        assert_eq!(t[T_AIRBORNE_TOUCH_EVENTS], 1.0);
+        assert_eq!(t[T_AERIAL_TOUCH_EVENTS], 0.0,
+                   "a tape with no ramp defines no aerial gate; it must not guess one");
     }
 
     #[test]
@@ -1742,11 +1889,15 @@ mod tests {
 
     #[test]
     fn air_shaping_is_inert_at_zero_weight() {
-        // v9 ships air_setup = 0.0, and the episode-level call site is
-        // UNCONDITIONAL, so this exact-zero return is what keeps every existing
-        // config's per-step reward untouched.
-        let cfg = v9_cfg();
-        assert_eq!(cfg.air_setup, 0.0);
+        // The episode-level call site is UNCONDITIONAL, so this exact-zero
+        // return is what keeps the per-step reward of every config that does not
+        // set air_setup byte-identical -- which is every config but
+        // reward_v9_aerial.toml, and v9 itself for its first 222M steps.
+        // The weight is FORCED here rather than read off the shipped file: v9's
+        // is a staged lever and is 0.3 today, so asserting the file was zero
+        // tested the schedule instead of the property.
+        let mut cfg = v9_cfg();
+        cfg.air_setup = 0.0;
         let (prev, cur, i) = contact_state(
             [0.0, -220.0, 1000.0], [0.0, 1900.0, 0.0], [0.0, 0.0, 1000.0], [0.0, 0.0, 0.0], 16);
         assert_eq!(super::air_shaping(&prev, &cur, i, 0.9954, &cfg), 0.0);

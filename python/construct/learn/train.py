@@ -620,7 +620,29 @@ class Trainer:
             # the period settles into a 2-rung band at the SAME mean win rate
             # (~0.5). See the 2026-07-25 controller simulation.
             self._ac_dwell = int(ac.get("adjust_dwell", 2))
-            self._ac_since = [10 ** 6] * self._foreign_slots   # free to move at start
+            # SEEDED AT 0, not at "free to move" (was 10**6). Every slot must
+            # therefore spend `adjust_dwell` measurements settling before its
+            # first move, on a fresh run and on a resume alike -- the resume case
+            # holds because `_restore_curriculum_state` re-seeds this to 0 too
+            # rather than restoring the checkpoint's counter, which in steady
+            # state is always past the dwell. The old seed let
+            # the FIRST eval a process ever ran move a rung, and that eval is
+            # measured to be the least trustworthy one there is: on the 222M
+            # restart the first read came in at 0.11-0.28 and the next at
+            # 0.67-0.92, one rung apart, i.e. the first measurement moved the
+            # rung the wrong way and the second had to undo it. See the
+            # `_ac_warmup_steps` gate in `_auto_curriculum_step`, which is the
+            # other half of the same fix.
+            self._ac_since = [0] * self._foreign_slots
+            # NO RUNG MOVES FOR THE FIRST N STEPS OF A PROCESS (D5). Counted
+            # from `_ac_start_steps`, latched below AFTER the checkpoint's
+            # total_steps is restored, so this is "since this process started"
+            # and not "since the lineage started" -- a resume at 275M is gated
+            # to 295M, exactly the window the unreliable first evals live in.
+            # Default 20M applies to every auto-curriculum config, including
+            # ones that predate it: a from-zero net is unreadable for its first
+            # ~20M steps too (that is L7, and this file's own header says it).
+            self._ac_warmup_steps = int(ac.get("rung_warmup_steps", 20_000_000))
             # LEXICOGRAPHIC rung control (v9 D11). Two knobs per slot:
             # `foreign_cars` (coarse) and an index into `period_ladder` (fine).
             #
@@ -725,6 +747,14 @@ class Trainer:
             if _state["optimizer"] is not None:  # None = deliberate reset (regime swap)
                 self.opt.load_state_dict(_state["optimizer"])
             self.total_steps = _state["total_steps"]
+            # Absent on every checkpoint written before 2026-07-26, in which case
+            # this is a no-op and the rungs stay at their config seeds exactly as
+            # they did before -- see `_restore_curriculum_state`.
+            self._restore_curriculum_state(_state.get("curriculum"))
+        # Anchor for the rung warmup. Latched HERE, after any resume has moved
+        # total_steps, so `total_steps - _ac_start_steps` is experience gathered
+        # by THIS process. 0 for a fresh run, which gates its first 20M too.
+        self._ac_start_steps = self.total_steps
 
         # cfg.ppo["lr"] is the AUTHORITY, not Adam's restored param_groups.
         # `load_state_dict` above carries the checkpoint's `lr` back in, which is
@@ -745,6 +775,162 @@ class Trainer:
         for g in self.opt.param_groups:
             g["lr"] = lr
         return lr
+
+    # --- auto-curriculum state across a restart (D6) -----------------------
+    # THE MEASUREMENT THIS EXISTS FOR: the v9 restart at 222M reset all twelve
+    # rungs to the config seed p24 and cleared every EMA and dwell counter,
+    # because none of it was ever written to the checkpoint. The controller then
+    # has to re-walk the ladder from the seed at one rung per (dwell + 1)
+    # measurements, and with the staggered eval a slot is measured every
+    # `adjust_every * n_modes` iters -- tens of millions of steps of experience
+    # spent back down a ladder it had already climbed. It also means no restart
+    # in this run has ever been single-variable: whatever the restart was FOR,
+    # it also silently rewound the opponent difficulty.
+    #
+    # THE RUNG IS DURABLE KNOWLEDGE; THE MEASUREMENT IS NOT. Four fields come
+    # back: the two rung knobs (`_foreign_periods` and `_foreign_cars`), where
+    # each slot sits on the ladder (`_ac_pidx`), and the staggered eval's
+    # round-robin cursor (`_ac_cycle`). Those describe the OPPONENT, which a
+    # restart does not change -- that is the whole point of D6.
+    #
+    # `_ac_wr_ema` and `_ac_since` are written for provenance and DELIBERATELY
+    # NOT restored. They describe a POLICY, and by the time they are read the
+    # policy has moved (a restart is performed in order to change something --
+    # this one changes entropy_coef). Restoring them breaks two invariants at
+    # once:
+    #   * the controller's own rule at `_auto_curriculum_step` -- a rung change
+    #     invalidates the EMA, because every sample in it describes the old
+    #     difficulty. The D7 ladder trim makes the RESTORE ITSELF a rung change
+    #     (a slot parked at p32 lands on p24), so a surviving EMA would ratchet
+    #     again on evidence gathered at a difficulty this run never measured.
+    #   * D5's dwell seed. `_ac_since` only ever resets on a move, so in steady
+    #     state it comes back well past the dwell -- measured, every one of the
+    #     twelve slots in the last four `auto-curriculum:` lines of the v9 log
+    #     prints with no `dwellN/M` suffix. A restored counter means the first
+    #     eval after the warmup is free to move a rung on a 70%-stale EMA, which
+    #     is exactly the failure D5 exists to stop.
+    # Everything else the controller uses is re-read from the TOML on every
+    # start and is deliberately NOT persisted -- the config must stay the
+    # authority on the band, the ladder, the dwell length and the cadence, which
+    # is what makes `resume_train.py` able to change them at all.
+    _CURRICULUM_FIELDS = ("_foreign_periods", "_foreign_cars", "_ac_pidx",
+                          "_ac_cycle")
+    # Written so a checkpoint can be read post-hoc ("what did the controller
+    # believe when this was saved"), never read back in. See above.
+    _CURRICULUM_PROVENANCE_FIELDS = ("_ac_wr_ema", "_ac_since")
+
+    def _curriculum_state(self) -> dict | None:
+        """The controller's rung state plus its provenance, or None when no
+        foreign slots are loaded (every v0/v8-and-earlier run, which is why the
+        key can be absent)."""
+        if getattr(self, "_foreign_slots", 0) == 0:
+            return None
+        out = {}
+        for f in self._CURRICULUM_FIELDS + self._CURRICULUM_PROVENANCE_FIELDS:
+            v = getattr(self, f, None)
+            out[f] = list(v) if isinstance(v, list) else v
+        # WHAT THIS STATE DESCRIBES, so a resume can tell whether it still
+        # applies. Rung state is per (bot, team size) and positional: restoring
+        # slot 3's ladder index onto a differently-ordered slot list would hand
+        # a bot another bot's difficulty, silently.
+        out["slots"] = [(k, m) for k, m in zip(self._foreign_kinds, self._foreign_modes)]
+        out["ladder"] = list(self._ac_ladder) if getattr(self, "_ac_ladder", None) else None
+        return out
+
+    def _restore_curriculum_state(self, d: dict | None) -> None:
+        """Put the RUNGS back where the checkpoint left them, and start the
+        measurement over.
+
+        DEGRADES TO THE CONFIG SEEDS, loudly, in every case where the stored
+        state does not describe this run: a checkpoint written before this
+        existed (`d` is None), foreign opponents disabled, or a slot list that
+        has changed shape or order since. "Loudly" matters more than usual here
+        -- a rung silently one place off is invisible in the log and shows up
+        only as an opponent that is too easy for tens of millions of steps.
+
+        The EMA and the dwell counter are NOT restored -- see
+        `_CURRICULUM_PROVENANCE_FIELDS`. So every slot comes back with a fresh
+        EMA and a full dwell to serve, whether this config kept its rung or the
+        clamp/remap below moved it.
+        """
+        if not d or getattr(self, "_foreign_slots", 0) == 0:
+            return
+        want = [(k, m) for k, m in zip(self._foreign_kinds, self._foreign_modes)]
+        got = [tuple(s) for s in d.get("slots", [])]
+        if got != want:
+            print(f"curriculum: checkpoint state describes slots {got} but this "
+                  f"config has {want} -- keeping the config seeds", flush=True)
+            return
+        n = self._foreign_slots
+        for f in self._CURRICULUM_FIELDS:
+            v = d.get(f)
+            if f == "_ac_cycle":
+                if isinstance(v, int):
+                    self._ac_cycle = v
+            elif isinstance(v, list) and len(v) == n:
+                setattr(self, f, list(v))
+        # The rung AS STORED, before this config's bounds are applied, so the
+        # print below can name every slot whose difficulty the restore itself
+        # changed. That is the D7 trim's visible edge: it is a real rung move,
+        # made by editing a TOML rather than by a measurement, and the log is
+        # the only place it can be seen.
+        stored_periods, stored_cars = list(self._foreign_periods), list(self._foreign_cars)
+        # The config still owns the BOUNDS. A restored rung is clamped back into
+        # whatever the live config expresses, because the two legal ways to
+        # change a ladder mid-run -- trimming it (v9 D7 drops p32/p48) or
+        # changing foreign_cars' ceiling -- would otherwise restore a slot to a
+        # rung that no longer exists.
+        self._foreign_cars = [max(1, min(int(c), m))
+                              for c, m in zip(self._foreign_cars, self._foreign_modes)]
+        if self._ac_ladder:
+            lad = self._ac_ladder
+            pidx, periods = [], []
+            for s, p in enumerate(self._foreign_periods):
+                i = self._ac_pidx[s]
+                if not (0 <= i < len(lad)) or lad[i] != int(p):
+                    # RE-DERIVE FROM THE PERIOD, not from the stored index: the
+                    # index is a position in a ladder that may have been edited,
+                    # the period is the difficulty itself. Nearest entry is the
+                    # same rule __init__ seeds with, so a trimmed tail lands a
+                    # slot on the closest surviving rung (p32 -> p24, one rung in
+                    # the old ladder) instead of indexing off the end.
+                    i = min(range(len(lad)), key=lambda j, p=p: abs(lad[j] - int(p)))
+                pidx.append(i)
+                periods.append(lad[i])
+            self._ac_pidx, self._foreign_periods = pidx, periods
+        else:
+            self._foreign_periods = [
+                max(self._ac_period_min, min(self._ac_period_max, int(p)))
+                for p in self._foreign_periods
+            ]
+        # THE MEASUREMENT STARTS OVER. Not a defensive re-seed of values
+        # `__init__` already set: it is the same rule `_auto_curriculum_step`
+        # applies after any rung move, stated at the one other place a rung can
+        # move. A restart changes the policy being measured (that is what it is
+        # for), and the clamp/remap above can change the difficulty as well, so
+        # the stored EMA describes neither the current policy nor, possibly, the
+        # current rung -- and `_ac_since` is past the dwell in steady state, so
+        # keeping it would let the first eval after the warmup act on that EMA.
+        self._ac_wr_ema = [None] * n
+        self._ac_since = [0] * n
+        # The engine was handed the CONFIG seeds a few lines above; hand it the
+        # restored rungs before the first rollout, or the run would train against
+        # the seed difficulty until the first adjust cycle fired.
+        self.engine.set_foreign_opponents(
+            self._foreign_sds, self._foreign_kinds, self._foreign_periods,
+            list(self._foreign_cars))
+        moved = [s for s in range(n)
+                 if self._foreign_periods[s] != int(stored_periods[s])
+                 or self._foreign_cars[s] != int(stored_cars[s])]
+        print("curriculum RESTORED from checkpoint: "
+              + " ".join(f"{k}/{m}s {self._rung_str(s)}"
+                         for s, (k, m) in enumerate(want))
+              + " | EMA + dwell reset for every slot"
+              + ("" if not moved else
+                 " | RUNG MOVED BY THIS CONFIG (ladder/cars bounds changed): "
+                 + " ".join(f"{want[s][0]}/{want[s][1]}s "
+                            f"{stored_cars[s]}c/p{stored_periods[s]}->{self._rung_str(s)}"
+                            for s in moved)), flush=True)
 
     def _measure_foreign_winrates(self, modes=None) -> list[float | None] | None:
         """PER-SLOT blue win share, each bot at its own current rung, measured on
@@ -882,6 +1068,28 @@ class Trainer:
                         + self._ac_alpha * signal)
         if it % self._ac_every != 0:
             return
+        # --- rung warmup (D5): NOTHING MOVES IN THIS PROCESS'S FIRST 20M STEPS.
+        # MEASURED, repeatedly, across restarts: the first eval a process runs
+        # reads 0.11-0.28 and the next one 0.67-0.92, one rung apart -- the first
+        # measurement moves the rung and the second has to undo it. A restart
+        # perturbs what is being measured (fresh eval arenas, fresh kickoffs,
+        # a policy that has just had its optimizer state reloaded), so an eval
+        # taken inside this window is not evidence about the rung.
+        #
+        # The eval is SKIPPED rather than measured-and-ignored, deliberately: a
+        # reading folded into the EMA is acted on later just the same, only with
+        # the provenance lost. Holding also costs nothing -- the rungs are where
+        # `_restore_curriculum_state` put them, which is where the last process
+        # measured them to belong.
+        warm = int(getattr(self, "_ac_warmup_steps", 0))
+        if warm > 0:
+            elapsed = int(getattr(self, "total_steps", 0)) - int(getattr(self, "_ac_start_steps", 0))
+            if elapsed < warm:
+                print(f"auto-curriculum: WARMUP {elapsed:,}/{warm:,} steps since this "
+                      "process started -- no eval, no rung move; holding "
+                      + " ".join(f"{k} {self._rung_str(s)}"
+                                 for s, k in enumerate(self._foreign_kinds)), flush=True)
+                return
         # Staggered eval: one MODE per cycle, round-robin. Each slot is then
         # measured every `adjust_every * n_modes` iters and (with the 2-eval
         # dwell) can move at most every 3 measurements. The 2-rung jump rule
@@ -1211,23 +1419,122 @@ class Trainer:
             parts.append(f"{m}v{m} {100.0 * k / max(1, total):.1f}%|A|{a[sel].abs().mean():.3f}")
         return "grp " + " ".join(parts)
 
+    # Rows put through the extra forward that measures `p_jump`. 8192 is one
+    # minibatch, ~2.7% more forward rows on a 3-epoch update over a 93,440-row
+    # batch. The quantity being measured is a per-state MASS, not a sampled
+    # indicator, so 8192 states estimate its mean tightly even at 1e-5 -- the
+    # sampled-action frequency would need ~10^8 rows to resolve that at all,
+    # which is exactly why the number has been invisible.
+    _P_JUMP_ROWS = 8192
+
+    def _p_jump_idx(self, rows: int, device) -> torch.Tensor:
+        """A uniform sample of `_P_JUMP_ROWS` of the batch's `rows`, drawn from a
+        LOCAL generator seeded on `total_steps`.
+
+        WHY NOT A FIXED STRIDE, which is what this was. Rows are arena-major /
+        car-minor per timestep, so row `r`'s learner column is `r % N`, and a
+        stride of `step = rows // 8192 = (T*N) // 8192` covers only
+        `N / gcd(step, N)` distinct columns. At T=256 the step is exactly N//32,
+        so whenever N is a multiple of 32 the step DIVIDES N and the sample
+        collapses to 32 columns -- and always car 0 of every g-th arena, i.e.
+        systematically the blue car that takes the kickoff. Computed: N of
+        320/352/384/416/448/512/576 all give 32 columns; N=391 (the live value,
+        `iter 739 steps 296,184,064` / 256) gives 391. `--num-arenas` is a
+        routine `resume_train.py` override and N also shifts with the foreign
+        fraction and the team-size mix, so the instrument's sampling character
+        could change between two runs being compared with nothing in the log to
+        say so.
+
+        A local generator keeps the one property the stride was there for: this
+        must not draw from torch's GLOBAL RNG, which `ppo_update`'s minibatch
+        permutation also draws from -- consuming one number there would shift
+        every subsequent update and make the run non-reproducible for the sake
+        of a telemetry line. Seeding on `total_steps` also keeps it reproducible
+        from a checkpoint.
+        """
+        g = torch.Generator()               # CPU, independent of torch.manual_seed
+        g.manual_seed(int(getattr(self, "total_steps", 0)))
+        k = min(int(rows), self._P_JUMP_ROWS)
+        return torch.randperm(int(rows), generator=g)[:k].to(device)
+
+    @torch.no_grad()
+    def _p_jump(self, batch) -> float | None:
+        """Mean softmax mass on JUMP rows over the states this batch visited.
+
+        THE QUANTITY THAT OSCILLATES 4,000x, AND IT IS NOT IN THE LOG. Under a
+        FROZEN config, measured by probe: 6.5e-6 at 222M steps, 4.36e-2 at 248M,
+        1.08e-5 at 256M. Something removes jump mass as fast as it appears, and
+        nothing else in the log line moves with it -- 67 of 104 action rows are
+        dead (v8 had 2 of 92 at the same stage) and the only evidence that
+        anything is wrong comes from running a probe by hand.
+
+        Measured on the policy AFTER this iteration's update, over a uniform
+        subsample of the states it just collected -- see `_p_jump_idx` for why
+        the sample is drawn from a local generator rather than by striding.
+
+        None (and no log field) for a v0 net or an action table with no jump
+        column, so nothing but v1 runs are affected.
+        """
+        tbl = getattr(self.net, "action_table", None)
+        obs = batch.get("obs")
+        if tbl is None or not isinstance(obs, dict) or tbl.ndim != 2 or tbl.shape[1] < 6:
+            return None
+        jump = tbl[:, 5] > 0.0          # column 5 = jump, actions::to_controls
+        if not bool(jump.any()):
+            return None
+        any_obs = next(iter(obs.values()))
+        idx = self._p_jump_idx(any_obs.shape[0], any_obs.device)
+        logits, _ = self.net(**{k: v[idx] for k, v in obs.items()})
+        return float(torch.softmax(logits, dim=-1)[:, jump].sum(-1).mean())
+
     def _reward_terms_line(self) -> str:
         """Per-term reward sums + the §8.3 farming tripwires, per iteration.
 
         `touches_per_min_per_car` is tripwire 1 and the cleanest farm detector:
         continuous ball contact fires 12-14 touch events/s = 720-860/min, while
-        healthy play is 20-40/min. `airborne_touch_frac` is G4's "is air play
-        real" number (target 10-25%; >50% with goals flat is a hover farm).
-        Empty string when the engine predates `reward_terms()`.
+        healthy play is 20-40/min. Empty string when the engine predates
+        `reward_terms()`.
+
+        EVERY TOUCH STAT IS SPLIT `lrn` / `opp` (2026-07-26). The counters sum
+        over every car in every arena, so with a ported bot on ~20% of arenas
+        the unsplit number is a blend of our policy and its. That is not a
+        pedantic distinction: measured on the champion, the arena-wide
+        r_aerial_touch was +2.23 and OUR share of it was exactly 0.0000 over
+        24,000 learner steps -- every unit of it was nexto's, and the log said
+        "aerial play is happening". `opp` is absent when there are no
+        opponent-driven cars, and the whole split is absent on an engine built
+        before it (both keys degrade to the arena-wide number, i.e. the line
+        reads exactly as it did).
+
+        `lrn` is the rows TRAINED ON and `opp` is the rows a BOT drove, and they
+        do not add up to the arena: a partial foreign team's mirror cars -- our
+        own policy on the orange cars the bot cannot drive, discarded from the
+        training set -- are in neither. 31 of v9's 79 non-learner rows are those
+        mirrors, which is why `opp` is the engine's own counter rather than
+        `total - lrn`.
+
+        TWO AERIAL FRACTIONS, and only one of them measures air play:
+
+        * `air_gate_frac` -- touches passing `aerial_touch`'s OWN gate (airborne
+          AND ball above `aerial_z_lo`). This is the one to read.
+        * `air_tch_frac` -- the historical `airborne_touch_events / touch_events`,
+          kept only for continuity with 275M steps of existing log. IT IS
+          ANTI-CORRELATED WITH AERIAL SKILL: a RANDOM policy reads 0.87-0.93 on
+          it (the curriculum starts half the cars airborne and a tumbling car's
+          contacts are all "airborne") while the champion reads 0.0117 and makes
+          63x more real aerial touches than v9's 0.0345. Do not gate anything on
+          it, and do not read it as "is air play real" -- that is what it was
+          used for, and the 5%-at-150M `air_setup` trigger was pulled off it.
 
         READ `r_aerial_touch` AS A NET, NOT A VOLUME. Since 2026-07-26 the term
         is SIGNED (driving the ball at your own net is charged what driving it at
         theirs pays -- that symmetry is what makes a closed cycle sum to zero), so
-        a small sum means "balanced", not "inert". `air_tch_frac` is the liveness
-        signal; if it is healthy and r_aerial_touch is ~0, the policy is going up
-        and achieving nothing, which is a different problem from not going up.
-        Tripwire 1 alone would NOT have caught the lateral farm this replaced: a
-        6000uu bat at 2400uu/s is 24 touches/min/car, inside the healthy band.
+        a small sum means "balanced", not "inert". `air_gate_frac lrn` is the
+        liveness signal; if it is healthy and r_aerial_touch is ~0, the policy is
+        going up and achieving nothing, which is a different problem from not
+        going up. Tripwire 1 alone would NOT have caught the lateral farm this
+        replaced: a 6000uu bat at 2400uu/s is 24 touches/min/car, inside the
+        healthy band.
         """
         get = getattr(self.engine, "reward_terms", None)
         if get is None:
@@ -1239,15 +1546,61 @@ class Trainer:
         steps = t.get("agent_steps", 0.0)
         if steps <= 0:
             return ""
+
+        def split(key):
+            """(learner, opponent) for a counter. `opponent` is None on an
+            engine with no learner counters -- in which case `learner` is the
+            arena-wide total, which is what the log meant before the split.
+
+            The opponent number is the engine's OWN `opp_` counter when it has
+            one, and only falls back to `total - learner` on an engine built
+            before that existed. The fallback is wrong in exactly one case, and
+            it is the shipped one: a partial foreign team mirrors the orange cars
+            the bot cannot drive through our own net, so 31 of v9's 79
+            non-learner rows are ours and the subtraction dilutes the bot's
+            number toward ours (0.153 printed against a true 0.24). Kept anyway,
+            because train.py must be shippable ahead of a rebuilt wheel -- but
+            the honest number is preferred whenever it is available.
+            """
+            tot = float(t.get(key, 0.0))
+            lrn = t.get("learner_" + key)
+            if lrn is None:
+                return tot, None
+            opp = t.get("opp_" + key)
+            return float(lrn), (tot - float(lrn) if opp is None else float(opp))
+
+        l_steps, o_steps = split("agent_steps")
+        l_tev, o_tev = split("touch_events")
         # tick_skip 8 at 120Hz -> 15 decisions/s per car
-        minutes = steps / 15.0 / 60.0
-        out = [f"tch/min/car {t.get('touch_events', 0.0) / max(1e-9, minutes):.1f}"]
+        def per_min(events, agent_steps):
+            return events / max(1e-9, agent_steps / 15.0 / 60.0)
+
+        def pair(label, l_val, o_val, fmt):
+            p = f"{label} {l_val:{fmt}}" if o_steps is None else f"{label} lrn {l_val:{fmt}}"
+            if o_val is not None and o_steps:
+                p += f" opp {o_val:{fmt}}"
+            return p
+
+        out = [pair("tch/min/car", per_min(l_tev, l_steps),
+                    None if o_steps is None else per_min(o_tev, o_steps), ".1f")]
+        # The gated fraction needs an engine that counts it; absent (older .so)
+        # the line simply carries the legacy fraction as before.
+        if "gated_aerial_touch_events" in t:
+            l_ga, o_ga = split("gated_aerial_touch_events")
+            out.append(pair(
+                "air_gate_frac",
+                l_ga / l_tev if l_tev > 0 else 0.0,
+                None if o_tev is None else (o_ga / o_tev if o_tev > 0 else 0.0),
+                ".4f"))
         tev = t.get("touch_events", 0.0)
         if tev > 0:
             out.append(f"air_tch_frac {t.get('airborne_touch_events', 0.0) / tev:.3f}")
         for k in ("aerial_touch", "air_setup", "touch_accel", "touch"):
             if t.get(k, 0.0):
-                out.append(f"r_{k} {t[k]:.2f}")
+                # SPLIT, for the same reason the touch counts are: r_aerial_touch
+                # is the exact term whose whole arena-wide value was measured to
+                # be the ported bot's on a policy that scored 0.0000 of it.
+                out.append(pair(f"r_{k}", *split(k), ".2f"))
         ge = t.get("goal_events", 0.0)
         if ge > 0:
             # L8's master detector: farming shows as shaping-per-goal RISING
@@ -1363,6 +1716,11 @@ class Trainer:
                     msg += f" adv_group_floor_hits {stats['adv_group_floor_hits']:.0f}"
                 if batch.get("forward_rows", 0) != batch["n_agents"]:
                     msg += f" fwd_rows {batch['forward_rows']}"
+                pj = self._p_jump(batch)
+                if pj is not None:
+                    # Scientific notation deliberately: the readings that matter
+                    # span 1e-5 to 4e-2 and %.3f prints three of them as 0.000.
+                    msg += f" p_jump {pj:.3e}"
                 msg += self._reward_terms_line()
                 print(msg, flush=True)
             if it % self.cfg.run.get("save_every_iters", 20) == 0:
@@ -1392,6 +1750,11 @@ class Trainer:
                 # records which reward regime produced this checkpoint
                 "reward_config_path": self.cfg.reward_config_path,
                 "curriculum_config_path": self.cfg.curriculum_config_path,
+                # Auto-curriculum controller state (D6). None when no foreign
+                # slots are loaded, which is every pre-v9 lineage -- and readers
+                # must treat an ABSENT key the same way, since every checkpoint
+                # written before 2026-07-26 lacks it entirely.
+                "curriculum": self._curriculum_state(),
             },
             path,
         )

@@ -352,7 +352,11 @@ fn reward_terms_sum_matches_total_reward() {
     // drain anything the constructor's own reset may have accumulated
     e.reward_terms().unwrap();
     let out = e.collect(24, Arc::new(vec![-1; 2])).unwrap();
-    let terms = e.reward_terms().unwrap();
+    let (terms, learner, opp) = e.reward_terms().unwrap();
+    // Self-play: every agent-step IS a learner row, so the split is the identity
+    // and there is nothing in the opponent column at all.
+    assert_eq!(terms, learner, "self-play must not split");
+    assert!(opp.iter().all(|&x| x == 0.0), "self-play has no opponent-driven cars");
     let total: f64 = out.rewards.iter().map(|&x| x as f64).sum();
     assert!((terms[construct_engine::reward::T_VEL_TO_BALL] - total).abs() < 1e-4,
             "vel_to_ball telemetry {} != summed reward {total}",
@@ -360,6 +364,50 @@ fn reward_terms_sum_matches_total_reward() {
     assert_eq!(terms[construct_engine::reward::T_AGENT_STEPS], (24 * 4) as f64,
                "one count per agent-step");
     // read-and-RESET: a second read with no stepping in between is all zeros.
-    let again = e.reward_terms().unwrap();
+    let (again, again_learner, again_opp) = e.reward_terms().unwrap();
     assert!(again.iter().all(|&x| x == 0.0), "reward_terms must reset on read");
+    assert!(again_learner.iter().all(|&x| x == 0.0),
+            "the learner counters must reset on the SAME read -- one draining and the \
+             other accumulating would silently span an unknown number of iterations");
+    assert!(again_opp.iter().all(|&x| x == 0.0), "and so must the opponent counters");
+}
+
+#[test]
+fn the_opponent_column_counts_the_bot_and_not_our_mirror_cars() {
+    // THE MIS-ATTRIBUTION, at the level it was sized at. A 3v3 arena whose
+    // foreign slot drives ONE car has three kinds of row: 3 blue learner rows,
+    // 1 bot car, and 2 orange "mirror" cars run through our own net and then
+    // dropped from the training set. Under "opponent == every row we do not
+    // train on" the two mirrors were counted as the bot.
+    //
+    // Sized against the live v9 run (foreign on 48/144 arenas, 470 agents, 391
+    // learner rows): of the 79 non-learner rows, 48 are bot cars and 31 -- 39%
+    // -- are ours. At a true bot aerial-gate rate of 0.24 and ours of 0.02 the
+    // subtraction printed 0.153 and a reader attributed all of it to nexto.
+    let p = bot_path("necto");
+    if !p.exists() {
+        eprintln!("SKIP: {} absent", p.display());
+        return;
+    }
+    let mut e = engine(&[3], 17);
+    e.set_foreign_opponents(vec![foreign(load_npz(&p), ForeignKind::Necto, 12, 1)]).unwrap();
+    e.reward_terms().unwrap();          // drain construction-time counters
+    e.collect(8, Arc::new(vec![-2])).unwrap();
+    let (all, learner, opp) = e.reward_terms().unwrap();
+    use construct_engine::reward::T_AGENT_STEPS;
+    assert_eq!(all[T_AGENT_STEPS], 48.0, "6 cars x 8 steps");
+    assert_eq!(learner[T_AGENT_STEPS], 24.0, "the 3 blue cars are the learner rows");
+    assert_eq!(opp[T_AGENT_STEPS], 8.0,
+               "the ONE car necto drives -- (all - learner) would say 24, i.e. 3x");
+    assert_eq!(all[T_AGENT_STEPS] - learner[T_AGENT_STEPS] - opp[T_AGENT_STEPS], 16.0,
+               "the 2 mirror cars are ours, untrained, and in neither column");
+    // A FULL foreign team has no mirrors, so there the two agree -- which is what
+    // makes the change invisible in every 1v1 row of the bench history.
+    let mut e = engine(&[3], 17);
+    e.set_foreign_opponents(vec![foreign(load_npz(&p), ForeignKind::Necto, 12, 3)]).unwrap();
+    e.reward_terms().unwrap();
+    e.collect(8, Arc::new(vec![-2])).unwrap();
+    let (all, learner, opp) = e.reward_terms().unwrap();
+    assert_eq!(opp[T_AGENT_STEPS], all[T_AGENT_STEPS] - learner[T_AGENT_STEPS]);
+    assert_eq!(opp[T_AGENT_STEPS], 24.0);
 }
