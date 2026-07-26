@@ -362,13 +362,24 @@ def run_match(candidate, champion, steps, arenas, seed):
     return result
 
 
-def add_to_league(cfg, ck, steps, schema_version):
+def add_to_league(cfg, ck, steps, schema_version, action_table=None):
     """Append the new champion to the league pool so the opponent pool tracks
-    the champion lineage. Registry.add is a no-op for a ck already present."""
+    the champion lineage. Registry.add is a no-op for a ck already present.
+
+    `action_table` MUST be threaded through. Registry.add defaults it to the
+    92-row `construct_92_v1`, correct for every entry written before
+    2026-07-26 and WRONG for anything v9 promotes: schema_version is 1 for both
+    v1 tables, so a mislabelled 104-row entry (a) defeats play_entries'
+    cross-table refusal, which compares exactly this field on both sides, and
+    (b) is filtered out of its OWN run's league by choose_opponents, so v9's
+    league would stay dead for the life of the run without ever saying why.
+    None falls back to the default and is only right for a v0 checkpoint or a
+    caller that genuinely cannot know."""
     from construct.league.registry import Registry
     reg = Registry(path=cfg["registry"])
+    extra = {} if action_table is None else {"action_table": str(action_table)}
     reg.add(ck, int(steps), cfg["league_run"], cfg["reward_config"],
-            schema_version=int(schema_version))
+            schema_version=int(schema_version), **extra)
     return reg
 
 
@@ -529,7 +540,9 @@ def _do_promote(cfg, candidate, meta):
     leave the pool ahead of the pointer."""
     write_champion_ck(cfg["path"], candidate)
     try:
-        add_to_league(cfg, str(candidate), meta.get("steps", 0), meta.get("schema_version", 1))
+        add_to_league(cfg, str(candidate), meta.get("steps", 0),
+                      meta.get("schema_version", 1),
+                      action_table=meta.get("action_table"))
     except Exception as e:  # noqa: BLE001 -- never lose a valid promotion to a league write
         print(f"  warning: champion promoted but league registry append failed: {e}",
               file=sys.stderr)

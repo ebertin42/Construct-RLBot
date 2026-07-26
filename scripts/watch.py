@@ -26,6 +26,7 @@ import torch
 
 from construct._engine import RenderSession
 from construct.learn.model import PolicyValueNet
+from construct.tables import schema_path
 
 deterministic = "--argmax" in sys.argv
 size = 1
@@ -66,11 +67,13 @@ if is_v1:
 
     net_cfg = ck["config"]["net"]
     heads = int(net_cfg["heads"])
-    try:
-        from construct._engine import action_table_v1
-        table = action_table_v1()
-    except ImportError:
-        table = ck["model"]["action_table"].numpy()
+    # Table and schema from the CHECKPOINT, not constants: `action_table_v1()`
+    # is always 92 rows and the old try/except only fell back when the symbol
+    # was missing, so a 104-row v1-air net (v9) size-mismatched in
+    # load_state_dict below and the viewer went dark. The registered buffer is
+    # always in the state dict and cannot drift from the weights.
+    table = ck["model"]["action_table"].numpy()
+    schema = schema_path(ck)
     net = EntityPolicyNet(
         d_model=int(net_cfg["d_model"]), layers=int(net_cfg["layers"]),
         heads=heads, ff=int(net_cfg["ff"]), action_table=table,
@@ -78,7 +81,7 @@ if is_v1:
     net.load_state_dict(ck["model"])
     net.eval()
 
-    sess = RenderSession(blue=size, orange=size, schema_path="schema/v1.toml",
+    sess = RenderSession(blue=size, orange=size, schema_path=schema,
                          reward_config_path="configs/reward_v0.toml", seed=42,
                          net_heads=heads, curriculum_config_path=curriculum)
     if curriculum:

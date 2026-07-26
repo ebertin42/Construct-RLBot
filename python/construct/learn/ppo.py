@@ -1,6 +1,86 @@
 import torch
 
 
+def standardise_advantages(adv, *, adv_norm="global", group=None,
+                           min_group_rows=2048, group_std_floor=0.05):
+    """Return (standardised advantages, info dict).
+
+    WHY THIS EXISTS (v9 D6). Until 2026-07-26 this was one line:
+
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+    ONE scalar for the whole mixed batch, which PRESERVES the measured 9.48x
+    1v1:3v3 magnitude ratio exactly (mean|TD advantage| on ck_001283829760:
+    1v1 0.2275 / 2v2 0.0322 / 3v3 0.0240 -- six cars share one ball, so per-car
+    reward events are ~3x rarer and team_spirit averages what is left). The
+    entropy bonus, meanwhile, contributes a per-row gradient of CONSTANT
+    magnitude `entropy_coef`. So a 3v3 row's useful signal sat ~2.4x the entropy
+    pull while a 1v1 row's sat ~22.7x, and one `entropy_coef` meant two different
+    things.
+
+    Giving 3v3 more arenas cannot fix that: the entropy pull and the useful
+    signal BOTH scale linearly with a group's row count, so their RATIO is
+    share-independent -- collapse is decided purely by per-row |A|/entropy_coef.
+    That is why v8 had to skew the arena mix to [0.85, 0.1, 0.05] instead, and
+    why the skew then collapsed 1v1 (element p4 0.469 -> 0.417 -> 0.03-0.11 on
+    two seeds, with 1v1 entropy falling 3.06 -> 2.27).
+
+    Standardising WITHIN each team size puts mean|A_norm| at the same value in
+    every group by construction, so one entropy_coef finally means one thing.
+
+    Notes that are easy to get wrong:
+      * RETURNS ARE NOT TOUCHED. Only the policy-loss advantage is rescaled, so
+        the critic target and `value_loss` are unchanged.
+      * The per-group sigma is FLOORED at `group_std_floor * sigma_batch`.
+        0.05, not 0.1: measured sigma per group (Gaussian approx from mean|A|)
+        is 0.285 / 0.0404 / 0.0301 against sigma_batch ~= 0.167 under the v9
+        equal-row mix, so 3v3 sits at 0.18*sigma_batch -- a 0.1 floor would be
+        only 1.8x below it and could BIND, defeating the entire purpose. 0.05
+        gives 3.6x clearance and still catches a genuinely degenerate group (no
+        reward events at all -> pure critic noise amplified to unit scale).
+        `adv_group_floor_hits` in the returned info is the tripwire; it must be 0.
+      * A group with fewer than `min_group_rows` rows is left in the global pool
+        rather than standardised on a handful of samples.
+      * `adv_norm="global"` reproduces the historical single line EXACTLY, and
+        it is the default, so every pre-v9 config is byte-identical.
+    """
+    if adv_norm not in ("global", "group"):
+        raise ValueError(f"adv_norm must be 'global' or 'group', got {adv_norm!r}")
+    if adv_norm == "global" or group is None:
+        return (adv - adv.mean()) / (adv.std() + 1e-8), {"adv_group_floor_hits": 0.0,
+                                                         "adv_groups": 0.0}
+    if group.shape[0] != adv.shape[0]:
+        raise ValueError(
+            f"group label length {group.shape[0]} != advantage length {adv.shape[0]}; "
+            "the label must come from the engine's collect() output, one entry per "
+            "learner row, tiled over T -- see Trainer.collect"
+        )
+    adv = adv.clone()
+    mu_b, sigma_b = adv.mean(), adv.std()
+    floor = group_std_floor * sigma_b
+    done = torch.zeros_like(adv, dtype=torch.bool)
+    floor_hits, n_groups = 0, 0
+    for g in torch.unique(group).tolist():
+        if g <= 0:
+            continue                      # unlabelled (v0 path) -> global pool
+        m = group == g
+        if int(m.sum()) < min_group_rows:
+            continue                      # too few samples to standardise on
+        s = adv[m].std()
+        if s < floor:
+            floor_hits += 1
+            s = floor
+        adv[m] = (adv[m] - adv[m].mean()) / (s + 1e-8)
+        done |= m
+        n_groups += 1
+    rest = ~done
+    if bool(rest.any()):
+        # Whatever did not form a big enough group keeps the historical
+        # whole-batch statistics, so it is never left unnormalised.
+        adv[rest] = (adv[rest] - mu_b) / (sigma_b + 1e-8)
+    return adv, {"adv_group_floor_hits": float(floor_hits), "adv_groups": float(n_groups)}
+
+
 def ppo_update(
     net,
     optimizer,
@@ -31,6 +111,17 @@ def ppo_update(
     # when the hook is unused (`None` here is a complete no-op, byte-identical
     # to pre-hook behavior).
     extra_loss_fn=None,
+    # Advantage standardisation. "global" is the historical single-scalar
+    # `(adv - mu)/sigma` over the whole mixed batch and is BYTE-IDENTICAL to
+    # pre-v9 behaviour; "group" standardises within each team size. See
+    # `standardise_advantages` for why that distinction is the load-bearing one.
+    adv_norm: str = "global",
+    # Per-row group label (team size 1/2/3), same length as the batch. Required
+    # by adv_norm="group"; ignored otherwise. Rows labelled <= 0 fall into the
+    # global pool.
+    group: "torch.Tensor | None" = None,
+    min_group_rows: int = 2048,
+    group_std_floor: float = 0.05,
 ) -> dict:
     obs = batch["obs"]
     obs_is_dict = isinstance(obs, dict)
@@ -38,10 +129,13 @@ def ppo_update(
     # all dict tensors share the leading dim and device by construction.
     first = next(iter(obs.values())) if obs_is_dict else obs
     n = first.shape[0]
-    adv = batch["advantages"]
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    adv, norm_info = standardise_advantages(
+        batch["advantages"], adv_norm=adv_norm, group=group,
+        min_group_rows=min_group_rows, group_std_floor=group_std_floor,
+    )
     stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0,
              "updates": 0, "skipped": 0}
+    stats.update(norm_info)
     extra_keys: set[str] = set()
     for _ in range(epochs):
         perm = torch.randperm(n, device=first.device)

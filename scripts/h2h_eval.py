@@ -50,6 +50,7 @@ from pathlib import Path
 import torch
 
 from construct.league.matches import MatchRunner, load_sd
+from construct.tables import table_name
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_REFS_CONFIG = REPO / "configs" / "h2h_references.toml"
@@ -77,22 +78,32 @@ class SchemaMismatchError(ValueError):
 # ---------------------------------------------------------------------------
 
 def checkpoint_meta(path):
-    """Read {schema_version, heads, steps} from a checkpoint's own config --
-    same key path as scripts/eval_metrics.py's v1 branch (config.net.heads /
-    schema_version). `heads` is None for schema_version 0 (PolicyValueNet
-    has no attention-head concept)."""
+    """Read {schema_version, heads, steps, action_table} from a checkpoint's own
+    config -- same key path as scripts/eval_metrics.py's v1 branch
+    (config.net.heads / schema_version). `heads` is None for schema_version 0
+    (PolicyValueNet has no attention-head concept).
+
+    `action_table` is a THIRD compatibility axis beside version and head count,
+    and unlike them it is not visible in `schema_version`: that is 1 for both
+    the 92-row `construct_92_v1` and the 104-row `construct_104_v1air`. It is
+    read via construct.tables.table_name (recorded field, else the stored
+    buffer's width, else the 92-row default), and it is what
+    champion_gate/add_to_league stamps on the registry entry -- without it a
+    promoted v1-air checkpoint is labelled 92-row and every downstream guard
+    reads the wrong thing."""
     ck = torch.load(path, map_location="cpu", weights_only=False)
     sv = int(ck.get("schema_version", 0))
     heads = int(ck["config"]["net"]["heads"]) if sv == 1 else None
     return {
         "path": str(path), "schema_version": sv, "heads": heads,
         "steps": int(ck.get("total_steps", 0)),
+        "action_table": table_name(ck),
     }
 
 
 def require_compatible(meta_a, meta_b):
-    """Refuse a cross-schema (or, for v1, cross-head-count) pair with a
-    clear message, before touching the engine at all."""
+    """Refuse a cross-schema (or, for v1, cross-head-count or cross-action-
+    table) pair with a clear message, before touching the engine at all."""
     if meta_a["schema_version"] != meta_b["schema_version"]:
         raise SchemaMismatchError(
             f"cross-schema h2h refused: {meta_a['path']} is schema_version="
@@ -106,6 +117,21 @@ def require_compatible(meta_a, meta_b):
             f"{meta_b['path']} has net.heads={meta_b['heads']} -- both v1 "
             f"checkpoints must share an attention head count (candle "
             f"rebuilds attention from the head count, not tensor shape)."
+        )
+    # Third axis, invisible in schema_version (1 for BOTH v1 tables). play_h2h
+    # drives both sides through ONE MatchRunner, i.e. one engine, i.e. one
+    # decode table -- so a 92-row champion and a 104-row v9 candidate are not
+    # merely unfair to each other, they are unplayable together. Uses .get so a
+    # hand-built meta dict from an older caller still works.
+    ta = meta_a.get("action_table")
+    tb = meta_b.get("action_table")
+    if meta_a["schema_version"] == 1 and ta != tb:
+        raise SchemaMismatchError(
+            f"h2h refused: {meta_a['path']} decodes with {ta!r}, "
+            f"{meta_b['path']} with {tb!r} -- the action table sets the policy's "
+            f"OUTPUT DIMENSION and one engine binds one table, so these two "
+            f"cannot share a match. Gating a v1-air candidate against a 92-row "
+            f"champion needs one engine per side; it is not wired here."
         )
 
 
@@ -231,10 +257,15 @@ def _build_runner(meta, arenas, seed, mode=1):
     # (2+ cars per team are not bit-reproducible) but true for every invocation
     # that can actually occur, since mode never leaves 1 without a CLI surface.
     # Revisit all three together.
+    # action_table picks the SCHEMA FILE (schema/v1.toml vs schema/v1_air.toml);
+    # meta carries it because schema_version cannot. None at v0, where
+    # _engine_kwargs ignores it -- and None at v1 too for a hand-built meta from
+    # an older caller, which then gets the historical 92-row default.
     return MatchRunner(
         num_arenas=arenas, seed=seed, mode=mode,
         schema_version=meta["schema_version"],
         net_heads=meta["heads"] if meta["heads"] is not None else 4,
+        action_table=meta.get("action_table"),
     )
 
 

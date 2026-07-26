@@ -53,6 +53,17 @@ fn action_table_v1<'py>(py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
     numpy::ndarray::Array2::from_shape_vec((t.len(), 8), flat).unwrap().into_pyarray(py)
 }
 
+/// The v1-air action table (104 rows: v1.1's 92 + a doubled 12-row clean-air
+/// block) as an [N,8] f32 array. Same consumer as `action_table_v1`; selected
+/// by a schema whose `action_count` is 104 (schema/v1_air.toml). See
+/// actions::make_lookup_table_v1_air for why the extra rows exist.
+#[pyfunction]
+fn action_table_v1_air<'py>(py: Python<'py>) -> Bound<'py, PyArray2<f32>> {
+    let t = actions::make_lookup_table_v1_air();
+    let flat: Vec<f32> = t.iter().flatten().copied().collect();
+    numpy::ndarray::Array2::from_shape_vec((t.len(), 8), flat).unwrap().into_pyarray(py)
+}
+
 #[pyfunction]
 fn schema_dict<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyDict>> {
     let s = crate::schema::Schema::load(path)
@@ -90,10 +101,23 @@ struct Engine {
 /// keeps the exact legacy v0 check.
 fn validate_schema(schema_path: &str, sch: &schema::Schema) -> PyResult<()> {
     if sch.version == 1 {
-        if sch.action_count != actions::TABLE_SIZE_V1 || sch.action_table != "construct_92_v1" {
+        // Two (name, count) pairs are legal under version 1: the frozen v1.1
+        // table and the 104-row v1-air table. Both must be loadable by the
+        // same binary -- a v1.1 champion is the ruler v9 gets gated against.
+        let ok = matches!(
+            (sch.action_table.as_str(), sch.action_count),
+            ("construct_92_v1", actions::TABLE_SIZE_V1)
+                | ("construct_104_v1air", actions::TABLE_SIZE_V1_AIR)
+        );
+        if !ok {
             return Err(PyValueError::new_err(format!(
-                "schema {} disagrees with compiled engine (actions {} vs {}, table {:?})",
-                schema_path, sch.action_count, actions::TABLE_SIZE_V1, sch.action_table
+                "schema {} disagrees with compiled engine (actions {}, table {:?}; \
+                 expected (\"construct_92_v1\", {}) or (\"construct_104_v1air\", {}))",
+                schema_path,
+                sch.action_count,
+                sch.action_table,
+                actions::TABLE_SIZE_V1,
+                actions::TABLE_SIZE_V1_AIR
             )));
         }
         return Ok(());
@@ -302,30 +326,49 @@ impl Engine {
     /// ported bot (its own obs -> net -> action table -> controls, applied directly),
     /// and its BLUE cars remain learner rows. Independent of schema version, since a
     /// foreign bot builds its observation from the raw game state.
-    #[pyo3(signature = (opponents, kinds, decision_periods=None))]
+    ///
+    /// `foreign_cars[i]` (optional, same shape as `decision_periods`) is how
+    /// many of an arena's ORANGE cars slot `i` drives; omitted or 0 means the
+    /// whole orange team, which is the historical behaviour. A partial team
+    /// (1 nexto + 2 cars mirroring our own policy in a 3v3 arena) is the knob
+    /// that actually works above 1v1 -- see `foreign::ForeignPolicy`'s
+    /// `foreign_cars` field for the measurement.
+    #[pyo3(signature = (opponents, kinds, decision_periods=None, foreign_cars=None))]
     fn set_foreign_opponents(
         &mut self,
         opponents: Vec<HashMap<String, PyReadonlyArrayDyn<'_, f32>>>,
         kinds: Vec<String>,
         decision_periods: Option<Vec<u32>>,
+        foreign_cars: Option<Vec<u32>>,
     ) -> PyResult<()> {
         if opponents.len() != kinds.len() {
             return Err(PyValueError::new_err(format!(
                 "opponents/kinds length mismatch: {} vs {}", opponents.len(), kinds.len()
             )));
         }
-        if opponents.len() > 8 {
-            return Err(PyValueError::new_err("at most 8 foreign opponent slots"));
+        // 12, raised from 8 on 2026-07-26: v9 runs one slot per (bot x team
+        // size) and sat exactly at the old cap with 8, so admitting
+        // element/immortal to the 2v2 and 3v3 blocks (4 more slots) needed
+        // headroom. Separate slot space from `set_opponents`' league arms.
+        if opponents.len() > 12 {
+            return Err(PyValueError::new_err("at most 12 foreign opponent slots"));
         }
         let periods = decision_periods.unwrap_or_else(|| vec![1; opponents.len()]);
         if periods.len() != opponents.len() {
             return Err(PyValueError::new_err("decision_periods length mismatch"));
         }
+        // 0 (and the absent case) -> u32::MAX -> "the whole orange team", so
+        // every existing caller keeps its exact behaviour.
+        let cars = foreign_cars.unwrap_or_else(|| vec![0; opponents.len()]);
+        if cars.len() != opponents.len() {
+            return Err(PyValueError::new_err("foreign_cars length mismatch"));
+        }
         let parsed: Vec<engine::NetWeights> = opponents
             .into_iter()
             .zip(kinds)
             .zip(periods)
-            .map(|((w, kind), period)| {
+            .zip(cars)
+            .map(|(((w, kind), period), ncars)| {
                 let arrays: HashMap<String, (Vec<f32>, Vec<usize>)> = w
                     .into_iter()
                     .map(|(k, v)| {
@@ -335,11 +378,48 @@ impl Engine {
                     .collect();
                 let fk = crate::foreign::ForeignKind::parse(&kind)
                     .ok_or_else(|| format!("unknown foreign kind {kind:?}"))?;
-                Ok(engine::NetWeights::Foreign { raw: arrays, kind: fk, period })
+                Ok(engine::NetWeights::Foreign {
+                    raw: arrays,
+                    kind: fk,
+                    period,
+                    cars: if ncars == 0 { u32::MAX } else { ncars },
+                })
             })
             .collect::<Result<Vec<_>, String>>()
             .map_err(PyValueError::new_err)?;
         self.inner.set_foreign_opponents(parsed).map_err(PyValueError::new_err)
+    }
+
+    /// Per-term reward telemetry summed over every arena since the last call,
+    /// RESET ON READ (E9). Returns `{term_name: float}` with `TERM_NAMES`'
+    /// keys: the first nine are reward contributions, the last four are event
+    /// counts (`touch_events`, `airborne_touch_events`, `goal_events`,
+    /// `agent_steps`) that the farming tripwires are computed from --
+    /// touches/min/car and the airborne-touch fraction have no other source.
+    ///
+    /// Counts EVERY agent-step, including foreign- and opponent-driven cars:
+    /// it describes the reward function, not the training set.
+    fn reward_terms<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let sums = self.inner.reward_terms().map_err(PyValueError::new_err)?;
+        let d = PyDict::new(py);
+        for (name, v) in reward::TERM_NAMES.iter().zip(sums.iter()) {
+            d.set_item(*name, *v)?;
+        }
+        Ok(d)
+    }
+
+    /// Per-arena team size (1/2/3), in arena order (1s block, then 2s, then 3s
+    /// -- see `engine::allocate_team_sizes`).
+    ///
+    /// Exposed because the trainer places foreign and league opponents PER
+    /// BLOCK. Under the old front/tail stamping the placement was a function of
+    /// arena index alone, which is exactly how v8 ended up with zero 3v3
+    /// self-play arenas and 100% of its 3v3 experience against one frozen
+    /// 1v1-trained opponent. Python could not previously tell which arenas were
+    /// which -- `allocate_team_sizes` was Rust-only.
+    #[getter]
+    fn team_sizes(&self) -> Vec<usize> {
+        self.inner.team_sizes()
     }
 
     /// Runs `steps` rounds of on-worker rollout (policy-driven actions, sampled with
@@ -423,6 +503,16 @@ impl Engine {
         dict.set_item("final_values", final_values)?;
         dict.set_item("last_values", last_values)?;
         dict.set_item("learner_agents", n)?;
+        // (N,) int8 team-size label per learner ROW (E5). v1 only -- v0 leaves
+        // it empty, and the key is simply absent there so no v0 caller changes.
+        if !out.learner_team_size.is_empty() {
+            let lts: Bound<'py, PyArray1<i8>> = out.learner_team_size.into_pyarray(py);
+            dict.set_item("learner_team_size", lts)?;
+        }
+        // Rows forwarded through our policy per round: `learner_agents` plus a
+        // partial foreign team's mirror cars (E4). Equal to `learner_agents`
+        // unless partial teams are in play.
+        dict.set_item("forward_rows", out.forward_rows)?;
         Ok(dict)
     }
 
@@ -485,6 +575,10 @@ struct RenderSession {
     pacer: viser::Pacer,
     num_agents: usize,
     obs_mode: episode::ObsMode,
+    // V1 only: which action table the loaded schema selected (92-row v1.1 or
+    // 104-row v1-air). Drives `action_count`, so the sampler and the overlay
+    // agree with the arena's decode table.
+    act_table: episode::ActionTableKind,
     // V1 only: the in-session policy for `step_policy` (v1 inference lives
     // in-engine; the Python watch script no longer sees obs tensors).
     policy_v1: Option<policy_v1::EntityPolicy>,
@@ -524,6 +618,7 @@ impl RenderSession {
         let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
         validate_schema(schema_path, &sch)?;
         let obs_mode = if sch.version == 1 { episode::ObsMode::V1 } else { episode::ObsMode::V0 };
+        let act_table = sch.action_table_kind();
         let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
         // When set (e.g. curriculum_v3_match), the viewer renders in the SAME
         // regime the policy trains in -- full 300s matches with a running score
@@ -534,8 +629,8 @@ impl RenderSession {
             None => None,
         };
         let tick_skip = sch.tick_skip;
-        let mut arena = episode::EpisodeArena::new_full(
-            blue, orange, tick_skip, cfg, sch.normalization, seed, curriculum, obs_mode,
+        let mut arena = episode::EpisodeArena::new_full_with_table(
+            blue, orange, tick_skip, cfg, sch.normalization, seed, curriculum, obs_mode, act_table,
         );
         let mut stream = viser::ViserStream::new().map_err(|e| PyValueError::new_err(e.to_string()))?;
         // real state (valid tick_rate) with cars cleared — see send_flush docs
@@ -546,6 +641,7 @@ impl RenderSession {
             pacer: viser::Pacer::new(tick_skip),
             num_agents: blue + orange,
             obs_mode,
+            act_table,
             policy_v1: None,
             rng: sampler::Pcg32::new((seed as u64) * 1_000_003 + 17),
             net_heads,
@@ -563,9 +659,10 @@ impl RenderSession {
     }
     #[getter]
     fn action_count(&self) -> usize {
-        match self.obs_mode {
-            episode::ObsMode::V0 => actions::TABLE_SIZE,
-            episode::ObsMode::V1 => actions::TABLE_SIZE_V1,
+        match (self.obs_mode, self.act_table) {
+            (episode::ObsMode::V0, _) => actions::TABLE_SIZE,
+            (episode::ObsMode::V1, episode::ActionTableKind::V1) => actions::TABLE_SIZE_V1,
+            (episode::ObsMode::V1, episode::ActionTableKind::V1Air) => actions::TABLE_SIZE_V1_AIR,
         }
     }
     #[getter]
@@ -621,6 +718,18 @@ impl RenderSession {
         }
         let fk = foreign::ForeignKind::parse(kind)
             .ok_or_else(|| PyValueError::new_err(format!("unknown foreign kind {kind:?}")))?;
+        // No team-size guard: every ported bot drives a team arena as of
+        // 2026-07-26. Nexto/Necto size their obs from `state.cars.len()`;
+        // Immortal/Element get the near-ball TRUNCATED AdvancedObs-107 (see
+        // obs_advanced::build_advanced_obs_one_other), which is byte-identical
+        // to the untruncated builder at 1v1. Before that change this method
+        // refused mode > 1 for the fixed-width kinds -- and before 2026-07-26
+        // it had no guard at all and simply PANICKED inside build_advanced_obs
+        // (index 107 out of bounds), taking the viewer down with it. The
+        // truncated builder removes the panic, so the refusal is no longer
+        // load-bearing. Note what you are watching above 1v1 is a DEGRADED
+        // LOCAL VARIANT of the bot, not the ported bot; see
+        // docs/foreign-opponents.md.
         let mut fp = foreign::ForeignPolicy::new(&parse_foreign_dict(weights), fk)
             .map_err(PyValueError::new_err)?;
         fp.set_decision_period(decision_period);
@@ -669,7 +778,9 @@ impl RenderSession {
         self.arena.write_obs_v1(&mut ents, &mut mask, &mut query, &mut prev);
         let (logits, _values) =
             pol.forward(&ents, &mask, &query, &prev, n).map_err(PyValueError::new_err)?;
-        let action_count = actions::TABLE_SIZE_V1;
+        // Must match the arena's decode table, not a compiled constant: the
+        // logits row width is the loaded schema's action_count.
+        let action_count = self.action_count();
         let mut acts = vec![0i64; n];
         for a in 0..n {
             let row = &logits[a * action_count..(a + 1) * action_count];
@@ -784,18 +895,38 @@ fn parse_foreign_dict(w: HashMap<String, PyReadonlyArrayDyn<'_, f32>>) -> engine
 #[pymethods]
 impl BotMatch {
     #[new]
+    ///
+    /// `mode` is the team size per side (1/2/3). It was hardcoded to 1 until
+    /// 2026-07-26; measuring the (bot x team size) rung ladder before launch
+    /// needs 2v2/3v3 bot-vs-bot matches. Every kind is accepted at every mode:
+    /// element/immortal were refused above 1v1 until 2026-07-26 and now run on
+    /// the near-ball truncated AdvancedObs-107. Above 1v1 those two are a
+    /// DEGRADED LOCAL VARIANT, not the ported bot -- a "we beat Element at 3v3"
+    /// claim is meaningless outside this repo (docs/foreign-opponents.md).
     #[pyo3(signature = (kind_a, weights_a, period_a, kind_b, weights_b, period_b,
                         arenas=16, schema_path="schema/v1.toml",
                         reward_config_path="configs/reward_v0.toml",
-                        curriculum_config_path="configs/curriculum_v3_match.toml", seed=11))]
+                        curriculum_config_path="configs/curriculum_v3_match.toml", seed=11,
+                        mode=1))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         kind_a: &str, weights_a: HashMap<String, PyReadonlyArrayDyn<'_, f32>>, period_a: u32,
         kind_b: &str, weights_b: HashMap<String, PyReadonlyArrayDyn<'_, f32>>, period_b: u32,
         arenas: usize, schema_path: &str, reward_config_path: &str,
-        curriculum_config_path: Option<&str>, seed: u32,
+        curriculum_config_path: Option<&str>, seed: u32, mode: usize,
     ) -> PyResult<Self> {
         sim_init::ensure_init(None);
+        if !(1..=3).contains(&mode) {
+            return Err(PyValueError::new_err(format!("mode must be 1, 2 or 3, got {mode}")));
+        }
+        // No team-size guard: every ported bot drives a team arena as of
+        // 2026-07-26 (Immortal/Element via the near-ball truncated
+        // AdvancedObs-107). Kinds are still parsed here so an unknown name
+        // fails before any arena is built.
+        for k in [kind_a, kind_b] {
+            foreign::ForeignKind::parse(k)
+                .ok_or_else(|| PyValueError::new_err(format!("unknown foreign kind {k:?}")))?;
+        }
         let sch = schema::Schema::load(schema_path).map_err(PyValueError::new_err)?;
         let cfg = reward::RewardConfig::load(reward_config_path).map_err(PyValueError::new_err)?;
         let curriculum = match curriculum_config_path {
@@ -814,9 +945,14 @@ impl BotMatch {
         let bot_b = mk(kind_b, weights_b, period_b)?;
         let arenas_vec = (0..arenas)
             .map(|i| {
-                episode::EpisodeArena::new_full(
-                    1, 1, sch.tick_skip, cfg.clone(), sch.normalization.clone(),
+                episode::EpisodeArena::new_full_with_table(
+                    mode, mode, sch.tick_skip, cfg.clone(), sch.normalization.clone(),
                     seed.wrapping_add(i as u32), curriculum.clone(), episode::ObsMode::V1,
+                    // Both sides are foreign bots driving their OWN tables via
+                    // the override path, so this only sets the (unused) decode
+                    // table; follow the schema anyway so the arena is never
+                    // inconsistent with the schema it was built from.
+                    sch.action_table_kind(),
                 )
             })
             .collect();
@@ -825,6 +961,14 @@ impl BotMatch {
 
     /// Run `steps` steps. Returns (rewards, terminated), each shape
     /// `(steps, arenas)`, from BLUE's (bot A's) perspective.
+    ///
+    /// ONE COLUMN PER ARENA AT EVERY MODE: only blue agent 0's row is emitted,
+    /// so the caller keeps scoring with `split_matches(..., team_size=1)`
+    /// regardless of `mode`. That is sound because matches force reward_v0,
+    /// whose `team_spirit` is 0.0 -- every car of the scoring team gets the raw
+    /// +/-10 spike, so car 0's tape is the whole arena's tape. Repointing this
+    /// at a BLENDED reward would silently drop goals below GOAL_THRESHOLD; see
+    /// league/matches.py's header.
     fn run<'py>(
         &mut self, py: Python<'py>, steps: usize,
     ) -> (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<bool>>) {
@@ -874,6 +1018,7 @@ fn _engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(schema_dict, m)?)?;
     m.add_function(wrap_pyfunction!(action_table, m)?)?;
     m.add_function(wrap_pyfunction!(action_table_v1, m)?)?;
+    m.add_function(wrap_pyfunction!(action_table_v1_air, m)?)?;
     m.add_class::<Engine>()?;
     m.add_class::<RenderSession>()?;
     m.add_class::<BotMatch>()?;

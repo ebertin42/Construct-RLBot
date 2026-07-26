@@ -248,6 +248,10 @@ def _stub_runner(mode, rewards):
     mr.mode = mode
     mr.num_arenas = rewards.shape[1] // mode
     mr.assignment = [0] * mr.num_arenas
+    # None = "no decode table bound", which switches play()'s width check off.
+    # These tests feed it sd=None; the check itself is covered against real
+    # state dicts in test_league_v1.py.
+    mr.action_table = None
     mr.eng = _StubEngine(rewards)
     return mr
 

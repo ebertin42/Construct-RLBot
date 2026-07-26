@@ -38,12 +38,38 @@ class Registry:
                 return e
         raise KeyError(ck)
 
-    def add(self, ck, steps, run, reward_config, schema_version=0):
+    def add(self, ck, steps, run, reward_config, schema_version=0, gated_mode=1,
+            action_table="construct_92_v1"):
+        """Append a checkpoint to the pool. A ck already present is a no-op.
+
+        `action_table` is which V1 action table the checkpoint decodes with.
+        A SECOND AXIS beside `schema_version`, which is 1 for BOTH v1 tables:
+        the 92-row `construct_92_v1` and the 104-row `construct_104_v1air`
+        share an obs contract and differ only in the policy's output
+        dimension. `play_entries` refuses to pit one against the other, and it
+        needs this field to know. The default is the 92-row table because that
+        is what every entry written before 2026-07-26 is -- read it with
+        `e.get("action_table", "construct_92_v1")`, never by indexing.
+
+        `gated_mode` is the TEAM SIZE the checkpoint was gated at (v9 R8). It is
+        provenance only -- nothing selects on it yet -- but it has to start being
+        recorded before it is needed: `matchwin_gate.py --promote-if-pass` is
+        1v1-only precisely because this file had no team-size field, so a
+        2v2-gated net would silently have become a 1v1 training opponent. Every
+        promotion today is mode 1, hence the default.
+
+        APPEND-ONLY by design: entries written before 2026-07-26 have no
+        `gated_mode` key at all, so readers must use `e.get("gated_mode", 1)`
+        rather than indexing. Do not backfill -- an assumed mode is exactly the
+        provenance error this field exists to prevent.
+        """
         if any(e["ck"] == ck for e in self._entries):
             return
         self._entries.append({
             "ck": ck, "steps": steps, "run": run, "reward_config": reward_config,
             "schema_version": schema_version,
+            "gated_mode": int(gated_mode),
+            "action_table": str(action_table),
             "added_ts": int(time.time()),
             "mu": TS_ENV.mu, "sigma": TS_ENV.sigma, "games": 0,
         })

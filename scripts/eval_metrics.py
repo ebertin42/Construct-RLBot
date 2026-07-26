@@ -10,6 +10,10 @@ Engine.v0_only guard in lib.rs), so the v1 path drives the same eval tape
 through engine.collect() instead: one set_weights, one collect() call for the
 whole eval window, sampled actions (matches training and the v0 tape's
 sampled-action convention -- see the v0 branch's determinism comment below).
+
+The v1 branch's action table and schema file both come from the checkpoint
+(construct.tables), not from constants: schema_version does not distinguish the
+92-row `construct_92_v1` from the 104-row `construct_104_v1air` that v9 runs on.
 """
 import json
 import sys
@@ -21,6 +25,7 @@ import torch
 
 from construct._engine import Engine
 from construct.learn.model import PolicyValueNet
+from construct.tables import schema_path
 
 ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 is_v1 = int(ck.get("schema_version", 0)) == 1
@@ -31,13 +36,15 @@ if is_v1:
 
     net_cfg = ck["config"]["net"]
     heads = int(net_cfg["heads"])
-    try:
-        from construct._engine import action_table_v1
-        table = action_table_v1()
-    except ImportError:
-        # T8 says action_table_v1() exists; fall back to the checkpoint's own
-        # buffer (register_buffer'd, so it's in the state dict) if it doesn't.
-        table = ck["model"]["action_table"].numpy()
+    # THE TABLE AND THE SCHEMA BOTH COME FROM THE CHECKPOINT. This used to call
+    # action_table_v1() (always 92 rows) behind a try/except ImportError whose
+    # fallback only fired if the symbol was MISSING -- so on a 104-row v1-air
+    # checkpoint load_state_dict size-mismatched first. `action_table` is a
+    # registered buffer and is therefore always in the state dict, which makes
+    # it the one source that cannot drift from the weights; the schema file
+    # follows from its name, since schema_version is 1 for both v1 tables.
+    table = ck["model"]["action_table"].numpy()
+    schema = schema_path(ck)
     net = EntityPolicyNet(
         d_model=int(net_cfg["d_model"]), layers=int(net_cfg["layers"]),
         heads=heads, ff=int(net_cfg["ff"]), action_table=table,
@@ -45,7 +52,7 @@ if is_v1:
     net.load_state_dict(ck["model"])
     net.eval()
 
-    eng = Engine(num_arenas=16, blue=1, orange=1, schema_path="schema/v1.toml",
+    eng = Engine(num_arenas=16, blue=1, orange=1, schema_path=schema,
                  reward_config_path="configs/reward_v0.toml", seed=1234, net_heads=heads)
     eng.set_weights(
         {k: v.detach().cpu().numpy().astype(np.float32) for k, v in net.state_dict().items()}

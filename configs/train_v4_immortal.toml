@@ -29,7 +29,10 @@ num_arenas = 192
 blue = 1
 orange = 1
 seed = 0
-team_size_weights = [1.0, 0.0, 0.0]   # all 1v1 — foreign opponents are 1v1-only
+team_size_weights = [1.0, 0.0, 0.0]   # all 1v1 — Immortal's AdvancedObs-107 is a
+                                      # fixed width == exactly one other car.
+                                      # (Since 2026-07-26 the engine's guard is
+                                      # per kind; this bot is still 1v1-only.)
 
 [net]
 d_model = 128

@@ -72,17 +72,44 @@ RESUME = re.compile(r"resumed at ([\d,]+) steps")
 CONTAINMENT = "physics blowup contained"
 
 # --- per-bot auto-curriculum (the live difficulty ladder) ------------------
-# Banner:   auto-curriculum ON: hold win rate in [0.35,0.65], period in [1,12], ...
-# Roster:   foreign: ['element', 'immortal'] periods=[4, 3] on 77/192 arenas (frac=0.4)
-# Decision: auto-curriculum: element wr0.69/ema0.69 p4->3 | immortal ... p3->2
-#           a slot inside its post-change dwell reads "... p3 dwell1/2" instead.
+# THREE ERAS OF WIRE FORMAT, all of which must parse, because the log is
+# appended across restarts and the live remote run is still emitting the oldest
+# one. These regexes are the ONLY consumer of train.py's print()s -- there is no
+# schema between them, so a format drift shows up as an empty panel at best and
+# a silently STALE panel at worst. That is not hypothetical: the v9 change from
+# "p4->3" to "p4->p3" still MATCHED the old AC_SEG but returned an empty arrow
+# group, so `int(p_to) if p_to else int(p_from)` reported the pre-move period
+# forever, with no error anywhere. Hence the `test_dashboard_parsers` cases
+# below covering all three eras.
+#
+# Banner  pre-v9:  auto-curriculum ON: hold win rate in [0.35,0.65], period in [1,12], ...
+#         v9:      ... , period [1,12], ...          (non-ladder configs)
+#         v9:      ... , ladder [1, 2, 3, 4, 6, 12], ...
+# Roster  pre-v9:  foreign: ['element', 'immortal'] periods=[4, 3] on 77/192 arenas (frac=0.4)
+#         v9:      foreign: [('element', 1), ('necto', 3)] periods=[4, 3] cars=[1, 2]
+#                           on 48/144 arenas (frac=0.3333 PER BLOCK)
+# Decision pre-v9: auto-curriculum: element wr0.69/ema0.69 p4->3 | immortal ... p3->2
+#         v9:      auto-curriculum: element wr0.69/ema0.69 p4->p3 | ...
+#         v9 ladder: auto-curriculum: nexto wr0.50/ema0.50 1c/p12->1c/p20 | ...
+#           a slot inside its post-change dwell reads "... p3 dwell1/2" instead,
+#           and a slot not measured this cycle (the staggered eval measures ONE
+#           team size per cycle) reads "... n/a 1c/p12".
 AC_BANNER = re.compile(
     r"auto-curriculum ON: hold win rate in \[([\d.]+),([\d.]+)\], "
-    r"period in \[(\d+),(\d+)\]")
-AC_ROSTER = re.compile(r"foreign: \[([^\]]*)\] periods=\[([^\]]*)\] on (\d+)/(\d+) arenas")
-AC_DECISION = re.compile(r"auto-curriculum: (\w+ wr[\d.]+.*)")
+    r"(?:period(?: in)? \[(\d+),(\d+)\]|ladder \[([\d,\s]+)\])")
+AC_ROSTER = re.compile(
+    r"foreign: \[([^\]]*)\] periods=\[([^\]]*)\](?: cars=\[([^\]]*)\])? "
+    r"on (\d+)/(\d+) arenas")
+AC_DECISION = re.compile(r"auto-curriculum: (\w+ (?:wr[\d.]+|n/a).*)")
+# rung is `p12`, `1c/p12` (ladder), and the arrow target is `3` (pre-v9),
+# `p3` or `1c/p20`. Unmeasured slots print `n/a` where wr/ema would be; they are
+# matched deliberately so the segments stay POSITIONALLY aligned with the roster,
+# which is how a repeated bot name (necto at 1s, 2s and 3s) is told apart.
 AC_SEG = re.compile(
-    r"(\w+) wr([\d.]+)/ema([\d.]+) p(\d+)(?:->(\d+))?(?: dwell(\d+)/(\d+))?")
+    r"(\w+) (?:wr([\d.]+)/ema([\d.]+)|n/a) "
+    r"(?:(\d+)c/)?p(\d+)"
+    r"(?:->(?:(\d+)c/)?p?(\d+))?"
+    r"(?: dwell(\d+)/(\d+))?")
 
 SSL_TS = r"(\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
 SSL_START = re.compile(SSL_TS + r" start: (\d+) replay\(s\) on disk, filling (\S+) \((\d+)/(\d+)\)")
@@ -170,40 +197,74 @@ def parse_curriculum(text):
     appended across restarts) and mixing eras would draw phantom period jumps.
 
     Returns {"band": [lo, hi], "period_min", "period_max", "roster", "arenas",
-    "bots": [{name, wr, ema, period, dwell, dwell_of}], "history": [...]}, where
-    each history row is one eval: {"i": n, "<bot>": period, "<bot>_wr": wr}.
+    "bots": [{name, wr, ema, period, cars, rung, dwell, dwell_of}],
+    "history": [...]}, where each history row is one eval:
+    {"i": n, "<label>": period, "<label>_wr": wr}.
+
+    `<label>` is the bot name, EXCEPT when v9's roster runs the same bot at
+    several team sizes (necto at 1s/2s/3s are three independent slots with three
+    independent rungs); then it is "necto·2s". Without that, three slots would
+    collapse onto one dict key and the panel would show whichever came last.
+
+    Under the staggered eval only ONE team size is measured per cycle, so most
+    segments read `n/a`. Their last real wr/ema is CARRIED FORWARD rather than
+    shown as 0 -- a slot measured two cycles ago is stale, not zero.
     """
     lines = text.splitlines()
     start = 0
     band = pmin = pmax = None
-    roster, arenas = [], None
+    roster, modes, arenas = [], [], None
     for i, line in enumerate(lines):
         m = AC_BANNER.search(line)
         if m:
             start = i
             band = [_f(m.group(1)), _f(m.group(2))]
-            pmin, pmax = int(m.group(3)), int(m.group(4))
+            if m.group(5):                       # ladder [1, 2, 3, ...]
+                rungs = [int(x) for x in m.group(5).replace(" ", "").split(",") if x]
+                pmin, pmax = min(rungs), max(rungs)
+            else:
+                pmin, pmax = int(m.group(3)), int(m.group(4))
         m = AC_ROSTER.search(line)
         if m:
-            roster = [s.strip().strip("'\"") for s in m.group(1).split(",") if s.strip()]
-            arenas = f"{m.group(3)}/{m.group(4)}"
+            # 'element' (pre-v9) and ('element', 1) (v9) both yield the quoted
+            # name; the tuple form additionally yields the team size.
+            roster = re.findall(r"'([^']+)'", m.group(1))
+            modes = [int(x) for x in re.findall(r"'[^']+'\s*,\s*(\d+)", m.group(1))]
+            arenas = f"{m.group(4)}/{m.group(5)}"
+    # one label per slot: bare name unless that name is used by several slots
+    dupes = {n for n in roster if roster.count(n) > 1}
+    labels = [f"{n}·{modes[i]}s" if n in dupes and i < len(modes) else n
+              for i, n in enumerate(roster)]
     out = {"band": band, "period_min": pmin, "period_max": pmax,
            "roster": roster, "arenas": arenas, "bots": [], "history": []}
     if band is None:
         return out
+    last = {}                                    # label -> last real {wr, ema}
     for line in lines[start:]:
         m = AC_DECISION.search(line)
         if not m:
             continue
+        segs = AC_SEG.findall(m.group(1))
         snap, row = [], {"i": len(out["history"]) + 1}
-        for name, wr, ema, p_from, p_to, dwell, dwell_of in AC_SEG.findall(m.group(1)):
-            # a moved slot reports p<from>-><to>; a held/dwelling one just p<n>
+        for i, (name, wr, ema, c_from, p_from, c_to, p_to, dwell, dwell_of) in enumerate(segs):
+            # a moved slot reports <from>-><to>; a held/dwelling one just <rung>
             period = int(p_to) if p_to else int(p_from)
-            snap.append({"name": name, "wr": _f(wr), "ema": _f(ema), "period": period,
+            cars = int(c_to) if c_to else (int(c_from) if c_from else None)
+            # positional against the roster, which is why `n/a` segments are
+            # matched too -- they are the majority under the staggered eval
+            label = labels[i] if len(segs) == len(labels) else name
+            prev = last.get(label, {})
+            w = _f(wr) if wr else prev.get("wr")
+            e = _f(ema) if ema else prev.get("ema")
+            if wr:
+                last[label] = {"wr": w, "ema": e}
+            snap.append({"name": label, "wr": w, "ema": e, "period": period,
+                         "cars": cars, "rung": f"{cars}c/p{period}" if cars else f"p{period}",
+                         "measured": bool(wr),
                          "dwell": int(dwell) if dwell else None,
                          "dwell_of": int(dwell_of) if dwell_of else None})
-            row[name] = period
-            row[name + "_wr"] = _f(wr)
+            row[label] = period
+            row[label + "_wr"] = _f(wr) if wr else None
         if snap:
             out["bots"] = snap                  # last decision wins = current state
             out["history"].append(row)
@@ -855,20 +916,25 @@ function renderCurriculum(c) {
   rows.innerHTML = c.bots.map(b => {
     // above the band -> we beat it comfortably, so it advances a rung next;
     // below -> it backs off. In band = a fair fight, which is the goal.
-    const state = b.ema > hi ? "advancing" : b.ema < lo ? "easing" : "";
-    const verdict = b.dwell ? `settling ${b.dwell}/${b.dwell_of}`
+    // ema is null until a slot has been measured at least once -- under the
+    // staggered eval only one team size moves per cycle, so that is normal and
+    // must NOT render as 0% ("losing every match").
+    const seen = b.ema != null;
+    const state = !seen ? "" : b.ema > hi ? "advancing" : b.ema < lo ? "easing" : "";
+    const verdict = !seen ? "not measured yet"
+      : b.dwell ? `settling ${b.dwell}/${b.dwell_of}`
       : b.ema > hi ? "→ harder next" : b.ema < lo ? "→ easier next" : "fair fight";
-    const pct = v => (100 * Math.max(0, Math.min(1, v))).toFixed(1) + "%";
+    const pct = v => (100 * Math.max(0, Math.min(1, v || 0))).toFixed(1) + "%";
     return `<div class="bot ${state}">
       <div class="name">${b.name}</div>
-      <div class="rung">rung <b>p${b.period}</b></div>
+      <div class="rung">rung <b>${b.rung || ("p" + b.period)}</b></div>
       <div class="gauge" title="win rate 0 → 1; shaded = target band ${lo}–${hi}">
         <div class="band" style="left:${pct(lo)};width:${pct(hi-lo)}"></div>
-        <div class="raw" style="left:${pct(b.wr)}"></div>
-        <div class="ema" style="left:${pct(b.ema)}"></div>
+        ${seen ? `<div class="raw" style="left:${pct(b.wr)}"></div>
+        <div class="ema" style="left:${pct(b.ema)}"></div>` : ""}
       </div>
-      <div class="verdict">${(b.ema*100).toFixed(0)}% smoothed
-        <span class="sub2">${verdict}</span></div>
+      <div class="verdict">${seen ? (b.ema*100).toFixed(0) + "% smoothed" : "—"}
+        <span class="sub2">${verdict}${b.measured === false && seen ? " · stale" : ""}</span></div>
     </div>`;
   }).join("");
 

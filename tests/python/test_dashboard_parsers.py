@@ -209,6 +209,32 @@ auto-curriculum: element wr0.69/ema0.69 p4->3 | immortal wr0.20/ema0.20 p3->4
 auto-curriculum: element wr0.55/ema0.58 p3 dwell1/2 | immortal wr0.50/ema0.50 p4->4
 """
 
+# v9's train.py, non-ladder config: the banner dropped the word "in" and the
+# arrow target gained its "p" ("p4->p3", not "p4->3"). The second one is the
+# dangerous kind of drift -- the OLD regex still MATCHED it and silently
+# returned an empty arrow group, so the panel reported the pre-move period
+# forever with no error anywhere.
+CURR_V9_PLAIN = """foreign: [('element', 1), ('immortal', 1)] periods=[4, 3] cars=[1, 1] \
+on 77/192 arenas (frac=0.4 PER BLOCK)
+auto-curriculum ON: hold win rate in [0.35,0.65], period [1,12], adjust every 20 iters
+auto-curriculum: element wr0.69/ema0.69 p4->p3 | immortal wr0.20/ema0.20 p3->p4
+"""
+
+# v9's ladder config: rungs are (cars, period) pairs, the roster carries the team
+# size, necto/nexto appear at THREE team sizes each, and the staggered eval
+# measures one team size per cycle so most slots read `n/a`.
+CURR_V9_LADDER = """foreign: [('element', 1), ('necto', 1), ('necto', 2), ('necto', 3)] \
+periods=[12, 12, 12, 12] cars=[1, 1, 1, 1] on 48/144 arenas (frac=0.3333 PER BLOCK)
+auto-curriculum: match-mode eval engines built {1: 24, 2: 12, 3: 12} arenas, 14000 steps, \
+ROUND-ROBIN one mode per cycle
+auto-curriculum ON: hold win rate in [0.35,0.65], ladder [1, 2, 3, 4, 6, 12, 20, 24], \
+adjust every 20 iters
+auto-curriculum: element wr0.10/ema0.10 1c/p12->1c/p20 | necto wr0.06/ema0.06 1c/p12->1c/p24 \
+| necto n/a 1c/p12 | necto n/a 1c/p1
+auto-curriculum: element n/a 1c/p20 | necto n/a 1c/p24 | necto wr0.90/ema0.90 1c/p12->1c/p4 \
+| necto wr0.95/ema0.95 1c/p1->2c/p24
+"""
+
 
 def test_parse_curriculum_band_roster_and_current_state():
     c = parse_curriculum(CURR_TEXT)
@@ -244,6 +270,53 @@ def test_parse_curriculum_only_reports_the_current_run():
 def test_parse_curriculum_without_a_banner_is_empty_not_a_crash():
     c = parse_curriculum("iter 1 steps 5 sps 5 ep_rew 0 pi_loss 0 v_loss 0 ent 0 clip 0\n")
     assert c["band"] is None and c["bots"] == [] and c["history"] == []
+
+
+def test_parse_curriculum_v9_plain_format():
+    """v9 dropped 'in' from the banner, tuple-ised the roster, inserted cars=,
+    and changed the arrow target from '3' to 'p3'. The last one is why this test
+    exists: it still MATCHED the pre-v9 regex and silently reported the OLD
+    period, so the ladder panel froze with nothing in any log to say so."""
+    c = parse_curriculum(CURR_V9_PLAIN)
+    assert c["band"] == [0.35, 0.65]
+    assert (c["period_min"], c["period_max"]) == (1, 12)
+    assert c["roster"] == ["element", "immortal"], "tuple-ised roster still yields names"
+    assert c["arenas"] == "77/192", "cars=[...] sits between periods= and the arena count"
+    el, im = c["bots"]
+    assert (el["period"], im["period"]) == (3, 4), "'p4->p3' must report the NEW rung"
+
+
+def test_parse_curriculum_v9_ladder_rungs_and_repeated_bots():
+    """The v9 rung is a (cars, period) PAIR, and the same bot runs at three team
+    sizes -- three independent slots that would otherwise collapse onto one dict
+    key and show whichever segment came last."""
+    c = parse_curriculum(CURR_V9_LADDER)
+    assert (c["period_min"], c["period_max"]) == (1, 24), "bounds come from the ladder"
+    assert c["arenas"] == "48/144"
+    names = [b["name"] for b in c["bots"]]
+    assert names == ["element", "necto·1s", "necto·2s", "necto·3s"], \
+        "a bot at several team sizes needs several labels"
+    by = {b["name"]: b for b in c["bots"]}
+    assert by["necto·2s"]["rung"] == "1c/p4" and by["necto·2s"]["period"] == 4
+    assert by["necto·3s"]["rung"] == "2c/p24" and by["necto·3s"]["cars"] == 2, \
+        "a car-count change is a rung change too"
+    # history keeps all four slots apart
+    assert c["history"][0]["necto·1s"] == 24 and c["history"][0]["necto·3s"] == 1
+
+
+def test_parse_curriculum_staggered_eval_carries_the_last_measurement():
+    """Under the staggered eval only ONE team size is measured per cycle, so most
+    slots print `n/a`. Their last real win rate is carried forward: rendering
+    them as 0.0 would read as 'losing every match' on a slot that simply was not
+    measured this cycle."""
+    c = parse_curriculum(CURR_V9_LADDER)
+    by = {b["name"]: b for b in c["bots"]}
+    assert by["element"]["wr"] == 0.10 and by["element"]["measured"] is False, \
+        "carried forward from the previous cycle, and flagged as stale"
+    assert by["necto·2s"]["measured"] is True and by["necto·2s"]["wr"] == 0.90
+    # ...but the history row for an unmeasured slot stays None, so the per-bot
+    # win-rate chart never draws a fabricated point.
+    assert c["history"][1]["element_wr"] is None
 
 
 # --- gate history ----------------------------------------------------------

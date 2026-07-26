@@ -40,10 +40,13 @@ seed = 0
 # opponents take the FRONT, so with 0.7*192 = 134 1v1 arenas the 77 foreign arenas
 # (opponent_frac 0.40) still all land on 1v1. Only SELF-PLAY arenas convert to team
 # play. Equal weights [1,1,1] would leave 64 1v1 arenas -- fewer than the 77 needed
-# -- and the engine hard-errors ("ported bots are 1v1-only"), because Immortal's
-# and Element's obs width is fixed to 1v1. Nexto's and Necto's obs builders ARE
-# team-size generic, so relaxing that guard per-kind is the route to real 2v2/3v3
-# opponents (and a 2v2 gate) later.
+# -- and the engine hard-errors, because Immortal's and Element's obs width is
+# fixed to 1v1.
+# SUPERSEDED 2026-07-26: that guard is now PER KIND. Nexto and Necto (EARL
+# attention, obs sized from state.cars.len()) DO drive 2v2/3v3 arenas, and a
+# foreign slot can drive only SOME of an arena's orange cars. See
+# configs/train_v9_fromscratch.toml, which places opponents per team-size BLOCK
+# instead of stamping the front and therefore cannot overflow this way at all.
 # 2026-07-25 (second sizing): [0.7,0.2,0.1] -> [0.85,0.1,0.05] after a MEASURED
 # 1v1 collapse. At 56% of experience, team play held the gradient majority; once
 # entropy_coef dropped to 0.003 the policy stopped hedging and committed to that
@@ -140,8 +143,17 @@ decision_periods = [4, 3, 4, 5]   # element, immortal, necto, nexto
 # plateau. 0.55 = 106 of the 134 1v1 arenas, restoring external bots to ~24.4% while
 # team play stays ~63%. The cost falls on 1v1 SELF-PLAY (24.6% -> 12.9%), which is
 # the least valuable regime in the mix: unopposed 1v1 self-play is exactly what
-# produced the trapped champion. Ceiling is the 1v1 arena count (foreign is
-# 1v1-only), i.e. frac <= 134/192 = 0.69 at these team weights.
+# produced the trapped champion. When this was written, foreign arenas were
+# stamped onto the FRONT of the whole arena list, so the ceiling was the 1v1
+# arena count: frac <= 134/192 = 0.69 at these team weights.
+#
+# PLACEMENT CHANGED UNDER THIS CONFIG'S FEET on 2026-07-26 (v9 D8): train.py now
+# places foreign and league opponents PER TEAM-SIZE BLOCK, not front/tail. All
+# four slots here are mode 1, so re-running this config today puts foreign
+# arenas on 0.55 of the 1v1 BLOCK (90 of 163) and leaves the 2v2/3v3 blocks
+# foreign-free -- and the league lands per block instead of entirely on the 3v3
+# tail. That is a strictly better layout, but it is NOT what the live v8 run was
+# collecting, so do not compare a re-run against the v8 logs.
 opponent_frac = 0.55
 
 [foreign.auto_curriculum]
@@ -191,11 +203,14 @@ eval_steps = 14000
 # touched -- league takes the tail, foreign takes the front, and the trainer
 # asserts the two cannot overlap.
 #
-# WHY THE LEAGUE AND NOT MORE PORTED BOTS: the four external bots are 1v1-only
-# (fixed obs width for Immortal/Element), so team arenas have no external
-# opposition available at all. League opponents are our OWN architecture, so they
-# work at any team size -- currently the only non-self opponent a 2v2/3v3 arena
-# can have.
+# WHY THE LEAGUE AND NOT MORE PORTED BOTS (true when this config was written):
+# all four external bots were refused above 1v1 by a blanket guard, so team
+# arenas had no external opposition available at all. League opponents are our
+# OWN architecture, so they work at any team size.
+# SUPERSEDED 2026-07-26: the guard is per-kind now, and nexto/necto drive team
+# arenas (measured: goals/600s 67/71/67 and 62/61/65 at 1v1/2v2/3v3). Only
+# Immortal and Element are structurally 1v1 (AdvancedObs-107). v9 puts real
+# external opposition in every regime.
 #
 # HONEST EXPECTATION: the current champion (ck_001171502080) was itself trained
 # 1v1-only, so in team arenas it is also near-random (~95% of max entropy). The

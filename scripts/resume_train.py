@@ -44,6 +44,28 @@ p.add_argument("--entropy-coef", type=float, default=None,
                help="override PPO entropy_coef. The resumed CHECKPOINT's ppo block "
                     "normally wins over the toml, so this is the only way to change it "
                     "on a resume (see the 2026-07-19 state-blindness diagnosis).")
+p.add_argument("--lr", type=float, default=None,
+               help="override the Adam learning rate. Needed because lr was "
+                    "unchangeable on a resume TWICE over: cfg.ppo comes from the "
+                    "checkpoint, and Adam's restored param_groups carry lr as well "
+                    "-- so before 2026-07-26 the only way to change it was "
+                    "--reset-optimizer, which also discards the moment estimates. "
+                    "Trainer now applies cfg.ppo['lr'] after the optimizer restore.")
+p.add_argument("--lr-final", type=float, default=None,
+               help="turn on (or retarget) the linear lr anneal; pair with "
+                    "--lr-hold-steps / --lr-anneal-steps. See train.lr_at.")
+p.add_argument("--lr-hold-steps", type=int, default=None,
+               help="hold --lr flat for this many TOTAL lineage steps before the "
+                    "anneal starts (keyed on total_steps, which survives a resume)")
+p.add_argument("--lr-anneal-steps", type=int, default=None,
+               help="length of the linear ramp from --lr to --lr-final")
+p.add_argument("--adv-norm", choices=["global", "group"], default=None,
+               help="override PPO adv_norm ('global' = one scalar over the whole "
+                    "mixed batch, historical; 'group' = standardise within each "
+                    "team size, v9's D6). Same reason as --entropy-coef: the "
+                    "resumed CHECKPOINT's ppo block wins over the toml, so on a "
+                    "resume this flag is the ONLY way to change it -- and it is "
+                    "also the kill switch if per-group standardisation misbehaves.")
 p.add_argument("--max-iterations", type=int, default=None,
                help="stop after N iterations (for bounded A/B experiments); default: run forever")
 args = p.parse_args()
@@ -73,6 +95,14 @@ if args.league:
     cfg.league = {**cfg.league, "enabled": True}
 if args.entropy_coef is not None:
     cfg.ppo = {**cfg.ppo, "entropy_coef": args.entropy_coef}
+if args.adv_norm is not None:
+    cfg.ppo = {**cfg.ppo, "adv_norm": args.adv_norm}
+for _flag, _key in (("lr", "lr"), ("lr_final", "lr_final"),
+                    ("lr_hold_steps", "lr_hold_steps"),
+                    ("lr_anneal_steps", "lr_anneal_steps")):
+    _v = getattr(args, _flag)
+    if _v is not None:
+        cfg.ppo = {**cfg.ppo, _key: _v}
 if args.kickstart_teacher:
     cfg.kickstart = {**cfg.kickstart, "teacher": args.kickstart_teacher}
     if args.kickstart_steps is not None:

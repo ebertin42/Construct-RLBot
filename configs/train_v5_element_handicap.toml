@@ -13,8 +13,10 @@
 # up -- the honest absolute metric is now "the period at which win_share crosses
 # 0.5", measured with scripts/bench_foreign.py.
 #
-# ALL ARENAS ARE 1v1 (team_size_weights = [1,0,0]) -- foreign opponents are
-# 1v1-only (their obs is fixed-width). Requires the extracted weights on the box:
+# ALL ARENAS ARE 1v1 (team_size_weights = [1,0,0]) -- Element's obs is
+# AdvancedObs-107, a fixed width == exactly one other car. (Since 2026-07-26 the
+# engine's guard is per kind and nexto/necto do drive team arenas; Element and
+# Immortal are the two that genuinely cannot.) Requires the extracted weights:
 #   scripts/extract_element_weights.py <RLMarlbot>/rlmarlbot/element/model.p
 # (unlicensed; never committed; see external_weights.manifest)
 schema_path = "schema/v1.toml"

@@ -286,6 +286,49 @@ def test_require_compatible_refuses_mismatched_v1_heads():
         h2h_eval.require_compatible(meta_a, meta_b)
 
 
+def test_require_compatible_refuses_cross_action_table():
+    """The axis schema_version cannot see: it is 1 for both the 92-row v1.1
+    table and the 104-row v1-air table v9 launches on. play_h2h runs both sides
+    through ONE MatchRunner, i.e. one engine, i.e. one decode table."""
+    meta_a = {"path": "champ.pt", "schema_version": 1, "heads": 4,
+              "action_table": "construct_92_v1"}
+    meta_b = {"path": "v9.pt", "schema_version": 1, "heads": 4,
+              "action_table": "construct_104_v1air"}
+    with pytest.raises(h2h_eval.SchemaMismatchError, match="action table"):
+        h2h_eval.require_compatible(meta_a, meta_b)
+
+
+def test_require_compatible_allows_same_action_table_and_older_meta_dicts():
+    same = {"path": "a.pt", "schema_version": 1, "heads": 4,
+            "action_table": "construct_104_v1air"}
+    h2h_eval.require_compatible(same, dict(same, path="b.pt"))  # must not raise
+    # a meta dict built before the field existed carries None on both sides,
+    # which compares equal -- the pre-v9 callers keep working unchanged.
+    old = {"path": "a.pt", "schema_version": 1, "heads": 4}
+    h2h_eval.require_compatible(old, dict(old, path="b.pt"))
+
+
+def test_checkpoint_meta_reports_the_action_table(tmp_path):
+    """champion_gate stamps the registry entry from this dict, so a missing
+    field here becomes a mislabelled league arm."""
+    import torch
+    from construct._engine import action_table_v1, action_table_v1_air
+    from construct.learn.model_v1 import EntityPolicyNet
+
+    cfg = {"net": {"d_model": 32, "layers": 1, "heads": 2, "ff": 64}}
+    for name, table, expect in (
+        ("air.pt", action_table_v1_air(), "construct_104_v1air"),
+        ("old.pt", action_table_v1(), "construct_92_v1"),
+    ):
+        net = EntityPolicyNet(d_model=32, layers=1, heads=2, ff=64, action_table=table)
+        p = tmp_path / name
+        # deliberately NO "action_table" key: the stored buffer must be enough,
+        # because every checkpoint written before 2026-07-26 lacks the field.
+        torch.save({"model": net.state_dict(), "total_steps": 1,
+                    "config": cfg, "schema_version": 1}, p)
+        assert h2h_eval.checkpoint_meta(p)["action_table"] == expect
+
+
 # ---------------------------------------------------------------------------
 # run_vs_references: schema-mismatch refs are skipped, not fatal
 # ---------------------------------------------------------------------------

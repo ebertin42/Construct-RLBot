@@ -48,15 +48,28 @@ SCRATCH_LOG="${CONSTRUCT_SCRATCH_LOG:-checkpoints_scratch/train_remote.log}"
 WATCH_FOREIGN="${CONSTRUCT_WATCH_FOREIGN:-1}"
 current_period() {  # $1 = bot kind. Periods are PER BOT since 2026-07-25, so the
                     # viewer must read that bot's own rung out of the newest
-                    # decision line, which looks like:
-                    #   auto-curriculum: element wr0.69/ema0.69 p4->3 | immortal ... p3->2
-                    # a held slot instead reads "... p4 dwell1/2". The previous
-                    # parser grepped the retired "auto-curriculum: winrate ..."
-                    # format, so it silently froze on a stale pre-restart value.
+                    # decision line. THREE formats, all of which must parse --
+                    # the log is appended across restarts:
+                    #   pre-v9   auto-curriculum: element wr0.69/ema0.69 p4->3 | ...
+                    #   v9       auto-curriculum: element wr0.69/ema0.69 p4->p3 | ...
+                    #   v9 ladder  ... nexto wr0.50/ema0.50 1c/p12->1c/p20 | ...
+                    # a held slot reads "... p4 dwell1/2"; a slot not measured
+                    # this cycle (the staggered eval measures one TEAM SIZE per
+                    # cycle) reads "... n/a 1c/p12" and still carries its rung.
+                    # The previous parser grepped the retired "auto-curriculum:
+                    # winrate ..." format and silently froze on a stale value;
+                    # then the v9 "->p3" spelling froze it the same way, because
+                    # 'p[0-9]+->[0-9]+' stopped matching and the fallback returns
+                    # the rung BEFORE the move. Both traps are why the arrow is
+                    # matched explicitly here.
+                    # head -1, not tail -1: v9 runs necto/nexto at three team
+                    # sizes, and the viewer streams 1v1, which is the FIRST slot.
     local seg p
-    seg=$(grep -a "auto-curriculum: .*wr[0-9]" "$SCRATCH_LOG" 2>/dev/null | tail -1 \
-          | tr '|' '\n' | grep -aE "(^| )$1 " | tail -1)
-    p=$(printf '%s' "$seg" | grep -oE 'p[0-9]+->[0-9]+' | grep -oE '[0-9]+$')   # moved
+    seg=$(grep -aE "auto-curriculum: .*(wr[0-9]|n/a)" "$SCRATCH_LOG" 2>/dev/null | tail -1 \
+          | tr '|' '\n' | grep -aE "(^| )$1 " | head -1)
+    # moved: '->3', '->p3' or '->1c/p20'. POSIX ERE is leftmost-LONGEST, so the
+    # full '->1c/p20' wins over the '->1' prefix.
+    p=$(printf '%s' "$seg" | grep -oE -- '->(([0-9]+c/)?p)?[0-9]+' | tail -1 | grep -oE '[0-9]+$')
     [ -z "$p" ] && p=$(printf '%s' "$seg" | grep -oE 'p[0-9]+' | head -1 | tr -d 'p')
     echo "${p:-${CONSTRUCT_WATCH_PERIOD:-4}}"
 }

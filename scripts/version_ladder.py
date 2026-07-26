@@ -5,12 +5,36 @@ decided by bot-vs-bot outcomes (not our champion).
 
 This is the spine the ladder-index auto-curriculum walks. Output: a sorted TSV
 (logs/version_ladder.tsv) + a printed ranking.
+
+NECTO PROVENANCE (2026-07-26): the engine now clears necto's per-arena boost and
+demo clocks on every episode reset, matching NectoObsBuilder.reset(). That is a
+fidelity fix, and it means every necto row measured BEFORE 2026-07-26 was scored
+on a build that leaked those clocks across resets and is NOT comparable to a row
+measured after the v9 wheel is installed. Re-measure necto (only necto -- nexto,
+element and immortal are byte-identical) before ranking it against an old number.
+See engine/src/foreign.rs::reset_car for the measurement.
 """
 import argparse
 import itertools
 import os
+import pathlib
 
 import numpy as np
+
+
+def _engine_fingerprint():
+    """md5 + mtime of the installed engine .so. Cheap, unlike
+    scripts/instrument_fingerprint.py (which plays matches) -- all this needs to
+    do is let a reader tell two ladder files apart when the build moved under
+    them. Necto is the reason: its rows changed on 2026-07-26 and nothing in the
+    TSV said so."""
+    import hashlib
+    import construct
+    so = next((p for p in pathlib.Path(construct.__file__).parent.glob("_engine*.so")), None)
+    if so is None:
+        return "unknown"
+    h = hashlib.md5(so.read_bytes()).hexdigest()[:12]
+    return f"{so.name} md5:{h} mtime:{int(so.stat().st_mtime)}"
 
 
 def winshare(rewards, terminated):
@@ -67,6 +91,10 @@ def main():
 
     print("\n=== FULL VERSION LADDER (mean win_share vs field, STRONGEST first) ===")
     with open(args.out, "w") as f:
+        # Stamp the instrument INTO the file. A ladder TSV outlives the shell it
+        # was produced in, and necto's rows are only comparable within one
+        # engine build (see the NECTO PROVENANCE note above).
+        f.write(f"# engine {_engine_fingerprint()}\n")
         f.write("version\tbot\tperiod\tmean_win_share\n")
         for nm, b, p, m in ladder:
             print(f"    {nm:14s}  {m:.3f}")

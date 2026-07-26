@@ -106,6 +106,24 @@ def test_cross_schema_match_refused():
         play_entries(None, entry_a, entry_b)  # must refuse before touching mr or disk
 
 
+def test_cross_action_table_match_refused():
+    """schema_version is 1 for BOTH v1 tables, so the version check alone does
+    not catch a v1.1-vs-v1-air pairing -- and that pairing is UNPLAYABLE, not
+    merely unfair: MatchRunner.play drives both sides through ONE engine and
+    one engine binds one decode table. This is the gate hazard the v1-air
+    launch introduces, refused on metadata so the error names the two
+    checkpoints rather than a tensor width."""
+    entry_a = {"ck": "champ.pt", "schema_version": 1}  # no field -> 92-row default
+    entry_b = {"ck": "v9.pt", "schema_version": 1, "action_table": "construct_104_v1air"}
+    with pytest.raises(ValueError, match="cross-action-table"):
+        play_entries(None, entry_a, entry_b)
+    # ...and two entries on the SAME table are not refused by this guard
+    # (it must get past the metadata check and only then hit the None mr).
+    entry_b2 = {"ck": "other.pt", "schema_version": 1, "action_table": "construct_92_v1"}
+    with pytest.raises(AttributeError):
+        play_entries(None, entry_a, entry_b2)
+
+
 def test_same_schema_match_not_refused_by_guard(tmp_path):
     # play_entries's schema check must not false-positive on matched schemas;
     # drive it end to end with real tiny checkpoints on disk.
@@ -119,6 +137,124 @@ def test_same_schema_match_not_refused_by_guard(tmp_path):
     entry_b = {"ck": str(p_b), "schema_version": 1}
     ga, gb = play_entries(mr, entry_a, entry_b, steps=100)
     assert ga >= 0 and gb >= 0
+
+
+# --- action_table: the second axis, which schema_version cannot express -----
+
+def test_engine_kwargs_picks_the_schema_file_from_the_action_table():
+    """schema_version 1 admits TWO tables and one engine binds ONE, so the
+    schema FILE has to follow the table, not the version. Omitting it keeps the
+    historical 92-row path byte-identical -- that default is what every pre-v9
+    caller (bench scripts, matchwin_gate, the goal-share gate) relies on."""
+    from construct.league.matches import _engine_kwargs
+
+    base = dict(num_arenas=1, seed=0, reward_config="configs/reward_v0.toml",
+                mode=1, schema_version=1, net_heads=4)
+    assert _engine_kwargs(**base)["schema_path"] == "schema/v1.toml"
+    assert _engine_kwargs(**base, action_table="construct_92_v1")["schema_path"] \
+        == "schema/v1.toml"
+    assert _engine_kwargs(**base, action_table="construct_104_v1air")["schema_path"] \
+        == "schema/v1_air.toml"
+    # v0 has exactly one table; the argument is ignored rather than consulted.
+    v0 = dict(base, schema_version=0)
+    assert _engine_kwargs(**v0, action_table="construct_104_v1air")["schema_path"] \
+        == "schema/v0.toml"
+
+
+def test_match_runner_refuses_a_state_dict_of_the_wrong_width():
+    """Both sides of a match go through ONE engine. A 104-row state dict handed
+    to a 92-row runner is not a weaker opponent, it is an out-of-bounds index in
+    a worker thread; refuse it here, where the message can name the side."""
+    from construct._engine import action_table_v1_air
+
+    mr = MatchRunner(num_arenas=1, seed=0, schema_version=1, net_heads=2)
+    assert mr.action_table == "construct_92_v1"  # the default, unchanged
+    torch.manual_seed(0)
+    air = EntityPolicyNet(d_model=32, layers=1, heads=2, ff=64,
+                          action_table=action_table_v1_air())
+    air_sd = {k: v.detach().numpy().astype(np.float32) for k, v in air.state_dict().items()}
+    with pytest.raises(ValueError, match="action-table mismatch"):
+        mr.play(air_sd, _v1_sd(1), steps=10)
+    with pytest.raises(ValueError, match="action-table mismatch"):
+        mr.play(_v1_sd(1), air_sd, steps=10)
+
+
+def test_league_tick_stamps_the_checkpoints_own_action_table(tmp_path):
+    """register_newest_checkpoints used to omit action_table entirely, so
+    Registry.add's 92-row DEFAULT was the only value the field could ever hold.
+    A mislabelled 104-row entry then (a) sails through play_entries' cross-table
+    refusal, which compares exactly this field, and (b) is filtered out of its
+    own run's league forever."""
+    from construct._engine import action_table_v1_air
+    from construct.league import tick
+
+    ck_dir = tmp_path / "checkpoints_entity"
+    ck_dir.mkdir()
+    net = EntityPolicyNet(d_model=32, layers=1, heads=2, ff=64,
+                          action_table=action_table_v1_air())
+    ck = ck_dir / "ck_000000000042.pt"
+    torch.save({"model": net.state_dict(), "total_steps": 42,
+                "config": {"net": {"d_model": 32, "layers": 1, "heads": 2, "ff": 64}},
+                "schema_version": 1, "reward_config_path": "x",
+                "action_table": "construct_104_v1air"}, ck)
+
+    reg = Registry(path=str(tmp_path / "reg.jsonl"))
+    monkey = dict(tick.CHECKPOINT_SOURCES)
+    monkey[1] = (("entity", str(ck_dir / "ck_*.pt")),)
+    orig, tick.CHECKPOINT_SOURCES = tick.CHECKPOINT_SOURCES, monkey
+    try:
+        tick.register_newest_checkpoints(reg, 1)
+    finally:
+        tick.CHECKPOINT_SOURCES = orig
+
+    (entry,) = Registry(path=str(tmp_path / "reg.jsonl")).entries()  # reload from disk
+    assert entry["action_table"] == "construct_104_v1air"
+    champ = {"ck": "champ.pt", "schema_version": 1}  # pre-v9 entry: no field
+    with pytest.raises(ValueError, match="cross-action-table"):
+        play_entries(None, entry, champ)
+
+
+def test_league_tick_leaves_a_92_row_checkpoint_on_the_default(tmp_path):
+    """The other direction: a pre-v9 checkpoint has no `action_table` key, and
+    it must still come out tagged 92-row (from the stored buffer's width), or
+    every existing lineage would be filtered out of its own league."""
+    from construct.league import tick
+
+    ck_dir = tmp_path / "checkpoints_entity"
+    ck_dir.mkdir()
+    net = EntityPolicyNet(d_model=32, layers=1, heads=2, ff=64,
+                          action_table=action_table_v1())
+    torch.save({"model": net.state_dict(), "total_steps": 7,
+                "schema_version": 1, "reward_config_path": "x"},
+               ck_dir / "ck_000000000007.pt")  # no action_table key at all
+
+    reg = Registry(path=str(tmp_path / "reg.jsonl"))
+    monkey = dict(tick.CHECKPOINT_SOURCES)
+    monkey[1] = (("entity", str(ck_dir / "ck_*.pt")),)
+    orig, tick.CHECKPOINT_SOURCES = tick.CHECKPOINT_SOURCES, monkey
+    try:
+        tick.register_newest_checkpoints(reg, 1)
+    finally:
+        tick.CHECKPOINT_SOURCES = orig
+    assert reg.entries()[0]["action_table"] == "construct_92_v1"
+
+
+def test_cold_start_warning_fires_only_when_no_entry_is_pickable():
+    """v9's registry holds one 92-row champion and v9 decodes 104 rows, so its
+    league cannot pick anything at launch. _refresh_opponents handles that
+    correctly but only says so once every refresh_iters (200) in a run whose
+    first ~20M steps are to be ignored -- this is the startup-time statement."""
+    from construct.learn.train import league_cold_start_warning
+
+    entries = [{"ck": "champ.pt", "schema_version": 1}]  # pre-v9: no field
+    warn = league_cold_start_warning(entries, 1, "construct_104_v1air", "r.jsonl")
+    assert warn is not None
+    assert "construct_92_v1" in warn and "construct_104_v1air" in warn
+    # ...and stays silent whenever a pick is actually available
+    assert league_cold_start_warning(entries, 1, "construct_92_v1", "r.jsonl") is None
+    assert league_cold_start_warning(entries, 1, None, "r.jsonl") is None
+    # empty registry is also inert, and says so
+    assert league_cold_start_warning([], 1, "construct_92_v1", "r.jsonl") is not None
 
 
 # --- Trainer._refresh_opponents: schema filtering --------------------------

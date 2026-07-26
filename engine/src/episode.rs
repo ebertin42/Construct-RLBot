@@ -110,6 +110,28 @@ pub enum ObsMode {
     V1,
 }
 
+/// Which action table a V1 arena decodes with. A SECOND, INDEPENDENT axis from
+/// `ObsMode`: the obs contract is byte-identical between the two (max_ent 17 /
+/// ent_feat 26 / q_feat 64 / prev_actions 5), only the policy's output
+/// dimension differs, so this is deliberately not folded into `ObsMode` and the
+/// schema `version` stays 1 for both.
+///
+/// Both tables must exist SIMULTANEOUSLY, which is why this is a runtime enum
+/// and not a bumped `TABLE_SIZE_V1`. Redefining that constant to 104 would make
+/// every existing v8/champion checkpoint unloadable by this engine, and the
+/// local engine is the instrument every gate result was scored on
+/// (bench_foreign.py, version_ladder.py, MatchRunner, league play, deploy) --
+/// breaking it would destroy the only ruler v9 can be measured against.
+///
+/// `V1` (92 rows) is the default so every existing call site keeps its exact
+/// behavior; `V1Air` (104) is opt-in via `schema/v1_air.toml`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ActionTableKind {
+    #[default]
+    V1,
+    V1Air,
+}
+
 /// V1-only per-arena state: the ball-prediction tracker (one `predict()` per
 /// arena per step, shared across its agents) plus a per-agent prev-action
 /// ring (`[i64; 5]`, most-recent-first; all zeros after episode reset).
@@ -227,6 +249,16 @@ pub struct EpisodeArena {
     /// constructor leaves this at its default (`true`) — production
     /// behavior is unaffected.
     pub(crate) jitter_enabled: bool,
+    /// Per-term reward telemetry (E9), accumulated over every agent-step since
+    /// the last `take_reward_terms()`. `f64` because a 300s match at 144 arenas
+    /// puts millions of f32-scale increments through this and an f32
+    /// accumulator would visibly lose the small terms.
+    ///
+    /// It is a plain counter array, NOT part of any collect buffer: adding a
+    /// column to the (T, N) buffers would change their shapes and the merge
+    /// arithmetic, and the whole point is that turning the telemetry on cannot
+    /// perturb the rollout. Read + reset from the trainer once per iteration.
+    reward_terms: [f64; reward::N_TERMS],
 }
 
 impl EpisodeArena {
@@ -257,6 +289,10 @@ impl EpisodeArena {
     /// wrappers above) or v1 (entity) obs family. V1 arenas use the 92-row
     /// action table and own a `V1State`; nothing else differs — in
     /// particular the reset/rng path is byte-identical across modes.
+    ///
+    /// Defaults to `ActionTableKind::V1` so every pre-v9 call site keeps its
+    /// exact behavior; use `new_full_with_table` to select the 104-row v1-air
+    /// table.
     #[allow(clippy::too_many_arguments)]
     pub fn new_full(
         blue: usize,
@@ -268,6 +304,34 @@ impl EpisodeArena {
         curriculum: Option<CurriculumConfig>,
         obs_mode: ObsMode,
     ) -> Self {
+        Self::new_full_with_table(
+            blue,
+            orange,
+            tick_skip,
+            reward_cfg,
+            norm,
+            seed,
+            curriculum,
+            obs_mode,
+            ActionTableKind::V1,
+        )
+    }
+
+    /// As `new_full`, plus explicit selection of the V1 action table. Only
+    /// meaningful when `obs_mode == ObsMode::V1`: the V0 obs family is welded
+    /// to the 90-row v0 table and ignores `act_table`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full_with_table(
+        blue: usize,
+        orange: usize,
+        tick_skip: u32,
+        reward_cfg: RewardConfig,
+        norm: Normalization,
+        seed: u32,
+        curriculum: Option<CurriculumConfig>,
+        obs_mode: ObsMode,
+        act_table: ActionTableKind,
+    ) -> Self {
         let (mut arena, car_ids) = Self::build_arena(blue, orange);
         // Placeholder state — immediately overwritten by reset_episode() below,
         // which performs the actual (possibly curriculum-driven) reset.
@@ -275,9 +339,10 @@ impl EpisodeArena {
         let start = prev_state.tick_count;
         let mut this = Self {
             arena,
-            table: match obs_mode {
-                ObsMode::V0 => actions::make_lookup_table(),
-                ObsMode::V1 => actions::make_lookup_table_v1(),
+            table: match (obs_mode, act_table) {
+                (ObsMode::V0, _) => actions::make_lookup_table(),
+                (ObsMode::V1, ActionTableKind::V1) => actions::make_lookup_table_v1(),
+                (ObsMode::V1, ActionTableKind::V1Air) => actions::make_lookup_table_v1_air(),
             },
             car_ids,
             blue_count: blue,
@@ -303,6 +368,7 @@ impl EpisodeArena {
             },
             blowup_count: 0,
             jitter_enabled: true,
+            reward_terms: [0.0; reward::N_TERMS],
         };
         // Positive confirmation, mirroring the "[curriculum] replay pool ..."
         // line. On 2026-07-20 an arm ran fully INERT because a missing
@@ -687,6 +753,18 @@ impl EpisodeArena {
         self.blue_count
     }
 
+    /// Per-term reward telemetry accumulated since the last call, RESET ON READ
+    /// (so the trainer logs a per-iteration delta rather than a running total
+    /// that has to be differenced by the reader).
+    ///
+    /// Counts EVERY agent-step in this arena, including foreign- and
+    /// opponent-driven cars: it is a property of the arena's reward function,
+    /// not of whose experience is kept. Divide by `agent_steps` (the last
+    /// index) for per-car rates.
+    pub fn take_reward_terms(&mut self) -> [f64; reward::N_TERMS] {
+        std::mem::replace(&mut self.reward_terms, [0.0; reward::N_TERMS])
+    }
+
     /// Queue per-car controls overrides for the NEXT step (consumed and cleared
     /// by it). Used to drive foreign-opponent cars.
     pub fn set_foreign_overrides(&mut self, o: Vec<(u32, [f32; 8])>) {
@@ -879,13 +957,35 @@ impl EpisodeArena {
 
         for a in 0..n {
             let ci = self.agent_car_index(&cur, a);
-            let mut r = reward::compute(&self.prev_state, &cur, ci, scored, &self.reward_cfg);
+            let mut r = reward::compute_terms(
+                &self.prev_state, &cur, ci, scored, &self.reward_cfg, &mut self.reward_terms,
+            );
             if self.match_mode() {
-                r += reward::win_prob_shaping(
+                let wp = reward::win_prob_shaping(
                     &ms_prev, &ms_cur, cur.cars[ci].team,
                     self.reward_cfg.win_prob_gamma, &self.reward_cfg,
                 );
+                r += wp;
+                self.reward_terms[reward::T_WIN_PROB] += wp as f64;
             }
+            // v9 aerial-setup shaping. UNCONDITIONAL (unlike win_prob_shaping,
+            // which needs a match layer to have a score at all): PHI is a
+            // function of car/ball geometry only, so it is meaningful in every
+            // regime. Inert at `air_setup = 0.0` -- `air_shaping` returns
+            // literally 0.0, and `r += 0.0` is exact for every finite r, which
+            // is what keeps v9-launch and every historical config's per-step
+            // reward bit-identical while the term is staged off.
+            //
+            // The (prev_state, cur) pair is ALWAYS a within-episode pair: the
+            // `reset_episode()` below runs after this loop and re-latches
+            // prev_state to the fresh kickoff. See `air_shaping`'s doc comment
+            // -- moving the reset above this loop would silently pay a large
+            // spurious potential jump at every kickoff.
+            let air = reward::air_shaping(
+                &self.prev_state, &cur, ci, self.reward_cfg.win_prob_gamma, &self.reward_cfg,
+            );
+            r += air;
+            self.reward_terms[reward::T_AIR_SETUP] += air as f64;
             rewards[a] = r;
             flags[a] = StepFlags { terminated, truncated };
         }

@@ -41,7 +41,7 @@ use candle_core::{Device, Tensor};
 use candle_nn::{LayerNorm, Linear, Module};
 use std::collections::HashMap;
 
-use crate::actions::TABLE_SIZE_V1;
+use crate::actions::{TABLE_SIZE_V1, TABLE_SIZE_V1_AIR};
 use crate::policy::ensure_single_thread_gemm;
 
 const ACT_FEAT: usize = 8;
@@ -222,14 +222,29 @@ impl EntityPolicy {
         let prev_actions = prev_w_shape[0];
 
         let (_, act_table_shape) = weights.get("action_table").ok_or("missing action_table")?;
-        // Hard guard: the v1 action table is exactly the compiled 92-row v1.1
-        // table (see actions::TABLE_SIZE_V1 / make_lookup_table_v1) -- a
-        // stale/mismatched buffer (e.g. a v0 90-row table on a v1 checkpoint)
-        // must fail construction loudly rather than silently index_select-ing
-        // out of bounds or producing wrong prev-action / policy-head rows.
-        if act_table_shape.len() != 2 || act_table_shape[0] != TABLE_SIZE_V1 || act_table_shape[1] != ACT_FEAT {
+        // Hard guard: the v1 action table is one of the two compiled V1 tables
+        // -- the frozen 92-row v1.1 table (actions::make_lookup_table_v1) or
+        // the 104-row v1-air table (make_lookup_table_v1_air, v1.1 + a doubled
+        // clean-air block). A stale/mismatched buffer (e.g. a v0 90-row table
+        // on a v1 checkpoint) must fail construction loudly rather than
+        // silently index_select-ing out of bounds or producing wrong
+        // prev-action / policy-head rows.
+        //
+        // BOTH widths are accepted because both must be loadable by the SAME
+        // engine binary: a v1.1 champion is the ruler every v9 gate is scored
+        // against, so narrowing this to 104 would break bench_foreign.py,
+        // version_ladder.py and MatchRunner. Note the guard is on the WIDTH
+        // only -- a single Engine still binds one table via its schema, so a
+        // v1.1 checkpoint and a v1-air checkpoint cannot share one engine
+        // instance and cross-table evaluation needs one engine per side.
+        // Rank checked FIRST: the width test below indexes [0] and [1].
+        let width_ok = act_table_shape.len() == 2
+            && (act_table_shape[0] == TABLE_SIZE_V1 || act_table_shape[0] == TABLE_SIZE_V1_AIR)
+            && act_table_shape[1] == ACT_FEAT;
+        if !width_ok {
             return Err(format!(
-                "action_table must be [{TABLE_SIZE_V1},{ACT_FEAT}], got {act_table_shape:?}"
+                "action_table must be [{TABLE_SIZE_V1},{ACT_FEAT}] or \
+                 [{TABLE_SIZE_V1_AIR},{ACT_FEAT}], got {act_table_shape:?}"
             ));
         }
         let table_size = act_table_shape[0];
@@ -378,8 +393,17 @@ impl EntityPolicy {
         let value = e(value.flatten_all())?;
         let value = value.to_vec1::<f32>().map_err(|err| err.to_string())?;
 
-        let _ = self.table_size; // reserved for future validation hooks
+        debug_assert_eq!(logits.len(), b * self.table_size);
         Ok((logits, value))
+    }
+
+    /// Rows in this policy's action table -- i.e. the per-agent stride of the
+    /// `logits` vector `forward` returns. Read this instead of a compiled
+    /// constant when slicing that output: with two legal V1 tables (92-row
+    /// v1.1 and 104-row v1-air) a hardcoded width silently mis-slices every
+    /// agent after the first.
+    pub fn table_size(&self) -> usize {
+        self.table_size
     }
 }
 
@@ -415,12 +439,27 @@ mod tests {
 
     #[test]
     fn rejects_action_table_with_wrong_row_count() {
-        // 90 rows is the v0 table size, not v1's 92 -- must be rejected even
-        // though the feature width (8) is correct.
+        // 90 rows is the v0 table size -- neither of the two legal V1 widths
+        // (92 v1.1 / 104 v1-air) -- so it must be rejected even though the
+        // feature width (8) is correct.
         let w = minimal_weights_with_table(90, ACT_FEAT);
         let err = expect_err(EntityPolicy::new(&w, 4));
         assert!(err.contains("action_table"), "unexpected error: {err}");
-        assert!(err.contains("92"), "error should name the required row count: {err}");
+        assert!(err.contains("92"), "error should name both legal row counts: {err}");
+        assert!(err.contains("104"), "error should name both legal row counts: {err}");
+    }
+
+    #[test]
+    fn accepts_104_row_v1_air_action_table() {
+        // The v1-air table must load in the SAME engine binary that loads
+        // v1.1: a v1.1 champion is the ruler v9 is gated against, so both
+        // widths have to be constructible. Guard passes; construction still
+        // fails afterward on the missing transformer blocks, which is what
+        // proves the guard itself is not the rejecter.
+        let w = minimal_weights_with_table(TABLE_SIZE_V1_AIR, ACT_FEAT);
+        let err = expect_err(EntityPolicy::new(&w, 4));
+        assert!(!err.contains("action_table"), "unexpected action_table error: {err}");
+        assert!(err.contains("blocks"), "expected the no-blocks error, got: {err}");
     }
 
     #[test]

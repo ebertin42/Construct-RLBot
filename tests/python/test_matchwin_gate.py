@@ -174,7 +174,8 @@ def test_promote_enrols_the_new_champion_in_the_league(tmp_path, monkeypatch):
     reg = tmp_path / "pool.jsonl"
     cfg.write_text(cfg.read_text().replace('registry = "league/r.jsonl"',
                                            f'registry = "{reg}"'))
-    monkeypatch.setattr(mg, "_ck_provenance", lambda ck: (1_171_502_080, 1))
+    monkeypatch.setattr(mg, "_ck_provenance",
+                        lambda ck: (1_171_502_080, 1, "construct_92_v1"))
     mg.promote("new/better.pt", cfg)
 
     rows = [json.loads(l) for l in reg.read_text().splitlines() if l.strip()]
@@ -184,6 +185,33 @@ def test_promote_enrols_the_new_champion_in_the_league(tmp_path, monkeypatch):
     # selected (v0 and v1 policies cannot play each other -- different obs).
     assert rows[0]["schema_version"] == 1
     assert rows[0]["run"] == "champion"
+    assert rows[0]["action_table"] == "construct_92_v1"
+
+
+def test_promote_records_the_candidates_action_table_not_the_default(tmp_path, monkeypatch):
+    """The SAME hazard as schema_version, one level down and invisible in it:
+    schema_version is 1 for both v1 tables. Registry.add defaults action_table
+    to the 92-row one, so a promoted 104-row v1-air champion stamped with the
+    default would (a) sail through play_entries' cross-table refusal, which
+    compares exactly this field, and (b) be filtered out of its own run's
+    league by choose_opponents -- a league that stays dead and never says
+    why."""
+    cfg = _cfg(tmp_path, "old/champ.pt")
+    reg = tmp_path / "pool.jsonl"
+    cfg.write_text(cfg.read_text().replace('registry = "league/r.jsonl"',
+                                           f'registry = "{reg}"'))
+    monkeypatch.setattr(mg, "_ck_provenance", lambda ck: (9, 1, "construct_104_v1air"))
+    mg.promote("v9/air.pt", cfg)
+
+    rows = [json.loads(l) for l in reg.read_text().splitlines() if l.strip()]
+    assert rows[0]["action_table"] == "construct_104_v1air"
+
+    # ...and that entry is then refused against a 92-row champion instead of
+    # being handed to an engine that cannot decode one of the two.
+    from construct.league.matches import play_entries
+    champ = {"ck": "old/champ.pt", "schema_version": 1}  # pre-v9: no field at all
+    with pytest.raises(ValueError, match="cross-action-table"):
+        play_entries(object(), rows[0], champ)
 
 
 def test_promote_still_moves_the_pointer_if_league_enrolment_fails(tmp_path, monkeypatch, capsys):
@@ -204,10 +232,40 @@ def test_promote_still_moves_the_pointer_if_league_enrolment_fails(tmp_path, mon
 def test_promote_can_skip_the_league(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path, "old/champ.pt")
     called = []
-    monkeypatch.setattr(mg, "_ck_provenance", lambda ck: called.append(ck) or (1, 1))
+    monkeypatch.setattr(mg, "_ck_provenance",
+                        lambda ck: called.append(ck) or (1, 1, "construct_92_v1"))
     mg.promote("new/better.pt", cfg, add_to_league=False)
     assert called == [], "add_to_league=False must not touch the pool"
     assert mg.resolve_champion(cfg) == "new/better.pt"
+
+
+# --- the action table both sides must share ----------------------------------
+
+def _tiny_ck(tmp_path, name, table):
+    import torch
+    from construct.learn.model_v1 import EntityPolicyNet
+
+    net = EntityPolicyNet(d_model=16, layers=1, heads=2, ff=32, action_table=table)
+    p = tmp_path / name
+    torch.save({"model": net.state_dict(), "total_steps": 1, "schema_version": 1,
+                "config": {"net": {"d_model": 16, "layers": 1, "heads": 2, "ff": 32}}}, p)
+    return str(p)
+
+
+def test_gate_refuses_a_cross_action_table_pair(tmp_path):
+    """The gate drives both sides through ONE engine and one engine binds one
+    decode table, so a 104-row v1-air candidate against the 92-row champion is
+    impossible, not merely hard. schema_version is 1 for both and cannot catch
+    it; unrefused, it is an out-of-bounds index in a worker thread."""
+    from construct._engine import action_table_v1, action_table_v1_air
+
+    cand = _tiny_ck(tmp_path, "cand_air.pt", action_table_v1_air())
+    champ = _tiny_ck(tmp_path, "champ_92.pt", action_table_v1())
+    with pytest.raises(SystemExit, match="gate refused"):
+        mg._gate_action_table(cand, champ)
+    # a matched pair returns the shared name, which selects the schema file
+    assert mg._gate_action_table(cand, cand) == "construct_104_v1air"
+    assert mg._gate_action_table(champ, champ) == "construct_92_v1"
 
 
 # --- team sizes (--mode) -----------------------------------------------------
@@ -285,7 +343,7 @@ def test_promote_if_pass_at_1v1_still_promotes(tmp_path, monkeypatch, capsys):
         "order1": (200, 20, 100), "order2": (200, 20, 100),
         "records": 640, "short_records": 3, "short_frac": 3 / 640})
     monkeypatch.setattr(mg, "_append_history", lambda *a, **k: None)
-    monkeypatch.setattr(mg, "_ck_provenance", lambda ck: (1, 1))
+    monkeypatch.setattr(mg, "_ck_provenance", lambda ck: (1, 1, "construct_92_v1"))
     assert mg.main(["cand.pt", "--champion-config", str(cfg)]) == 0
     assert mg.resolve_champion(cfg) is not None
     mg.main(["cand.pt", "--promote-if-pass", "--champion-config", str(cfg)])

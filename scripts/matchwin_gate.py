@@ -147,21 +147,29 @@ def promote(candidate, config_path=None, add_to_league=True):
     if add_to_league:
         try:
             cfg = champion_gate.load_config(cfg_path)
-            steps, schema_version = _ck_provenance(candidate)
-            champion_gate.add_to_league(cfg, str(candidate), steps, schema_version)
+            steps, schema_version, action_table = _ck_provenance(candidate)
+            champion_gate.add_to_league(cfg, str(candidate), steps, schema_version,
+                                        action_table=action_table)
         except Exception as e:                              # noqa: BLE001
             print(f"  (champion pointer moved, but league enrolment failed: {e})")
     return previous
 
 
 def _ck_provenance(ck):
-    """(total_steps, schema_version) from a checkpoint. schema_version MUST be
-    right: the trainer only ever considers pool entries tagged with its own
-    schema version, since v0 and v1 policies cannot play each other (different
-    obs). A mistagged entry is silently never selected."""
+    """(total_steps, schema_version, action_table) from a checkpoint.
+
+    schema_version MUST be right: the trainer only ever considers pool entries
+    tagged with its own schema version, since v0 and v1 policies cannot play
+    each other (different obs). A mistagged entry is silently never selected.
+
+    action_table is the SAME hazard one level down and is not implied by the
+    version -- that is 1 for both the 92-row `construct_92_v1` and the 104-row
+    `construct_104_v1air`. `None` at v0 (no table name was ever recorded
+    there), which add_to_league reads as "use the default"."""
     import torch                                            # noqa: PLC0415
+    from construct.tables import table_name                 # noqa: PLC0415
     d = torch.load(ck, map_location="cpu", weights_only=False)
-    return int(d.get("total_steps", 0)), int(d.get("schema_version", 0))
+    return int(d.get("total_steps", 0)), int(d.get("schema_version", 0)), table_name(d)
 
 
 def flip_to_candidate(matches):
@@ -263,8 +271,38 @@ def _short_record_line(r):
     return line
 
 
+def _gate_action_table(candidate, champion):
+    """The action table BOTH sides of the gate must share, or a refusal.
+
+    The gate plays candidate and champion through ONE engine, and one engine
+    binds ONE decode table -- so a 104-row v1-air candidate against the 92-row
+    champion is not a hard match, it is an impossible one. schema_version does
+    not distinguish them (it is 1 for both), which is why this cannot be left
+    to the existing version check. Same-table pairs return the shared name and
+    it selects the schema file."""
+    import torch                                             # noqa: PLC0415
+
+    from construct.tables import table_name                  # noqa: PLC0415
+
+    def _name(p):
+        return table_name(torch.load(p, map_location="cpu", weights_only=False))
+
+    tc, tch = _name(candidate), _name(champion)
+    if tc != tch:
+        raise SystemExit(
+            f"gate refused: candidate {candidate} decodes with {tc!r} but champion "
+            f"{champion} decodes with {tch!r}. The action table sets the policy's "
+            f"OUTPUT DIMENSION and this gate drives both sides through one engine, "
+            f"so they cannot be compared here. Cross-table evaluation needs one "
+            f"engine per side and is NOT wired -- gate a v1-air lineage against a "
+            f"v1-air champion, or use scripts/bench_foreign.py (a fixed external "
+            f"opponent) as the common ruler."
+        )
+    return tc
+
+
 def _play_order(champion_sd, candidate_sd, arenas, seed, steps, as_candidate_weights,
-                mode=1):
+                mode=1, action_table=None):
     """One side order. Returns ((cand_wins, draws, cand_losses), census) over the
     matches played this order. `as_candidate_weights` True => candidate drives the
     learner rows (its goals are the +spikes); False => champion does, and we
@@ -276,9 +314,12 @@ def _play_order(champion_sd, candidate_sd, arenas, seed, steps, as_candidate_wei
 
     from construct.league.matches import MatchRunner, match_record, split_matches
 
+    # action_table selects the SCHEMA FILE; None keeps schema/v1.toml, i.e. every
+    # historical invocation of this gate is byte-identical.
     mr = MatchRunner(num_arenas=arenas, seed=seed, mode=mode, schema_version=1,
                      net_heads=4, reward_config="configs/reward_v0.toml",
-                     curriculum_config="configs/curriculum_v3_match.toml")
+                     curriculum_config="configs/curriculum_v3_match.toml",
+                     action_table=action_table)
     if as_candidate_weights:
         mr.eng.set_weights(candidate_sd)
         mr.eng.set_opponents([champion_sd])
@@ -312,11 +353,13 @@ def _play_order(champion_sd, candidate_sd, arenas, seed, steps, as_candidate_wei
 def gate(candidate, champion, arenas, steps, seed, threshold, mode=1):
     from construct.league.matches import load_sd
 
+    table = _gate_action_table(candidate, champion)
     champ_sd = load_sd(champion)
     cand_sd = load_sd(candidate)
-    o1, c1 = _play_order(champ_sd, cand_sd, arenas, seed, steps, True, mode=mode)
+    o1, c1 = _play_order(champ_sd, cand_sd, arenas, seed, steps, True, mode=mode,
+                         action_table=table)
     o2, c2 = _play_order(champ_sd, cand_sd, arenas, seed + 1000, steps, False,
-                         mode=mode)
+                         mode=mode, action_table=table)
     r = aggregate(o1, o2, threshold)
     r["order1"], r["order2"] = o1, o2
     r["records"] = c1["records"] + c2["records"]
@@ -343,9 +386,11 @@ def main(argv=None):
     ap.add_argument("--threshold", type=float, default=0.55)
     ap.add_argument("--mode", type=int, choices=(1, 2, 3), default=1,
                     help="team size per side (1=1v1, 2=2v2, 3=3v3). NET vs NET "
-                         "only -- ported foreign bots are refused above 1v1 by "
-                         "the engine (engine/src/engine.rs:319-325). Default 1 "
-                         "keeps every existing invocation unchanged.")
+                         "only. (The engine's foreign-bot guard became PER KIND "
+                         "on 2026-07-26 -- nexto/necto do drive team arenas -- "
+                         "but this gate has never used foreign opponents either "
+                         "way.) Default 1 keeps every existing invocation "
+                         "unchanged.")
     ap.add_argument("--promote-if-pass", action="store_true",
                     help="on PASS, move configs/champion.toml's champion_ck to the "
                          "candidate (atomic). Opt-in on purpose. 1v1 only.")
@@ -359,8 +404,9 @@ def main(argv=None):
         ap.error("--promote-if-pass is 1v1-only. configs/champion.toml's "
                  "champion_ck feeds the KL anchor, the league pool seed and the "
                  "deploy candidate, all measured in the 1v1 regime, and "
-                 "league/registry_champions.jsonl has no team-size field -- a "
-                 "2v2-gated net would silently become a 1v1 training opponent. "
+                 "a 2v2-gated net would silently become a 1v1 training "
+                 "opponent. (Registry entries carry a `gated_mode` field since "
+                 "2026-07-26, but nothing SELECTS on it yet, so the guard stays.) "
                  "The team gate also measures a DIFFERENT quantity: the champion "
                  "scores 7.1 goals/match at 1v1 and 4.5 at 3v3, and has never had "
                  "a teammate, so 3v3 is out-of-distribution for it. "

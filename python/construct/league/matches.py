@@ -10,11 +10,27 @@ the tape trick is schema-independent and holds unchanged for a v1 engine.
 v0 and v1 policies can NEVER play each other (different obs contracts): each
 MatchRunner is built for exactly one schema_version, and play_entries() below
 is the hard guard against feeding it a cross-schema pair.
+
+The SAME is true one level down, and `schema_version` cannot express it: a
+MatchRunner is also built for exactly one ACTION TABLE, because one engine binds
+one decode table and both sides of a match go through this single engine.
+Version 1 admits two -- the 92-row `construct_92_v1` and the 104-row
+`construct_104_v1air` -- so `action_table=` selects the schema file (default:
+the 92-row one, i.e. every pre-v9 caller is unchanged), `_require_table` refuses
+a state dict of the other width, and play_entries refuses the pairing on
+metadata before either side is loaded.
 """
 import numpy as np
 import torch
 
 from construct._engine import Engine
+from construct.tables import (
+    DEFAULT_V1_TABLE,
+    V0_SCHEMA_PATH,
+    V1_TABLE_ROWS as V1_TABLE_ROWS_BY_NAME,
+    V1_TABLE_SCHEMA,
+    schema_path_for_table,
+)
 
 # Goal detection threshold: goal pays ±10; same-step shaping can offset a concede
 # by up to +0.55 (touch 0.5 + vel_to_ball 0.05), so a concede row can be as small
@@ -32,11 +48,11 @@ from construct._engine import Engine
 # the detector if someone tries.
 GOAL_THRESHOLD = 9.4
 
-_SCHEMA_PATHS = {0: "schema/v0.toml", 1: "schema/v1.toml"}
+_SCHEMA_PATHS = {0: V0_SCHEMA_PATH, 1: V1_TABLE_SCHEMA[DEFAULT_V1_TABLE]}
 
 
 def _engine_kwargs(num_arenas, seed, reward_config, mode, schema_version, net_heads,
-                    curriculum_config=None):
+                    curriculum_config=None, action_table=None):
     """Assemble the kwargs dict for the Engine constructor.
 
     Pulled out of MatchRunner.__init__ so it can be unit-tested without
@@ -53,10 +69,21 @@ def _engine_kwargs(num_arenas, seed, reward_config, mode, schema_version, net_he
     mode=2 builds 2v2 arenas and mode=3 builds 3v3. No code change was needed
     for team matches here -- the fix lives in the per-arena reduction in
     MatchRunner.play / split_matches, not in engine construction.
+
+    `action_table` picks the SCHEMA FILE at schema_version 1, where the version
+    number alone cannot: it is 1 for both the 92-row `construct_92_v1` and the
+    104-row `construct_104_v1air`, and one engine binds one decode table. None
+    (the default) keeps the historical 92-row schema/v1.toml, so every existing
+    caller is byte-identical; h2h_eval/_build_runner threads the checkpoint's
+    own table through so a v9 net can be gated at all. Ignored at v0, which has
+    exactly one table.
     """
+    schema_path = _SCHEMA_PATHS[schema_version]
+    if schema_version == 1 and action_table is not None:
+        schema_path = schema_path_for_table(action_table)
     engine_kwargs = dict(
         num_arenas=num_arenas, blue=mode, orange=mode,
-        schema_path=_SCHEMA_PATHS[schema_version], reward_config_path=reward_config,
+        schema_path=schema_path, reward_config_path=reward_config,
         seed=seed,
     )
     if schema_version == 1:
@@ -80,7 +107,8 @@ def load_sd(ck_path):
 
 class MatchRunner:
     def __init__(self, num_arenas=8, seed=0, reward_config="configs/reward_v0.toml", mode=1,
-                 schema_version=0, net_heads=4, curriculum_config=None):
+                 schema_version=0, net_heads=4, curriculum_config=None,
+                 action_table=None):
         # Goal events pay EVERY learner agent on the scoring team in that arena at
         # the same step, so a raw `(rew >= GOAL_THRESHOLD).sum()` over the whole
         # tape counts one 2v2 goal twice and one 3v3 goal three times. That is why
@@ -105,6 +133,14 @@ class MatchRunner:
             f"got {schema_version}"
         )
         self.schema_version = schema_version
+        # Which decode table this runner's engine binds. `play()` checks every
+        # state dict against it, because ONE ENGINE BINDS ONE TABLE and both
+        # sides of a match go through this single engine (set_weights +
+        # set_opponents). None at v0 (one table exists); at v1 it defaults to
+        # the 92-row table, exactly what every pre-v9 caller got.
+        self.action_table = (
+            (action_table or DEFAULT_V1_TABLE) if schema_version == 1 else None
+        )
         # Both consumed downstream: play() needs `mode` for the per-arena reshape,
         # and `num_arenas` lets a caller assert the exact learner-column count
         # (divisibility alone is NOT enough -- 31 arenas at m=2 plus one self-play
@@ -119,10 +155,26 @@ class MatchRunner:
         # separate step (G2).
         engine_kwargs = _engine_kwargs(
             num_arenas, seed, reward_config, mode, schema_version, net_heads,
-            curriculum_config=curriculum_config,
+            curriculum_config=curriculum_config, action_table=action_table,
         )
         self.eng = Engine(**engine_kwargs)
         self.assignment = [0] * num_arenas
+
+    def _require_table(self, sd, which):
+        """Refuse a state dict whose action table is not the one this engine
+        binds. v0 state dicts carry no such buffer and are skipped."""
+        if self.action_table is None or "action_table" not in sd:
+            return
+        want = V1_TABLE_ROWS_BY_NAME[self.action_table]
+        got = int(sd["action_table"].shape[0])
+        if got != want:
+            raise ValueError(
+                f"action-table mismatch on the {which} side: this MatchRunner "
+                f"binds {self.action_table} ({want} rows) but the state dict "
+                f"carries {got} rows. One engine binds ONE decode table, so a "
+                f"92-row and a 104-row policy cannot share a match -- build one "
+                f"runner per table (MatchRunner(action_table=...))."
+            )
 
     def play(self, sd_a, sd_b, steps=2700):
         # Arenas are not reset between calls: match N+1's collect() continues
@@ -132,6 +184,11 @@ class MatchRunner:
         # fixed seed + call sequence (see test_match_deterministic); the only
         # cost is a bit of extra noise in per-match goal counts, which washes
         # out over the TrueSkill ladder's many matches.
+        # Width check before the engine boundary. The engine guards this too,
+        # but it can only report "the state dict carries N rows"; here we can
+        # also name WHICH SIDE is wrong and which table this runner binds.
+        self._require_table(sd_a, "learner (sd_a)")
+        self._require_table(sd_b, "opponent (sd_b)")
         self.eng.set_weights(sd_a)
         self.eng.set_opponents([sd_b])
         out = self.eng.collect(steps, arena_opponents=self.assignment)
@@ -154,7 +211,8 @@ class MatchRunner:
 
 def play_entries(mr: "MatchRunner", entry_a: dict, entry_b: dict, steps: int = 2700):
     """Run a match between two registry entries via `mr`, refusing to pit
-    different schema_version checkpoints against each other.
+    different schema_version OR different action_table checkpoints against
+    each other.
 
     v0 and v1 obs are structurally different (flat 94-float vector vs entity
     tensors) -- a cross-schema match would either crash deep in the engine
@@ -162,6 +220,14 @@ def play_entries(mr: "MatchRunner", entry_a: dict, entry_b: dict, steps: int = 2
     This checks entry metadata *before* touching disk or the engine, so the
     refusal is immediate and doesn't depend on `mr` being usable at all
     (checked first, ahead of the mr.schema_version comparison below).
+
+    ACTION TABLE IS A SECOND AXIS. schema_version is 1 for BOTH v1 tables --
+    the 92-row `construct_92_v1` and the 104-row `construct_104_v1air` -- so
+    the version check alone does NOT catch a v1.1-vs-v1-air pairing. That
+    pairing is unplayable rather than merely unfair: `MatchRunner.play` drives
+    both sides through ONE engine (set_weights + set_opponents), and one
+    engine binds one decode table. The engine also guards this, but refusing
+    on metadata names the two checkpoints instead of a tensor width.
     """
     va = entry_a.get("schema_version", 0)
     vb = entry_b.get("schema_version", 0)
@@ -169,6 +235,19 @@ def play_entries(mr: "MatchRunner", entry_a: dict, entry_b: dict, steps: int = 2
         raise ValueError(
             f"cross-schema match refused: {entry_a['ck']!r} is schema_version={va}, "
             f"{entry_b['ck']!r} is schema_version={vb}"
+        )
+    # Entry-vs-entry, so it belongs with the version check above and BEFORE any
+    # `mr` dereference -- same "refuse without needing a usable mr" contract.
+    # Default: pre-v9 entries predate the field and are all the 92-row table.
+    ta = entry_a.get("action_table", "construct_92_v1")
+    tb = entry_b.get("action_table", "construct_92_v1")
+    if ta != tb:
+        raise ValueError(
+            f"cross-action-table match refused: {entry_a['ck']!r} uses {ta!r}, "
+            f"{entry_b['ck']!r} uses {tb!r}. The action table sets the policy's "
+            f"output dimension and one engine binds one table, so these two "
+            f"cannot be played against each other -- run each side on its own "
+            f"schema (schema/v1.toml vs schema/v1_air.toml)."
         )
     if va != mr.schema_version:
         raise ValueError(

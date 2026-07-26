@@ -10,7 +10,10 @@ Verifies deploy/{actions,obs,model}.py against the Rust engine WITHOUT rlbot:
 
 deploy/bot.py (the rlbot/rlgym_compat adapter) is deliberately NOT imported —
 rlbot is Windows-only; those seams are covered by the README's
-live-verification checklist.
+live-verification checklist. Its ONE decision that can silently fly a
+different bot — which action table decodes the policy's argmax — is factored
+into model.decode_table so it can be tested here, plus a source-level check
+that bot.py still calls it (see test_bot_takes_its_table_from_the_net).
 """
 
 import json
@@ -24,8 +27,12 @@ import torch
 torch.set_num_threads(1)
 
 sys.path.insert(0, "deploy")
-from actions import make_lookup_table, make_lookup_table_v1  # deploy/actions.py
-from model import load_policy  # deploy/model.py
+from actions import (  # deploy/actions.py
+    make_lookup_table,
+    make_lookup_table_v1,
+    make_lookup_table_v1_air,
+)
+from model import EntityPolicyNet, decode_table, load_policy  # deploy/model.py
 from obs import (  # deploy/obs.py
     BIG_PAD_COUNT,
     CANONICAL_PAD_LOCATIONS,
@@ -72,6 +79,26 @@ def test_action_table_v1_matches_engine():
     np.testing.assert_array_equal(t[90], [0, 0, 0, 1, -1, 1, 0, 1])  # stall: yaw=-roll
     np.testing.assert_array_equal(t[91], [0, 0, 0, -1, 1, 1, 0, 1])
     np.testing.assert_array_equal(np.asarray(action_table_v1(), dtype=np.float32), t)
+
+
+def test_action_table_v1_air_matches_engine():
+    """Deploy decodes logits with its OWN copy of the table, so any drift from
+    the engine's flies a different bot: identical indices, different controls.
+    The 92-row mirror has been parity-tested since v1.1; this is the same
+    contract for the 104-row table v9 launches on."""
+    from construct._engine import action_table_v1_air
+
+    t = make_lookup_table_v1_air()
+    assert t.shape == (104, 8)
+    np.testing.assert_array_equal(t[:92], make_lookup_table_v1())  # append-only
+    # The appended block: pitch x boost, jump=1, no yaw / roll / HANDBRAKE.
+    for base in (92, 98):
+        np.testing.assert_array_equal(t[base], [0, 0, -1, 0, 0, 1, 0, 0])
+        np.testing.assert_array_equal(t[base + 3], [1, 0, 0, 0, 0, 1, 1, 0])
+        np.testing.assert_array_equal(t[base + 5], [1, 0, 1, 0, 0, 1, 1, 0])
+    assert (t[92:, 3] == 0).all() and (t[92:, 4] == 0).all(), "no yaw/roll: those are dodges"
+    assert (t[92:, 7] == 0).all(), "handbrake airborne IS air roll -- must be 0"
+    np.testing.assert_array_equal(np.asarray(action_table_v1_air(), dtype=np.float32), t)
 
 
 def test_pad_constants_are_sane():
@@ -288,3 +315,55 @@ def test_v1_checkpoint_runs_on_parity_obs():
             torch.from_numpy(bc["prev"][:n]),
         )
     assert torch.equal(picks, logits2.argmax(-1))
+
+
+# ------------------------------------------------- (d) which table decodes it
+
+@pytest.mark.parametrize(
+    "builder,rows", [(make_lookup_table_v1, 92), (make_lookup_table_v1_air, 104)]
+)
+def test_decode_table_width_follows_the_net_not_the_schema_version(builder, rows):
+    """A 104-wide policy decoded through a 92-row table is an IndexError on
+    every appended aerial row -- 11.8% of decisions for a uniform policy, and
+    exactly the rows the v1-air table exists to make reachable. schema_version
+    is 1 in BOTH cases and therefore cannot be the discriminator."""
+    net = EntityPolicyNet(d_model=16, layers=1, heads=2, ff=32, action_table=builder())
+    table = decode_table(net, 1)
+    assert table.shape == (rows, 8)
+    np.testing.assert_array_equal(table, builder())
+
+    # the contract that matters: every index the policy can emit decodes
+    with torch.no_grad():
+        logits, _ = net(
+            torch.zeros(4, MAX_ENT, ENT_FEAT),
+            torch.zeros(4, MAX_ENT, dtype=torch.bool),
+            torch.zeros(4, Q_FEAT),
+            torch.zeros(4, PREV_ACTIONS, dtype=torch.int64),
+        )
+    assert logits.shape == (4, rows)
+    for i in range(logits.shape[1]):
+        assert len(table[i]) == 8
+
+
+def test_decode_table_v0_is_the_90_row_table():
+    """v0's PolicyValueNet has no action_table buffer and only ever had one
+    table; decode_table must not go looking for a buffer there."""
+    from model import PolicyValueNet
+
+    table = decode_table(PolicyValueNet(94, 90, (8,)), 0)
+    np.testing.assert_array_equal(table, make_lookup_table())
+
+
+def test_bot_takes_its_table_from_the_net():
+    """Source-level regression: bot.py cannot be imported here (rlbot is
+    Windows-only), and it is the ONE caller of load_policy. It used to pick its
+    table with `make_lookup_table_v1() if schema_version == 1 else ...`, which
+    is 92 rows regardless of what load_policy just built -- the mis-decode that
+    load_policy's own assertion was written to prevent, reintroduced one
+    function later. Pin the call so it cannot drift back."""
+    src = (Path(__file__).resolve().parents[2] / "deploy" / "bot.py").read_text()
+    assert "decode_table(self.net, self.schema_version)" in src
+    assert "make_lookup_table_v1()" not in src, (
+        "bot.py must not build a table from the schema version -- schema_version "
+        "is 1 for both the 92-row and the 104-row v1 tables"
+    )

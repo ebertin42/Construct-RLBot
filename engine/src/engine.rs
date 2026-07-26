@@ -1,7 +1,7 @@
 use crate::{
     actions,
     curriculum::CurriculumConfig,
-    episode::{EpisodeArena, ObsMode, StepFlags},
+    episode::{ActionTableKind, EpisodeArena, ObsMode, StepFlags},
     obs::OBS_SIZE,
     obs_v1::{ENT_FEAT, MAX_ENT, PREV_ACTIONS, Q_FEAT},
     policy::{LayerWeights, MlpPolicy, PolicyWeights},
@@ -30,7 +30,15 @@ pub enum NetWeights {
     /// A ported community bot (see `foreign.rs`): its own obs builder, MLP and
     /// action table. Lives in a SEPARATE slot space from `set_opponents`
     /// (`set_foreign_opponents`), addressed by `k <= -2` in a collect assignment.
-    Foreign { raw: RawStateDict, kind: crate::foreign::ForeignKind, period: u32 },
+    /// `cars` = how many of an arena's ORANGE cars this bot drives (E4);
+    /// `u32::MAX` means the whole orange team, which is the historical
+    /// behaviour and the default lib.rs fills in.
+    Foreign {
+        raw: RawStateDict,
+        kind: crate::foreign::ForeignKind,
+        period: u32,
+        cars: u32,
+    },
 }
 
 enum Cmd {
@@ -50,6 +58,9 @@ enum Cmd {
     // path and the opponent path run through literally the same code (byte-
     // identity regression test pins this).
     Collect { steps: usize, assignment: Arc<Vec<i32>> },
+    /// Drain each arena's per-term reward counters (E9). Read-and-reset, so a
+    /// caller gets a per-interval delta rather than a running total.
+    RewardTerms,
     Shutdown,
 }
 
@@ -88,6 +99,28 @@ pub struct CollectOut {
     // shrink it (self-play arenas contribute all agents, opponent arenas
     // contribute only their blue agents — see Cmd::Collect's `learner_idx`).
     pub learner_agents: usize,
+    /// `(N,)` team size (1/2/3) of the arena each learner ROW came from (E5).
+    /// Empty in v0 mode (v0 collects predate mixed team sizes as a trained
+    /// regime and nothing consumes the label there).
+    ///
+    /// This is the label `ppo.py`'s per-group advantage standardisation keys
+    /// on, and it MUST come from here rather than being reconstructed in
+    /// Python: the worker split is `(num_arenas - assigned) / (threads - t)`
+    /// with `threads` auto-detected from `available_parallelism`, so a Python
+    /// reconstruction would silently disagree on some machines and mis-scale
+    /// every gradient without producing an error anywhere.
+    pub learner_team_size: Vec<i8>,
+    /// Rows put through OUR policy's batched forward per round: learner rows
+    /// plus the "mirror" cars of a partial foreign team (E4), whose experience
+    /// is discarded. Equals `learner_agents` whenever no arena runs a partial
+    /// foreign team.
+    ///
+    /// Exposed because it is the only direct evidence that the mirrors are
+    /// being PLAYED by the policy rather than acting uniformly at random (which
+    /// is what an unforwarded, unoverridden car does -- it samples from an
+    /// all-zero logits row), and because it is the compute the run actually
+    /// pays for (R5).
+    pub forward_rows: usize,
 }
 
 impl CollectOut {
@@ -108,6 +141,8 @@ impl CollectOut {
             final_values: vec![0.0; steps * agents],
             last_values: vec![0.0; agents],
             learner_agents: agents,
+            learner_team_size: vec![],
+            forward_rows: agents,
         }
     }
 
@@ -129,6 +164,8 @@ impl CollectOut {
             final_values: vec![0.0; steps * agents],
             last_values: vec![0.0; agents],
             learner_agents: agents,
+            learner_team_size: vec![0; agents],
+            forward_rows: agents,
         }
     }
 }
@@ -148,6 +185,8 @@ struct WorkerOut {
     debug_json: Option<String>,
     error: Option<String>,
     collect: Option<CollectOut>,
+    /// `Cmd::RewardTerms` reply: this worker's arenas' counters, summed.
+    terms: Option<[f64; crate::reward::N_TERMS]>,
 }
 
 impl WorkerOut {
@@ -161,6 +200,7 @@ impl WorkerOut {
             debug_json: None,
             error: None,
             collect: None,
+            terms: None,
         }
     }
 
@@ -294,13 +334,34 @@ fn collect_v1_worker(
     // per-agent buffer widths
     let ek = MAX_ENT * ENT_FEAT;
     let (mk, qk, pk) = (MAX_ENT, Q_FEAT, PREV_ACTIONS);
-    let action_count = actions::TABLE_SIZE_V1;
+    // Read the width off the POLICY, not a compiled constant: v1 has two legal
+    // action tables (92-row v1.1, 104-row v1-air) and this value strides every
+    // per-agent slice of `logits` below. A constant here would mis-slice every
+    // agent after the first the moment a v1-air checkpoint is loaded.
+    let action_count = pol.table_size();
 
     // Learner/opponent index maps — same construction as the v0 arm.
     let mut learner_idx: Vec<usize> = Vec::with_capacity(agents);
     let mut opp_idx: Vec<Vec<usize>> = vec![Vec::new(); opponents.len()];
     let mut learner_col: Vec<Option<usize>> = vec![None; agents];
-    // Arenas whose ORANGE cars are driven by a foreign (ported) bot:
+    // Every agent whose action comes from OUR policy: `learner_idx` plus the
+    // "mirror" cars of a PARTIAL foreign team (E4) -- orange cars in a foreign
+    // arena that the ported bot does not drive. Mirrors are forwarded (so they
+    // play, rather than acting uniformly at random) but are NOT learner rows:
+    // their experience is discarded, which keeps the equal-rows arithmetic in
+    // configs/train_v9_fromscratch.toml exact and keeps every learner row off a
+    // team that contains a bot.
+    //
+    // With no partial foreign teams this is EQUAL to learner_idx, element for
+    // element, so the batched forward's composition -- and therefore its float
+    // rounding -- is unchanged from the pre-2026-07-26 build.
+    let mut fwd_idx: Vec<usize> = Vec::with_capacity(agents);
+    // Per learner ROW, the team size of the arena it came from (E5). Built in
+    // THE SAME loop as learner_idx so the two orderings cannot drift: the
+    // trainer standardises advantages per team size off this label, and a silent
+    // mis-label would mis-scale the policy gradient undetectably.
+    let mut learner_team_size: Vec<i8> = Vec::with_capacity(agents);
+    // Arenas whose ORANGE cars are (partly) driven by a foreign (ported) bot:
     // (local arena index, foreign slot, first agent index of the arena).
     let mut foreign_arenas: Vec<(usize, usize, usize)> = Vec::new();
     {
@@ -312,29 +373,77 @@ fn collect_v1_worker(
                 // `foreign[slot]` via a controls override at step time -- they are
                 // neither learner rows nor native-opponent rows.
                 let fslot = (-k - 2) as usize;
-                // Ported bots have a FIXED input width tied to a team size --
-                // Immortal's AdvancedObs is 107 floats == exactly 1v1 (one other
-                // car). A 2v2/3v3 arena would need 169/201 and the net could not
-                // consume it, so refuse loudly instead of writing out of bounds.
-                if (b, o) != (1, 1) {
-                    return Err(format!(
-                        "foreign opponent assigned to a {b}v{o} arena (index {li}); \
-                         ported bots are 1v1-only (their obs width is fixed). Use \
-                         team_size_weights = [1, 0, 0] for foreign-opponent runs."
-                    ));
-                }
+                // EVERY ported bot drives a team arena as of 2026-07-26. Nexto
+                // and Necto are EARL attention models that size their obs from
+                // `state.cars.len()` (obs_nexto::n_entities /
+                // obs_necto::n_entities) with an all-false mask at a full
+                // complement, so they see the whole arena unchanged; measured
+                // at 9000 steps/arena vs a random opponent, goals/600s 67/71/67
+                // (nexto) and 62/61/65 (necto) at 1v1/2v2/3v3 -- team size costs
+                // them nothing.
+                //
+                // Immortal and Element consume AdvancedObs-107, a FIXED width
+                // that fits exactly one other car, and until 2026-07-26 they
+                // were REFUSED here because `build_advanced_obs` ran off the end
+                // of the buffer at 2v2. That refusal treated a property of the
+                // EXTRACTED ARTIFACT as a property of the bot. Upstream
+                // RLMarlbot shares the limitation -- its advanced_obs.py loops
+                // over all other cars with no padding and would emit 169 floats
+                // into a 107-wide net -- but nothing stops US truncating: they
+                // now see the opponent nearest the ball and nothing else
+                // (foreign.rs Immortal/Element arms ->
+                // obs_advanced::build_advanced_obs_one_other, which is
+                // byte-identical to the old path at 1v1, so every existing 1v1
+                // bench row stays comparable).
+                //
+                // Measured over 4000 steps/row x 3 seeds vs a random opponent, a
+                // truncated element/immortal at 2v2 and 3v3 is indistinguishable
+                // from the same bot at 1v1: element goals/600s 58+-5 (3v3) vs
+                // 61+-5 (1v1), ball-facing 0.570 vs 0.555, approach 0.579 vs
+                // 0.531, no spin, no idling, zero insane physics states. Against
+                // nexto they track a NON-truncated necto control cell for cell as
+                // team size grows, so the collapse with team size is the cost of
+                // playing nexto rather than the cost of truncation.
+                //
+                // WHY WE WANT THEM HERE: they are the two easiest bots we have
+                // (at a shared p4 vs ck_001171502080: immortal 0.896, element
+                // 0.677, nexto 0.146) and were excluded from exactly the 2v2/3v3
+                // blocks where the net is weakest and the lexicographic rung
+                // controller has nowhere easier to go. They are also ~5x cheaper
+                // per car-forward than nexto at 3v3 (0.23-0.26 ms vs 1.29 ms).
+                //
+                // TRIPWIRE: the bot cannot see 1 (2v2) or 3 (3v3) of our cars, so
+                // "occupy the visible slot with car A, walk car B in" is a free
+                // goal that exists against no real opponent. near-ball selection
+                // bounds it (the car contesting the ball IS the visible one), as
+                // does the [0.35, 0.65] auto-curriculum band. If win share vs an
+                // element/immortal team slot ratchets to the easy pin and STAYS
+                // there while the nexto/necto slots do not, that is the exploit
+                // -- pull the slots. See docs/foreign-opponents.md.
+                // BLUE only are learner rows; the bot drives the first
+                // `cars_in_arena` orange cars and OUR policy mirrors the rest.
+                let fcars = foreign.get(fslot).map(|f| f.cars_in_arena(o)).unwrap_or(o);
                 for i in 0..b {
                     learner_idx.push(a_off + i);
+                    learner_team_size.push(b.max(o) as i8);
+                    fwd_idx.push(a_off + i);
+                }
+                for i in (b + fcars)..(b + o) {
+                    fwd_idx.push(a_off + i); // mirror: forwarded, not learned from
                 }
                 foreign_arenas.push((li, fslot, a_off));
             } else if k < 0 {
                 for i in 0..(b + o) {
                     learner_idx.push(a_off + i);
+                    learner_team_size.push(b.max(o) as i8);
+                    fwd_idx.push(a_off + i);
                 }
             } else {
                 let slot = k as usize;
                 for i in 0..b {
                     learner_idx.push(a_off + i);
+                    learner_team_size.push(b.max(o) as i8);
+                    fwd_idx.push(a_off + i);
                 }
                 for i in b..(b + o) {
                     opp_idx[slot].push(a_off + i);
@@ -347,8 +456,12 @@ fn collect_v1_worker(
         }
     }
     let n_learner = learner_idx.len();
+    let n_fwd = fwd_idx.len();
+    debug_assert_eq!(learner_team_size.len(), n_learner);
 
     let mut out = CollectOut::zeros_v1(steps, n_learner, emit_v0_obs);
+    out.learner_team_size = learner_team_size;
+    out.forward_rows = n_fwd;
 
     // Full-agent-width per-round obs scratch (current + terminal-final).
     let mut ents_buf = vec![0f32; agents * ek];
@@ -366,11 +479,13 @@ fn collect_v1_worker(
     let mut logits_all = vec![0f32; agents * action_count];
     let mut acts = vec![0i64; agents];
 
-    // Batched-forward gather buffers (learner + per opponent slot).
-    let mut l_ents = vec![0f32; n_learner * ek];
-    let mut l_mask = vec![false; n_learner * mk];
-    let mut l_query = vec![0f32; n_learner * qk];
-    let mut l_prev = vec![0i64; n_learner * pk];
+    // Batched-forward gather buffers (our policy + per opponent slot). Sized by
+    // `n_fwd` (learner rows + partial-team mirrors), which equals `n_learner`
+    // whenever no arena runs a partial foreign team.
+    let mut l_ents = vec![0f32; n_fwd * ek];
+    let mut l_mask = vec![false; n_fwd * mk];
+    let mut l_query = vec![0f32; n_fwd * qk];
+    let mut l_prev = vec![0i64; n_fwd * pk];
     let mut o_ents: Vec<Vec<f32>> = opp_idx.iter().map(|ix| vec![0f32; ix.len() * ek]).collect();
     let mut o_mask: Vec<Vec<bool>> = opp_idx.iter().map(|ix| vec![false; ix.len() * mk]).collect();
     let mut o_query: Vec<Vec<f32>> = opp_idx.iter().map(|ix| vec![0f32; ix.len() * qk]).collect();
@@ -421,16 +536,22 @@ fn collect_v1_worker(
 
         // 3. batched forwards: one learner batch + one per used opponent slot,
         // logits scattered into full agent width for uniform sampling below.
-        if n_learner > 0 {
-            for (j, &a) in learner_idx.iter().enumerate() {
+        if n_fwd > 0 {
+            for (j, &a) in fwd_idx.iter().enumerate() {
                 gather!(j, a, l_ents, l_mask, l_query, l_prev, ents_buf, mask_buf, query_buf, prev_buf);
             }
-            let (l_logits, l_values) = pol.forward(&l_ents, &l_mask, &l_query, &l_prev, n_learner)?;
-            for (j, &a) in learner_idx.iter().enumerate() {
+            let (l_logits, l_values) = pol.forward(&l_ents, &l_mask, &l_query, &l_prev, n_fwd)?;
+            // Scatter logits for EVERY forwarded agent, but record values only
+            // for learner rows. When there are no mirrors, `fwd_idx` IS
+            // `learner_idx` and this writes `out.values` in the same order the
+            // old bulk copy_from_slice did.
+            for (j, &a) in fwd_idx.iter().enumerate() {
                 logits_all[a * action_count..(a + 1) * action_count]
                     .copy_from_slice(&l_logits[j * action_count..(j + 1) * action_count]);
+                if let Some(col) = learner_col[a] {
+                    out.values[t * n_learner + col] = l_values[j];
+                }
             }
-            out.values[t * n_learner..(t + 1) * n_learner].copy_from_slice(&l_values);
         }
         for (slot, idxs) in opp_idx.iter().enumerate() {
             if idxs.is_empty() {
@@ -470,8 +591,15 @@ fn collect_v1_worker(
             let mut foreign_ids: Vec<u64> = Vec::new();
             if let Some(&(_, fslot, _)) = foreign_arenas.iter().find(|(l, _, _)| *l == li) {
                 let bc = ar.blue_count();
-                let mut ov = Vec::with_capacity(n.saturating_sub(bc));
-                for i in bc..n {
+                // PARTIAL foreign team (E4): the bot drives the first `k` orange
+                // cars, the rest keep the action our policy already sampled for
+                // them. `k` defaults to the whole orange side, so a run that
+                // never sets foreign_cars queues exactly the same overrides as
+                // before. Must match the `fwd_idx` split above -- both take the
+                // FIRST k orange cars.
+                let k = foreign[fslot].cars_in_arena(n - bc);
+                let mut ov = Vec::with_capacity(k);
+                for i in bc..(bc + k) {
                     let (cid, key, ctrl) =
                         ar.foreign_controls(i, &mut foreign[fslot], global_base + li);
                     foreign_ids.push(key);
@@ -545,10 +673,22 @@ fn collect_v1_worker(
         off += n;
     }
     if n_learner > 0 {
+        // Learner rows ONLY here (not `fwd_idx`): `last_values` is the GAE
+        // bootstrap for the rows that actually become training data, and a
+        // mirror row has none.
         for (j, &a) in learner_idx.iter().enumerate() {
             gather!(j, a, l_ents, l_mask, l_query, l_prev, ents_buf, mask_buf, query_buf, prev_buf);
         }
-        let (_, lv) = pol.forward(&l_ents, &l_mask, &l_query, &l_prev, n_learner)?;
+        // The gather buffers are sized for `n_fwd` rows; slice them to the
+        // `n_learner` rows actually filled above, or `forward` infers max_ent
+        // from `mask.len() / b` and rejects the batch.
+        let (_, lv) = pol.forward(
+            &l_ents[..n_learner * ek],
+            &l_mask[..n_learner * mk],
+            &l_query[..n_learner * qk],
+            &l_prev[..n_learner * pk],
+            n_learner,
+        )?;
         out.last_values.copy_from_slice(&lv);
     }
     Ok(out)
@@ -642,6 +782,9 @@ impl MultiEngine {
         emit_v0_obs: bool,
     ) -> Self {
         let obs_mode = if schema.version == 1 { ObsMode::V1 } else { ObsMode::V0 };
+        // Which V1 action table the schema selected; moved into every worker
+        // below so each arena decodes with the same table the policy emits.
+        let act_table = schema.action_table_kind();
         let num_arenas = sizes.len();
         let threads = if num_threads == 0 {
             std::thread::available_parallelism().map(|n| n.get().saturating_sub(2).max(1)).unwrap_or(4)
@@ -674,9 +817,9 @@ impl MultiEngine {
                     .iter()
                     .enumerate()
                     .map(|(i, &(b, o))| {
-                        EpisodeArena::new_full(b, o, sch.tick_skip, cfg.clone(),
+                        EpisodeArena::new_full_with_table(b, o, sch.tick_skip, cfg.clone(),
                                           sch.normalization.clone(), seed.wrapping_add((global_base + i) as u32),
-                                          curr.clone(), obs_mode)
+                                          curr.clone(), obs_mode, act_table)
                     })
                     .collect();
                 // Per-arena agent counts (blue+orange, may vary across arenas now)
@@ -737,6 +880,7 @@ impl MultiEngine {
                                 debug_json: None,
                                 error: None,
                                 collect: None,
+                                terms: None,
                             };
                             let mut off = 0;
                             for ar in arenas.iter_mut() {
@@ -756,6 +900,7 @@ impl MultiEngine {
                                 debug_json: None,
                                 error: None,
                                 collect: None,
+                                terms: None,
                             };
                             let mut a_off = 0;
                             let mut flags = vec![StepFlags::default(); max_arena_agents];
@@ -776,6 +921,15 @@ impl MultiEngine {
                             }
                             let _ = otx.send(out);
                         }
+                        Cmd::RewardTerms => {
+                            let mut sums = [0.0f64; crate::reward::N_TERMS];
+                            for ar in arenas.iter_mut() {
+                                for (s, v) in sums.iter_mut().zip(ar.take_reward_terms()) {
+                                    *s += v;
+                                }
+                            }
+                            let _ = otx.send(WorkerOut { terms: Some(sums), ..WorkerOut::empty() });
+                        }
                         Cmd::Debug { local_idx } => {
                             let ar = &mut arenas[local_idx];
                             let n = ar.num_agents();
@@ -788,6 +942,7 @@ impl MultiEngine {
                                 debug_json: None,
                                 error: None,
                                 collect: None,
+                                terms: None,
                             };
                             ar.write_obs(&mut out.obs);
                             out.debug_json = Some(ar.debug_state_json());
@@ -855,10 +1010,11 @@ impl MultiEngine {
                             let mut build_err: Option<String> = None;
                             for w in ws.iter() {
                                 match w {
-                                    NetWeights::Foreign { raw, kind, period } => {
+                                    NetWeights::Foreign { raw, kind, period, cars } => {
                                         match crate::foreign::ForeignPolicy::new(raw, *kind) {
                                             Ok(mut p) => {
                                                 p.set_decision_period(*period);
+                                                p.set_foreign_cars(*cars);
                                                 built.push(p)
                                             }
                                             Err(e) => {
@@ -1165,9 +1321,10 @@ impl MultiEngine {
             // V1 has no flat obs: obs_size 0 mirrors schema/v1.toml's
             // obs_size = 0 (the lib.rs getter passes it straight through).
             obs_size: match obs_mode { ObsMode::V0 => OBS_SIZE, ObsMode::V1 => 0 },
-            action_count: match obs_mode {
-                ObsMode::V0 => crate::actions::TABLE_SIZE,
-                ObsMode::V1 => crate::actions::TABLE_SIZE_V1,
+            action_count: match (obs_mode, act_table) {
+                (ObsMode::V0, _) => crate::actions::TABLE_SIZE,
+                (ObsMode::V1, ActionTableKind::V1) => crate::actions::TABLE_SIZE_V1,
+                (ObsMode::V1, ActionTableKind::V1Air) => crate::actions::TABLE_SIZE_V1_AIR,
             },
             obs_mode,
             emit_v0_obs,
@@ -1250,7 +1407,28 @@ impl MultiEngine {
         let debug_policy = match (self.obs_mode, &*arc) {
             (ObsMode::V0, NetWeights::V0(pw)) => Some(MlpPolicy::new(pw)?),
             (ObsMode::V1, NetWeights::V1 { raw, heads }) => {
-                EntityPolicy::new(raw, *heads)?;
+                let pol = EntityPolicy::new(raw, *heads)?;
+                // CROSS-TABLE GUARD. schema.version is 1 for BOTH v1 action
+                // tables, so a 104-row v1-air checkpoint loaded against
+                // schema/v1.toml (92 rows) passes every version check and then
+                // samples action index 92..104 into a 92-row decode table --
+                // an out-of-bounds panic deep inside a worker thread, minutes
+                // in, with no hint of the real cause. One Engine binds ONE
+                // table; cross-table evaluation needs one engine per side.
+                // Fail here, on the calling thread, naming both widths.
+                if pol.table_size() != self.action_count {
+                    return Err(format!(
+                        "action-table mismatch: this engine's schema selects a \
+                         {}-row table but the state dict carries a {}-row \
+                         action_table. schema_version is 1 for BOTH v1 tables, so \
+                         the schema PATH is what distinguishes them -- use \
+                         schema/v1.toml for a 92-row checkpoint and \
+                         schema/v1_air.toml for a 104-row one. A v1.1 checkpoint \
+                         and a v1-air checkpoint cannot share one engine.",
+                        self.action_count,
+                        pol.table_size()
+                    ));
+                }
                 None
             }
             (ObsMode::V0, NetWeights::V1 { .. }) => {
@@ -1297,9 +1475,33 @@ impl MultiEngine {
     pub fn set_opponents(&mut self, weights: Vec<NetWeights>) -> Result<(), String> {
         // Every slot's variant must match the engine's obs mode (workers
         // then never see a mixed/mismatched slot list).
-        for w in &weights {
+        for (slot, w) in weights.iter().enumerate() {
             match (self.obs_mode, w) {
-                (ObsMode::V0, NetWeights::V0(_)) | (ObsMode::V1, NetWeights::V1 { .. }) => {}
+                (ObsMode::V0, NetWeights::V0(_)) => {}
+                (ObsMode::V1, NetWeights::V1 { raw, .. }) => {
+                    // Same cross-table guard as `set_weights`, and it has to be
+                    // here too because MatchRunner.play drives BOTH sides
+                    // through ONE engine (`set_weights(a)` + `set_opponents([b])`).
+                    // A 104-row v1-air opponent in a 92-row engine would sample
+                    // an index past the end of the decode table. Read the width
+                    // off the raw buffer rather than building an EntityPolicy:
+                    // this path never needed a full construction and a shape
+                    // check is what is actually at stake.
+                    if let Some((_, shape)) = raw.get("action_table") {
+                        if shape.len() == 2 && shape[0] != self.action_count {
+                            return Err(format!(
+                                "opponent slot {slot}: action-table mismatch -- this \
+                                 engine's schema selects a {}-row table but the \
+                                 opponent state dict carries a {}-row action_table. \
+                                 schema_version is 1 for BOTH v1 tables, so a v1.1 \
+                                 checkpoint and a v1-air checkpoint cannot be played \
+                                 against each other in one engine; run each side on \
+                                 its own schema.",
+                                self.action_count, shape[0]
+                            ));
+                        }
+                    }
+                }
                 (ObsMode::V0, NetWeights::V1 { .. }) => {
                     return Err("v1 opponent state dict given to a v0-schema engine".into());
                 }
@@ -1461,6 +1663,7 @@ impl MultiEngine {
                 }
                 let mut merged = CollectOut::zeros_v1(steps, learner_count, self.emit_v0_obs);
                 let mut off = 0usize;
+                let mut fwd_rows = 0usize;
                 for out in worker_outs.into_iter() {
                     let co = out.collect.expect("collect payload missing on worker success");
                     let n = co.learner_agents;
@@ -1481,10 +1684,55 @@ impl MultiEngine {
                         ilv(&mut merged.final_values, &co.final_values, t, learner_count, off, n, 1);
                     }
                     merged.last_values[off..off + n].copy_from_slice(&co.last_values);
+                    // Same interleave as last_values: workers own contiguous
+                    // arena ranges, so concatenating in worker order reproduces
+                    // the global learner-row order exactly.
+                    merged.learner_team_size[off..off + n]
+                        .copy_from_slice(&co.learner_team_size);
+                    fwd_rows += co.forward_rows;
                     off += n;
                 }
+                merged.forward_rows = fwd_rows;
                 Ok(merged)
             }
+        }
+    }
+
+    /// Per-arena team size (1/2/3) in global arena order. See `Engine.team_sizes`
+    /// in lib.rs for why the trainer needs it.
+    pub fn team_sizes(&self) -> Vec<usize> {
+        self.sizes.iter().map(|&(b, o)| b.max(o)).collect()
+    }
+
+    /// Sum every worker's arenas' per-term reward counters, resetting them (E9).
+    ///
+    /// Deliberately its own Cmd rather than a field on `CollectOut`: the collect
+    /// buffers' shapes are load-bearing for the merge arithmetic and for the
+    /// determinism regression tests, and telemetry must never be able to perturb
+    /// them.
+    pub fn reward_terms(&mut self) -> Result<[f64; crate::reward::N_TERMS], String> {
+        for w in &self.workers {
+            w.tx.send(Cmd::RewardTerms).map_err(|e| e.to_string())?;
+        }
+        let mut sums = [0.0f64; crate::reward::N_TERMS];
+        let mut first_err: Option<String> = None;
+        for w in &self.workers {
+            let out = w.rx.recv().map_err(|e| e.to_string())?;
+            if let Some(e) = out.error {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                continue;
+            }
+            if let Some(t) = out.terms {
+                for (s, v) in sums.iter_mut().zip(t) {
+                    *s += v;
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(sums),
         }
     }
 

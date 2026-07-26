@@ -16,6 +16,7 @@ import random
 from construct.league.matches import MatchRunner, play_entries
 from construct.league.registry import Registry
 from construct.league.sampling import choose_opponents
+from construct.tables import table_name
 
 # (run label, checkpoint glob) pairs scanned per schema version. Globs are
 # cwd-relative, matching how league_tick_loop.sh runs from the repo root.
@@ -48,9 +49,19 @@ def register_newest_checkpoints(reg, schema_version):
         ck = newest(pattern)
         if ck:
             meta = torch.load(ck, map_location="cpu", weights_only=False)
+            # action_table comes off the checkpoint, NEVER from the default.
+            # Registry.add defaults it to the 92-row table (right for every
+            # entry written before 2026-07-26), so a producer that omits it
+            # stamps a 104-row v1-air arm as 92-row -- which makes the
+            # cross-table guards in play_entries and choose_opponents read the
+            # wrong thing and silently pass / silently exclude. table_name()
+            # returns None at v0, where no table name was ever recorded; keep
+            # the 92-row default there so v0 rows are unchanged.
+            table = table_name(meta)
             reg.add(ck, steps=meta["total_steps"], run=run,
                     reward_config=meta.get("reward_config_path", "unknown"),
-                    schema_version=schema_version)
+                    schema_version=schema_version,
+                    **({"action_table": table} if table is not None else {}))
 
 
 def play_rating_matches(reg, schema_version, budget, *, net_heads=4, rng=None,

@@ -42,3 +42,32 @@ def make_lookup_table_v1() -> np.ndarray:
         dtype=np.float32,
     )
     return np.vstack([make_lookup_table(), stalls])
+
+
+def make_lookup_table_v1_air() -> np.ndarray:
+    """v1-air action table: v1.1's 92 rows APPENDED with a 12-row clean-air block.
+
+    Mirrors engine/src/actions.rs make_lookup_table_v1_air exactly
+    (parity-tested in tests/python/test_deploy_v1.py). Append-only, so indices
+    0..92 keep their v1.1 meaning byte-for-byte.
+
+    The appended rows are the clean-air grid -- pitch in {-1,0,+1} x boost in
+    {0,1}, jump=1, steer=yaw=roll=HANDBRAKE=0 -- emitted twice. v1.1 cannot
+    express "jump without air roll" at any index, because its handbrake is
+    derived from rotation (`handbrake = jump and (pitch or yaw or roll)` in
+    make_lookup_table above) and its aerial loop also skips `jump and yaw`.
+    That leaves 2/92 clean-jump rows and makes a sustained takeoff effectively
+    unsamplable; the block takes clean jumps to 14/104 and the probability of
+    holding one for three consecutive decisions from 1.03e-5 to 2.44e-3.
+    Doubled per ZealanL's RLGym-PPO-Guide ("doubling jump actions in discrete
+    action parsers"); duplicate rows are a free prior because EntityPolicyNet
+    computes logits from the action-table ROW, not a per-slot parameter.
+    Row layout: [throttle, steer, pitch, yaw, roll, jump, boost, handbrake].
+    """
+    air = []
+    for _ in range(2):
+        for pitch in (-1, 0, 1):
+            for boost in (0, 1):
+                #          throttle steer  pitch  yaw roll jump boost handbrake
+                air.append([boost, 0, pitch, 0, 0, 1, boost, 0])
+    return np.vstack([make_lookup_table_v1(), np.array(air, dtype=np.float32)])

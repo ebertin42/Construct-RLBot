@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from actions import make_lookup_table_v1
+from actions import make_lookup_table, make_lookup_table_v1, make_lookup_table_v1_air
 
 
 class PolicyValueNet(nn.Module):
@@ -177,7 +177,14 @@ def load_policy(checkpoint_path: str) -> tuple[nn.Module, int]:
 
     Returns (net, schema_version):
       0 -> PolicyValueNet (obs 94, 90-action table)
-      1 -> EntityPolicyNet (obs_v1 entity set, 92-action table)
+      1 -> EntityPolicyNet (obs_v1 entity set, 92- or 104-action table)
+
+    Schema version 1 covers TWO action tables -- the frozen 92-row v1.1
+    (`construct_92_v1`) and the 104-row v1-air (`construct_104_v1air`, v1.1
+    plus a doubled clean-air block). They share an obs contract and differ
+    only in the policy's output dimension, so the table is selected from the
+    checkpoint's `action_table` name, falling back to the stored buffer's row
+    count for pre-v9 checkpoints that predate that field.
     """
     ck = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     version = int(ck["schema_version"])
@@ -186,13 +193,26 @@ def load_policy(checkpoint_path: str) -> tuple[nn.Module, int]:
         net.load_state_dict(ck["model"])
     elif version == 1:
         cfg = ck["config"]["net"]
-        table = make_lookup_table_v1()
-        # fail loud if the checkpoint was trained against a different table
-        # than the one deploy decodes with
         ck_table = ck["model"]["action_table"]
+        # Which of the two v1 tables this checkpoint was trained against.
+        # Prefer the recorded NAME (written since v9); fall back to the stored
+        # buffer's row count so every pre-v9 checkpoint keeps loading.
+        name = ck.get("action_table")
+        if name is None:
+            name = "construct_104_v1air" if ck_table.shape[0] == 104 else "construct_92_v1"
+        builders = {
+            "construct_92_v1": make_lookup_table_v1,
+            "construct_104_v1air": make_lookup_table_v1_air,
+        }
+        assert name in builders, f"unknown checkpoint action_table: {name!r}"
+        table = builders[name]()
+        # Fail loud if the checkpoint was trained against a different table
+        # than the one deploy decodes with. This is the guard that stops a
+        # silently mis-decoded policy: identical logit indices mean different
+        # CONTROLS across tables, so a wrong table here flies a different bot.
         assert ck_table.shape == tuple(table.shape) and torch.equal(
             ck_table, torch.as_tensor(table)
-        ), "checkpoint action_table differs from deploy's make_lookup_table_v1()"
+        ), f"checkpoint action_table differs from deploy's {name}"
         net = EntityPolicyNet(
             d_model=cfg["d_model"], layers=cfg["layers"], heads=cfg["heads"], ff=cfg["ff"],
             action_table=table,
@@ -204,3 +224,27 @@ def load_policy(checkpoint_path: str) -> tuple[nn.Module, int]:
     net.eval()
     torch.set_num_threads(1)
     return net, version
+
+
+def decode_table(net: nn.Module, schema_version: int) -> np.ndarray:
+    """The [N,8] table that decodes THIS net's argmax index into controls.
+
+    Take the table off the NET, never off the schema version. The bug this
+    replaces: bot.py built its table as
+        make_lookup_table_v1() if schema_version == 1 else make_lookup_table()
+    -- 92 rows, chosen from a version that is 1 for BOTH v1 tables. Against a
+    104-row v1-air net every index 0..91 still decoded correctly (the table is
+    append-only), so nothing looked wrong until the policy picked one of the 12
+    appended aerial rows; then `self.table[index]` raised IndexError inside
+    get_output's catch-all and the bot silently repeated its previous controls.
+    Measured on a uniform 104-row policy that is 11.8% of decisions, and it is
+    exactly the 12 rows the v1-air table was added to make reachable -- a bot
+    that learned aerials would hit it far more often than a random one.
+
+    v1 nets carry `action_table` as a registered buffer, so it is by
+    construction the table the weights were trained against. v0's PolicyValueNet
+    has no such buffer and exactly one table ever existed there.
+    """
+    if int(schema_version) == 1:
+        return net.action_table.detach().cpu().numpy()
+    return make_lookup_table()

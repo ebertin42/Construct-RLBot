@@ -394,16 +394,21 @@ def load_checkpoint(path: str):
 
 def build_net(state, device):
     """Load the checkpoint the way Trainer does for the v1 path: EntityPolicyNet
-    dims come from the checkpoint's own config.net, the action table from the
-    engine (construct._engine.action_table_v1)."""
-    from construct._engine import action_table_v1
+    dims come from the checkpoint's own config.net, and the action table from
+    the checkpoint's own registered buffer.
+
+    NOT `action_table_v1()`: that is always 92 rows, and schema_version is 1 for
+    both the 92-row v1.1 table and the 104-row v1-air table v9 runs on, so a
+    hardcoded table size-mismatches in load_state_dict below. The buffer travels
+    with the state dict and therefore cannot disagree with the weights.
+    """
     from construct.learn.model_v1 import EntityPolicyNet
 
     net_cfg = state["config"]["net"]
     net = EntityPolicyNet(
         d_model=int(net_cfg["d_model"]), layers=int(net_cfg["layers"]),
         heads=int(net_cfg["heads"]), ff=int(net_cfg["ff"]),
-        action_table=action_table_v1(),
+        action_table=state["model"]["action_table"].numpy(),
     ).to(device)
     net.load_state_dict(state["model"])
     net.eval()

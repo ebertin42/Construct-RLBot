@@ -8,8 +8,7 @@ from rlbot.managers import Bot
 from rlgym_compat import GameState
 from rlgym_compat.sim_extra_info import SimExtraInfo
 
-from actions import make_lookup_table, make_lookup_table_v1
-from model import load_policy
+from model import decode_table, load_policy
 from obs import (
     BALL_PRED_HORIZONS_SEC,
     NUM_PRED,
@@ -159,7 +158,14 @@ class ConstructBot(Bot):
     def initialize(self):
         here = os.path.dirname(os.path.abspath(__file__))
         self.net, self.schema_version = load_policy(os.path.join(here, "checkpoint.pt"))
-        self.table = make_lookup_table_v1() if self.schema_version == 1 else make_lookup_table()
+        # FROM THE NET, NOT FROM schema_version. schema_version is 1 for BOTH v1
+        # action tables -- the 92-row construct_92_v1 and the 104-row
+        # construct_104_v1air -- so selecting on it hardcoded 92 rows and made
+        # every appended aerial row undecodable (IndexError, swallowed below).
+        # See model.decode_table for the measurement.
+        self.table = decode_table(self.net, self.schema_version)
+        self._dbg(f"loaded checkpoint: schema_version={self.schema_version} "
+                  f"action_table={len(self.table)} rows")
         # rlgym_compat >= 2.x dropped the tick_skip param (we do our own
         # tick-skip accounting via frame_num deltas in get_output)
         self.extra_info = SimExtraInfo(self.field_info)
@@ -167,7 +173,9 @@ class ConstructBot(Bot):
         self.ticks = TICK_SKIP  # act on first packet
         self.prev_control = ControllerState()
         self.prev_frame = -1
-        self._debug_budget = 30  # log first N acting frames / exceptions
+        self._debug_budget = 30  # log first N acting frames
+        self._exc_budget = 30    # log first N exceptions (see get_output)
+        self._exc_total = 0
         # v1: prev-5 executed-action ring (newest-first, zeros at match start;
         # re-zeroed on goals — see _get_output) + field-info pad order mapping
         self.prev_ring = np.zeros(PREV_ACTIONS, dtype=np.int64)
@@ -187,11 +195,19 @@ class ConstructBot(Bot):
         try:
             return self._get_output(packet)
         except Exception:
-            if self._debug_budget > 0:
-                self._debug_budget -= 1
+            # SEPARATE budget from the acting-frame log. Sharing one meant the
+            # 30 start-up frames spent it before any exception could be
+            # recorded, so a PERSISTENT fault (the 104-row decode IndexError
+            # that motivated this) was indistinguishable from a dropped frame:
+            # the bot just repeated its last controls forever, silently. Log
+            # the first 30, then every 300th, and always carry the running
+            # total so the log says how long it has been failing.
+            self._exc_total += 1
+            if self._exc_budget > 0 or self._exc_total % 300 == 0:
+                self._exc_budget -= 1
                 import traceback
 
-                self._dbg("EXCEPTION:\n" + traceback.format_exc())
+                self._dbg(f"EXCEPTION #{self._exc_total}:\n" + traceback.format_exc())
             return self.prev_control
 
     def _dbg(self, msg: str):

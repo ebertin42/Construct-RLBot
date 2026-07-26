@@ -19,6 +19,7 @@ import torch
 from construct._engine import Engine, action_table_v1
 from construct.learn.model import PolicyValueNet
 from construct.learn.model_v1 import EntityPolicyNet
+from construct.tables import schema_path as ck_schema_path
 
 p = argparse.ArgumentParser()
 p.add_argument("--schema", choices=["v0", "v1"], default="v0")
@@ -35,10 +36,11 @@ if args.schema == "v1":
         ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         net_cfg = ck["config"]["net"]
         heads = int(net_cfg["heads"])
-        try:
-            table = action_table_v1()
-        except ImportError:
-            table = ck["model"]["action_table"].numpy()
+        # Both from the checkpoint: schema_version does not distinguish the
+        # 92-row v1.1 table from the 104-row v1-air one, and the registered
+        # buffer is the only source that cannot drift from the weights.
+        table = ck["model"]["action_table"].numpy()
+        schema_path = ck_schema_path(ck)
         net = EntityPolicyNet(
             d_model=int(net_cfg["d_model"]), layers=int(net_cfg["layers"]),
             heads=heads, ff=int(net_cfg["ff"]), action_table=table,

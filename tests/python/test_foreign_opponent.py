@@ -133,18 +133,28 @@ def test_rejects_length_mismatch():
 
 @needs_champion
 @needs_weights
-def test_rejects_non_1v1_arena():
-    """Immortal's AdvancedObs is 107 floats == exactly 1v1. A 2v2 arena would need
-    169 and the net cannot consume it, so the engine must refuse rather than write
-    out of bounds."""
+def test_runs_non_1v1_arena_on_a_truncated_obs():
+    """Immortal's AdvancedObs is 107 floats == self + exactly ONE other car, so
+    an untruncated 2v2 obs would need 169 and overrun the buffer.
+
+    INVERTED on 2026-07-26: rather than refusing the arena, immortal/element
+    are now fed a TRUNCATED obs showing only the opponent nearest the ball, so
+    a 2v2 collect must RUN and produce finite rewards. The overrun is still
+    prevented -- that is what this asserts now. The truncated builder is
+    byte-identical to the full one at 1v1 (engine immortal_obs_test.rs), so
+    every existing 1v1 bench row stays comparable.
+    """
     sd = _champion_sd()
     eng = Engine(num_arenas=1, blue=2, orange=2, schema_path="schema/v1.toml",
                  reward_config_path="configs/reward_v0.toml", seed=7,
                  num_threads=1, net_heads=4)
     eng.set_weights(sd)
     eng.set_foreign_opponents([_immortal_sd()], ["immortal"])
-    with pytest.raises(Exception, match="1v1"):
-        eng.collect(8, arena_opponents=[-2])
+    out = eng.collect(8, arena_opponents=[-2])
+    # BLUE only are learner rows in a foreign arena.
+    assert out["learner_agents"] == 2
+    assert np.isfinite(out["rewards"]).all(), "truncated obs must not produce NaN rewards"
+    assert np.isfinite(out["values"]).all()
 
 
 @needs_champion

@@ -159,8 +159,14 @@ def main(argv=None):
                   flush=True)
 
     from construct.league.matches import MatchRunner, load_sd, match_record, split_matches
+    from construct.tables import table_for_state_dict
 
     sd = load_sd(args.champion)
+    # The null has to be re-measured per wheel and per net (`gates-need-an-idle-box`),
+    # so this instrument has to work on whatever net is being gated -- including a
+    # 104-row v1-air one. schema_version cannot pick the schema file; the weights'
+    # own action-table buffer can, and reading it off `sd` needs no second load.
+    table = table_for_state_dict(sd)
     shares = []
     # Unflipped, blue-perspective share of each (seed, order). The combined
     # `shares` above cannot carry this: the flip cancels blue advantage by
@@ -186,7 +192,8 @@ def main(argv=None):
             mr = MatchRunner(num_arenas=args.arenas, seed=seed + 1000 * order,
                              mode=args.mode, schema_version=1, net_heads=4,
                              reward_config="configs/reward_v0.toml",
-                             curriculum_config="configs/curriculum_v3_match.toml")
+                             curriculum_config="configs/curriculum_v3_match.toml",
+                             action_table=table)
             mr.eng.set_weights(sd)
             mr.eng.set_opponents([sd])
             out = mr.eng.collect(args.steps, arena_opponents=mr.assignment)

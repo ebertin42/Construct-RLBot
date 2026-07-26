@@ -24,13 +24,24 @@ class TrainConfig:
     # Trainer.__init__). Keys: ck (checkpoint path), lambda (float, default 0.05).
     kl_prior: dict = field(default_factory=dict)
     # Foreign opponents: externally-trained community bots ported into the engine
-    # (see docs/foreign-opponents.md). Keys: enabled (bool), kinds (list[str], e.g.
-    # ["immortal"]), weights (list[path] to the extracted npz, same length/order as
-    # kinds), opponent_frac (float, fraction of arenas they drive, default 0.25),
-    # decision_periods (list[int] same length as kinds, default all 1; a bot reacts
-    # every Nth decision -- the difficulty handicap, since every bot beats us 96-0).
-    # Independent of `league`: foreign arenas are taken from the FRONT of the arena
-    # list and league opponent arenas from the BACK, so both can run at once.
+    # (see docs/foreign-opponents.md). Keys: enabled (bool), opponent_frac (float,
+    # fraction of EACH TEAM-SIZE BLOCK's arenas they drive, default 0.25),
+    # decision_periods (list[int], one per slot, default all 1 -- a bot reacts
+    # every Nth decision, the difficulty handicap, since every bot beats us 96-0),
+    # foreign_cars (list[int], one per slot, how many ORANGE cars each bot drives;
+    # the rest of that team mirrors our own policy).
+    #
+    # The roster comes in one of two shapes:
+    #   v9:     slots = [{ kind = "nexto", mode = 3, weights = "...npz" }, ...]
+    #           -- `mode` is the TEAM SIZE that slot plays at, which is what
+    #           per-block placement and the (bot x mode) rung ladder need.
+    #   legacy: kinds = [...] + weights = [...] (parallel lists), treated as
+    #           all mode 1. Still accepted, unchanged.
+    # At most 8 slots (the cap in engine/src/lib.rs).
+    #
+    # Independent of `league`: within EACH block, foreign arenas are taken from
+    # the front and league opponent arenas from the back, so both can run at once
+    # in every regime.
     foreign: dict = field(default_factory=dict)
 
     @classmethod

@@ -20,7 +20,9 @@
 #     ~50%, measured with bench_foreign.py; the champion gate is secondary.
 #
 # Starts from the champion (our best policy; beats Element at period 8). ALL 1v1
-# (foreign opponents are 1v1-only). Requires element_weights.npz on the box.
+# (Element's AdvancedObs-107 is a fixed width == one other car; since 2026-07-26
+# the engine's guard is per kind, and nexto/necto are the ones that DO take team
+# arenas). Requires element_weights.npz on the box.
 schema_path = "schema/v1.toml"
 reward_config_path = "configs/reward_v7_goal_only.toml"
 curriculum_config_path = "configs/curriculum_v3_match.toml"

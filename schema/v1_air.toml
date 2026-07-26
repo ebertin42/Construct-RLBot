@@ -1,0 +1,36 @@
+# Schema v1-air: the v1 obs contract with the 104-row "v1-air" action table.
+#
+# version stays 1 and the [obs_v1] / [normalization] blocks are byte-identical
+# to schema/v1.toml -- the OBS is unchanged, only the policy's OUTPUT dimension
+# differs. The action table is a second, independent axis on the schema, keyed
+# off action_table / action_count; bumping `version` to 2 would instead fall
+# through Schema::validate's `version != 1` early-return and land in
+# lib.rs::validate_schema's v0 branch.
+#
+# The extra 12 rows are a doubled clean-air grid (jump x pitch x boost, no yaw,
+# no roll, NO HANDBRAKE) appended to v1.1's 92. v1.1 cannot express "jump
+# without air roll" at any index -- its handbrake is derived from rotation --
+# so a fresh policy holds a clean jump for the 3 consecutive decisions a
+# full-height takeoff needs with probability 1.03e-5 (~0.96 times per
+# 93,440-row iteration). The appended block takes that to 2.44e-3, a 237x
+# change. See engine/src/actions.rs::make_lookup_table_v1_air for the full
+# derivation and the measured before/after.
+#
+# schema/v1.toml is UNCHANGED and remains the schema for every existing
+# checkpoint. This file is opt-in, used by configs/train_v9_fromscratch.toml.
+version = 1
+obs_size = 0
+action_table = "construct_104_v1air"
+action_count = 104
+tick_skip = 8
+
+[obs_v1]
+max_ent = 17
+ent_feat = 26
+q_feat = 64
+prev_actions = 5
+
+[normalization]
+pos_norm = 0.00043478260869565216      # 1/2300
+vel_norm = 0.00043478260869565216      # 1/2300
+ang_vel_norm = 0.18181818181818182     # 1/5.5

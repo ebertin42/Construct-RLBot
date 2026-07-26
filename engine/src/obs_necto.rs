@@ -63,15 +63,92 @@ fn invert_at(i: usize) -> f32 {
 }
 
 /// Per-ARENA stateful timers. Necto carries these across frames, so they must be
-/// kept per arena (not per car) and advanced exactly once per decision.
+/// kept per arena (not per car) and advanced exactly once per FRAME.
+///
+/// "Once per frame" is the whole point, and it was WRONG until 2026-07-26. The
+/// reference `NectoObsBuilder.build_obs` is called once per frame for the whole
+/// team; ours is called once per CAR, so in a 2v2/3v3 arena the timers advanced
+/// 2-3 times per frame and each car saw a DIFFERENT observation of the same
+/// world. Measured, same frame, three cars: pad col21 read
+/// [1.0, 0.99333, 0.98667] and demo col21 [0.30, 0.29333, 0.28667] -- i.e. cars
+/// 2 and 3 were fed a boost-pad respawn clock that had silently run forward.
+/// Invisible at 1v1 (one car per team per frame), which is why it survived
+/// until team foreign arenas became expressible.
+///
+/// The fix keys the advance on `state.tick_count` and caches the values EMITTED
+/// for that frame, rather than just skipping the update: the boost timer emits
+/// its value BEFORE its own decrement (reproducing the reference's ordering), so
+/// "don't advance" and "emit what the first car emitted" are not the same thing
+/// -- they differ by exactly the TICK_SKIP/1200 = 0.00667 seen in the measurement
+/// above.
+///
+/// NOTE (unchanged, and deliberately so): with `decision_period > 1` a held
+/// frame returns before `build_necto_obs` runs at all, so the timers advance
+/// once per THINKING frame, not once per simulated frame. That is pre-existing
+/// behaviour that every rung of the existing difficulty ladder was measured
+/// against; do not "fix" it in the same change as this one.
 pub struct NectoTimers {
     boost: [f32; NECTO_PADS],
     demo: Vec<f32>,
+    /// Values emitted for `last_tick`'s frame (see the struct doc): the boost
+    /// timer is emitted pre-decrement, so this cannot be recomputed from the
+    /// live state after the fact.
+    boost_emit: [f32; NECTO_PADS],
+    demo_emit: Vec<f32>,
+    /// `state.tick_count` of the frame the caches above describe. `None` before
+    /// the first build (and after an episode boundary clears the whole struct).
+    last_tick: Option<u64>,
 }
 
 impl NectoTimers {
     pub fn new(n_players: usize) -> Self {
-        Self { boost: [0.0; NECTO_PADS], demo: vec![0.0; n_players] }
+        Self {
+            boost: [0.0; NECTO_PADS],
+            demo: vec![0.0; n_players],
+            boost_emit: [0.0; NECTO_PADS],
+            demo_emit: vec![0.0; n_players],
+            last_tick: None,
+        }
+    }
+
+    /// Advance one frame and latch what this frame emits. `order` is the
+    /// ascending-car-id player order, which is frame-global (identical for
+    /// every car of the frame), so the demo timers stay index-stable.
+    fn advance(&mut self, state: &GameState, order: &[usize]) {
+        let n_players = order.len();
+        if self.demo.len() < n_players {
+            self.demo.resize(n_players, 0.0);
+        }
+        if self.demo_emit.len() < n_players {
+            self.demo_emit.resize(n_players, 0.0);
+        }
+        for pi in 0..n_players {
+            // demo timer: reset to 3 when it hits 0, else count down. This is
+            // what the reference does (it never reads is_demoed) -- odd, but
+            // reproduced.
+            let t = &mut self.demo[pi];
+            if *t <= 0.0 {
+                *t = 3.0;
+            } else {
+                *t = (*t - TICK_SKIP / 120.0).max(0.0);
+            }
+            self.demo_emit[pi] = *t;
+        }
+        let perm = rlgym_to_canon(&state.pads);
+        for j in 0..NECTO_PADS {
+            let active = state.pads[perm[j]].state.is_active;
+            let is_big = BOOST_LOCATIONS[j][2] > 72.0;
+            // new grab: pad available while its timer is zero
+            if active && self.boost[j] == 0.0 {
+                self.boost[j] = 0.4 + 0.6 * (is_big as u8 as f32);
+            }
+            self.boost[j] *= active as u8 as f32;
+            self.boost_emit[j] = self.boost[j]; // emitted BEFORE the decrement
+            self.boost[j] -= TICK_SKIP / 1200.0;
+            if self.boost[j] < 0.0 {
+                self.boost[j] = 0.0;
+            }
+        }
     }
 }
 
@@ -80,7 +157,9 @@ pub fn n_entities(n_players: usize) -> usize {
 }
 
 /// Build Necto's (q, kv, mask) for `state.cars[car_idx]`, advancing `timers` one
-/// frame. Players are ordered by ascending car id (rlgym_compat sorts them so).
+/// frame IF this is the first car of that frame (keyed on `state.tick_count`;
+/// see `NectoTimers`). Players are ordered by ascending car id (rlgym_compat
+/// sorts them so).
 pub fn build_necto_obs(
     state: &GameState,
     car_idx: usize,
@@ -98,14 +177,17 @@ pub fn build_necto_obs(
     kv.fill(0.0);
     q.fill(0.0);
     mask.fill(false);
-    if timers.demo.len() < n_players {
-        timers.demo.resize(n_players, 0.0);
-    }
 
     let mut order: Vec<usize> = (0..n_players).collect();
     order.sort_by_key(|&i| state.cars[i].id);
     let self_row = 1 + order.iter().position(|&i| i == car_idx).expect("car in state");
     let orange = state.cars[car_idx].team == Team::Orange;
+
+    // ONE advance per frame, however many cars of this arena ask for an obs.
+    if timers.last_tick != Some(state.tick_count) {
+        timers.advance(state, &order);
+        timers.last_tick = Some(state.tick_count);
+    }
 
     // --- ball (entity 0) ---
     {
@@ -151,42 +233,21 @@ pub fn build_necto_obs(
         kv[o + BOOST] = s.boost / 100.0; // rlgym stores a 0..1 fraction
         kv[o + ON_GROUND] = s.is_on_ground as u8 as f32;
         kv[o + HAS_FLIP] = s.has_flip_or_jump() as u8 as f32;
-        // demo timer: reset to 3 when it hits 0, else count down. This is what
-        // the reference does (it never reads is_demoed) -- odd, but reproduced.
-        let t = &mut timers.demo[pi];
-        if *t <= 0.0 {
-            *t = 3.0;
-        } else {
-            *t = (*t - TICK_SKIP / 120.0).max(0.0);
-        }
-        kv[o + TIMER] = *t / 10.0;
+        // demo timer latched by `NectoTimers::advance` for THIS frame -- every
+        // car of the frame must read the same number.
+        kv[o + TIMER] = timers.demo_emit[pi] / 10.0;
     }
 
     // --- boost pads (entities 1+n..) in rlgym BOOST_LOCATIONS order ---
-    {
-        let perm = rlgym_to_canon(&state.pads);
-        for j in 0..NECTO_PADS {
-            let active = state.pads[perm[j]].state.is_active;
-            let is_big = BOOST_LOCATIONS[j][2] > 72.0;
-            // new grab: pad available while its timer is zero
-            if active && timers.boost[j] == 0.0 {
-                timers.boost[j] = 0.4 + 0.6 * (is_big as u8 as f32);
-            }
-            timers.boost[j] *= active as u8 as f32;
-
-            let o = (1 + n_players + j) * NECTO_KV;
-            kv[o + IS_BOOST] = 1.0;
-            kv[o + POS] = BOOST_LOCATIONS[j][0];
-            kv[o + POS + 1] = BOOST_LOCATIONS[j][1];
-            kv[o + POS + 2] = BOOST_LOCATIONS[j][2];
-            kv[o + BOOST] = 0.12 + 0.88 * (is_big as u8 as f32);
-            kv[o + TIMER] = timers.boost[j]; // emitted BEFORE the decrement
-
-            timers.boost[j] -= TICK_SKIP / 1200.0;
-            if timers.boost[j] < 0.0 {
-                timers.boost[j] = 0.0;
-            }
-        }
+    for (j, loc) in BOOST_LOCATIONS.iter().enumerate().take(NECTO_PADS) {
+        let is_big = loc[2] > 72.0;
+        let o = (1 + n_players + j) * NECTO_KV;
+        kv[o + IS_BOOST] = 1.0;
+        kv[o + POS] = loc[0];
+        kv[o + POS + 1] = loc[1];
+        kv[o + POS + 2] = loc[2];
+        kv[o + BOOST] = 0.12 + 0.88 * (is_big as u8 as f32);
+        kv[o + TIMER] = timers.boost_emit[j]; // pre-decrement value, per frame
     }
 
     // --- normalise ---
