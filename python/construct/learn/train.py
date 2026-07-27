@@ -1626,6 +1626,34 @@ class Trainer:
                 l_ab / l_tev if l_tev > 0 else 0.0,
                 None if o_tev is None else (o_ab / o_tev if o_tev > 0 else 0.0),
                 ".3f"))
+        # `air_z` -- the SHAPE of the learner's airborne-touch height distribution,
+        # as six percentages of that population summing to 100.
+        #
+        # This is the only field that can tell the air_setup ramp change working
+        # from the way it fails. Both look identical in every other number:
+        # air_any_frac and air_gate_frac stay flat either way, because a policy
+        # that hovers over a rolling ball and a policy that starts jumping at it
+        # produce the same COUNT of airborne touches. What differs is where those
+        # touches sit -- mass leaving the <150 bucket is a real takeoff gradient,
+        # mass staying put is the term paying for tumbling and is the revert
+        # signal. Measured pre-change on ck_000510489600 (offline, 1,155 airborne
+        # touches): 76.8 / 21.5 / 1.3 / 0.3 / 0.1 / 0.0.
+        #
+        # Percentages, not counts: the counters reset on read, so raw counts move
+        # with iteration length and cannot be compared across a config change.
+        # Suppressed entirely below a floor of airborne touches -- six percentages
+        # off 3 events is noise wearing the costume of a distribution, and this
+        # field exists to be read as evidence.
+        Z = ("lt150", "150_300", "300_500", "500_800", "800_1200", "ge1200")
+        zk = ["learner_air_touch_z_" + b for b in Z]
+        if all(k in t for k in zk):
+            zc = [float(t[k]) for k in zk]
+            ztot = sum(zc)
+            # The identity that says the histogram is wired to the population it
+            # claims (engine-side assert has the same job). A mismatch means the
+            # buckets are counting some other set of touches, so report nothing.
+            if ztot >= 25 and abs(ztot - l_ab) < 1e-6:
+                out.append("air_z " + "/".join(f"{100.0 * c / ztot:.1f}" for c in zc))
         tev = t.get("touch_events", 0.0)
         if tev > 0:
             out.append(f"air_tch_frac {t.get('airborne_touch_events', 0.0) / tev:.3f}")

@@ -114,6 +114,62 @@ def test_air_any_frac_does_not_divide_by_zero_on_a_touchless_iteration():
     assert "air_any_frac lrn 0.000 opp 0.000" in s
 
 
+# --- (a3) the touch-height histogram ----------------------------------------
+
+def _z(**kw):
+    """Six learner z-buckets, defaulting to zero."""
+    Z = ("lt150", "150_300", "300_500", "500_800", "800_1200", "ge1200")
+    return {f"learner_air_touch_z_{b}": float(kw.get(b, 0)) for b in Z}
+
+
+def test_air_z_reports_the_shape_as_percentages_of_the_airborne_population():
+    """Percentages, not counts: the counters reset on read, so raw counts scale
+    with iteration length and cannot be compared across a config change -- which
+    is the exact comparison this field exists for."""
+    s = line({
+        "agent_steps": 9000.0, "learner_agent_steps": 9000.0,
+        "touch_events": 3000.0, "learner_touch_events": 3000.0,
+        "airborne_touch_events": 100.0, "learner_airborne_touch_events": 100.0,
+        **_z(lt150=77, **{"150_300": 21}, **{"300_500": 1}, **{"500_800": 1}),
+    })
+    assert "air_z 77.0/21.0/1.0/1.0/0.0/0.0" in s
+
+
+def test_air_z_is_suppressed_when_the_buckets_do_not_sum_to_the_population():
+    """The wiring self-check. If the buckets stop partitioning the airborne
+    touches they are measuring some other set, and a plausible-looking
+    distribution would be worse than no distribution at all."""
+    s = line({
+        "agent_steps": 9000.0, "learner_agent_steps": 9000.0,
+        "touch_events": 3000.0, "learner_touch_events": 3000.0,
+        "airborne_touch_events": 100.0, "learner_airborne_touch_events": 100.0,
+        **_z(lt150=40, **{"150_300": 20}),          # sums to 60, not 100
+    })
+    assert "air_z" not in s
+
+
+def test_air_z_is_suppressed_on_too_few_airborne_touches():
+    """Six percentages off a handful of events is noise dressed as a
+    distribution, and this field is meant to be read as evidence."""
+    s = line({
+        "agent_steps": 9000.0, "learner_agent_steps": 9000.0,
+        "touch_events": 300.0, "learner_touch_events": 300.0,
+        "airborne_touch_events": 3.0, "learner_airborne_touch_events": 3.0,
+        **_z(lt150=3),
+    })
+    assert "air_z" not in s
+
+
+def test_air_z_absent_on_an_engine_without_the_buckets():
+    """The remote runs an INSTALLED .so; train.py must be shippable ahead of a
+    rebuilt wheel and degrade to the old line rather than crash."""
+    s = line({"agent_steps": 9000.0, "learner_agent_steps": 9000.0,
+              "touch_events": 300.0, "learner_touch_events": 300.0,
+              "airborne_touch_events": 120.0,
+              "learner_airborne_touch_events": 120.0})
+    assert "air_z" not in s and "air_any_frac" in s
+
+
 # --- (c) learner vs opponent ------------------------------------------------
 
 def test_touch_stats_split_learner_from_opponent():
