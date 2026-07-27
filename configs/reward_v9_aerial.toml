@@ -155,6 +155,15 @@ touch_accel = 0.5
 aerial_touch = 1.5
 aerial_z_lo = 400.0
 aerial_z_hi = 1400.0
+# The air_gate_frac COUNTER's floor, pinned independently of the payout ramp
+# above. Currently identical to aerial_z_lo, so this changes nothing today --
+# it is set so that any FUTURE move of aerial_z_lo cannot silently move the
+# instrument that would score it. aerial_z_lo drives the payout, air_setup's PHI
+# and the counter at once; the 1,786-iteration air_gate_frac baseline (312M-491M
+# steps, mean 2.76e-4) is the only thing a later ramp change can be judged
+# against, and it survives only if the ruler is nailed down. Same discipline as
+# never rebuilding the gate .so mid-measurement.
+aerial_meas_z_lo = 400.0
 
 # --- STAGED OFF. Do not enable at launch. ----------------------------------
 # Potential-based aerial-setup shaping (Ng/Harada/Russell):
@@ -195,6 +204,46 @@ aerial_z_hi = 1400.0
 # to revert, with no confound to unpick (contrast the 2026-07-20 two-variable
 # confound).
 air_setup = 0.3
+#
+# 2026-07-27, 510M steps: air_setup did NOT move the aerial numbers in the 288M
+# steps since it was enabled, and the reason is structural rather than a weight
+# being too small.
+#
+# MEASURED (learner-only, 32,550 touches / 1,155 airborne across 1v1+2v2+3v3 on
+# ck_000510489600, ~/construct-measure/touch_heights.json). Ball height at an
+# AIRBORNE learner touch -- the population that had never been measured, and the
+# only one `aerial_touch` can ever pay:
+#
+#     0-150   76.8%  |  150-300  21.5%  |  300-500  1.3%
+#   500-800    0.3%  |  800-1200  0.1%  |   1200+   0.0%
+#
+#   P(ball_z > 400 | airborne touch) = 0.011
+#
+# The probe's air_gate_frac reads 0.00025 against the live run's all-time
+# 2.76e-4, so this describes the actual regime and not a lab artifact.
+#
+# PHI shares `height_ramp` with the payout, so PHI is identically 0 whenever
+# ball_z <= aerial_z_lo REGARDLESS of what the car is doing -- i.e. the one term
+# whose stated job is teaching the TAKEOFF DECISION has exactly zero gradient in
+# 99.6% of the states where takeoff is decided. It could only ever pay for
+# already being airborne near an already-high ball, which is the same
+# chicken-and-egg it was introduced to break.
+#
+# So: give PHI its own ramp, reaching down to where the ball actually is. The
+# PAYOUT ramp is deliberately left at 400 -- 76.8% of these touches are on a ball
+# at resting height (93.15) hit by a car that merely happens to be off the
+# ground, and paying for those is a hop-tap farm, not aerial play. Lowering
+# aerial_z_lo to the 250 that was proposed would have reached 8.9% of airborne
+# touches and every one of them a hop-tap. THIS IS THE SINGLE VARIABLE.
+#
+# WATCH FOR: a low PHI ramp pays for being airborne near a LOW ball, so it could
+# reinforce the tumbling contact the histogram above shows already dominates
+# rather than real takeoffs. The `air_touch_z_*` buckets are in the log for
+# exactly this: if mass shifts UP out of 0-150, it is working; if air_any_frac
+# rises while the buckets keep their shape, it is paying for tumbling and this
+# is the thing to revert.
+air_setup_z_lo = 100.0
+air_setup_z_hi = 1400.0
 # REQUIRED co-requisite, not a free knob: air_setup's potential is discounted by
 # win_prob_gamma, which MUST equal [ppo] gamma (0.9954 in
 # configs/train_v9_fromscratch.toml) or the shaping telescopes against a different

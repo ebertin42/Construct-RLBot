@@ -1578,6 +1578,16 @@ mod tests {
         assert_eq!(c.aerial_touch, 1.5);
         assert_eq!(c.aerial_z_lo, 400.0);
         assert_eq!(c.aerial_z_hi, 1400.0);
+        assert_eq!(c.aerial_meas_z_lo, 400.0,
+                   "the counter's ruler is pinned to where the payout ramp is TODAY, \
+                    so a later move of aerial_z_lo cannot silently move it too");
+        // The PHI ramp reaches down to where the ball actually is at an airborne
+        // touch (76.8% under 150uu, measured); the PAYOUT ramp deliberately does
+        // not, because paying there is a hop-tap farm.
+        assert_eq!(c.air_setup_z_lo, 100.0);
+        assert_eq!(c.air_setup_z_hi, 1400.0);
+        assert!(c.air_setup_z_lo < c.aerial_z_lo,
+                "the whole point: PHI must have gradient below the payout floor");
         assert_eq!(c.team_spirit, 0.3);
         assert_eq!(c.opp_spirit, 0.0);
         // `air_setup` USED TO BE PINNED AT 0.0 here. That assertion encoded a
@@ -1727,8 +1737,11 @@ mod tests {
         // Every tape written before 2026-07-27 leaves aerial_meas_z_lo at 0.0
         // and MUST read bit-identically -- the 1,786-iteration air_gate_frac
         // baseline is the only thing a future ramp change can be judged against.
+        // Zeroed HERE rather than read off the shipped toml: this pins the
+        // INHERIT behaviour, which must hold for every historical tape whatever
+        // configs/reward_v9_aerial.toml happens to say today.
         let mut cfg = v9_cfg();
-        assert_eq!(cfg.aerial_meas_z_lo, 0.0, "precondition: unset in the shipped toml");
+        cfg.aerial_meas_z_lo = 0.0;
         let before = airborne_touch_terms(&cfg, 500.0)[T_AERIAL_TOUCH_EVENTS];
         cfg.aerial_meas_z_lo = cfg.aerial_z_lo;     // stating the default explicitly
         assert_eq!(airborne_touch_terms(&cfg, 500.0)[T_AERIAL_TOUCH_EVENTS], before);
@@ -1754,8 +1767,12 @@ mod tests {
 
     #[test]
     fn the_air_setup_ramp_defaults_to_the_shared_ramp() {
-        let cfg = v9_cfg();
-        assert_eq!((cfg.air_setup_z_lo, cfg.air_setup_z_hi), (0.0, 0.0), "precondition");
+        // Zeroed here, not read off the shipped toml -- see the measurement-floor
+        // test above. Every tape written before 2026-07-27 leaves these unset and
+        // must keep reading through the shared ramp bit-for-bit.
+        let mut cfg = v9_cfg();
+        cfg.air_setup_z_lo = 0.0;
+        cfg.air_setup_z_hi = 0.0;
         for z in [0.0, 200.0, 400.0, 700.0, 1400.0, 2000.0] {
             assert_eq!(setup_ramp(z, &cfg), height_ramp(z, &cfg),
                        "unset means inherit, bit-for-bit, at z={z}");
@@ -1784,7 +1801,8 @@ mod tests {
         // than a crash: it is a config whose log looks like the experiment you
         // meant to run.
         let mut cfg = v9_cfg();
-        cfg.air_setup_z_lo = 300.0;                 // hi left at 0.0
+        cfg.air_setup_z_hi = 0.0;                   // start from unset
+        cfg.air_setup_z_lo = 300.0;                 // ...and set only the low bound
         assert!(cfg.validate().is_err(), "a lone bound must not sail through");
 
         cfg.air_setup_z_hi = 1400.0;
