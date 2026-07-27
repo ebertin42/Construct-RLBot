@@ -413,3 +413,34 @@ def test_short_record_line_needs_no_share_to_flag_a_heavy_census():
 def test_short_record_line_survives_no_records():
     assert "n/a" in mg._short_record_line({"records": 0, "short_records": 0,
                                            "share": None})
+
+
+# --- the measured nulls -----------------------------------------------------
+
+def test_the_2v2_null_is_measured_not_borrowed_from_1v1():
+    """The null is a property of a POLICY and a REGIME. Reusing the 1v1 sd at
+    2v2 would launder an uncalibrated verdict, which is why 2v2 sat absent for
+    days rather than being guessed."""
+    from scripts.matchwin_gate import NULL_BY_MODE
+    assert set(NULL_BY_MODE) == {1, 2}, "3v3 must stay absent until measured"
+    assert NULL_BY_MODE[2] == (0.502, 0.0149)
+    assert NULL_BY_MODE[2][1] != NULL_BY_MODE[1][1], "not borrowed"
+
+
+def test_the_2v2_null_sd_is_not_the_duplicate_record_signature():
+    """expected/sqrt(2) = 0.0124 means match records are being counted once per
+    CAR instead of once per arena -- which at 2v2 doubles n and shrinks the sd,
+    i.e. it looks like a tighter gate. The measured 0.0149 is clear of it, and
+    the match count (640/seed, not 1280) is what actually rules it out."""
+    from scripts.matchwin_gate import NULL_BY_MODE
+    sd = NULL_BY_MODE[2][1]
+    assert sd > 0.0130, f"sd {sd} is at the duplicate-per-car signature 0.0124"
+    assert 0.0120 <= sd <= 0.0230, "inside the 95% chi-square band for this run"
+
+
+def test_a_2v2_gate_now_reports_a_calibrated_null():
+    """The whole point: before this measurement a 2v2 gate printed 'null
+    UNMEASURED' and the verdict could not be read as significant."""
+    from scripts.matchwin_gate import NULL_BY_MODE
+    assert NULL_BY_MODE.get(2) is not None
+    assert NULL_BY_MODE.get(3) is None, "3v3 must still say UNMEASURED"

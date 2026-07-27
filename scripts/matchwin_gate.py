@@ -90,12 +90,31 @@ CHAMPION_CONFIG = "configs/champion.toml"
 FULL_MATCH_STEPS = 4500
 
 # The null is a property of a POLICY and a REGIME, so it cannot be borrowed
-# across team sizes. Measured only at 1v1: champion self-play, 20 seeds x ~320
-# matches (journal 2026-07-21). 2v2/3v3 are deliberately absent rather than
-# guessed -- printing the 1v1 null next to a 2v2 share would launder an
-# uncalibrated verdict. Run scripts/match_gate_null.py --mode M --both-orders
-# to fill one in.
-NULL_BY_MODE = {1: (0.502, 0.024)}
+# across team sizes. 3v3 is deliberately absent rather than guessed -- printing
+# a 2v2 null next to a 3v3 share would launder an uncalibrated verdict. Run
+# scripts/match_gate_null.py --mode M --both-orders to fill it in.
+#
+#   1v1: champion self-play, 20 seeds x ~320 matches, single order
+#        (journal 2026-07-21).
+#   2v2: v9 ck_000572549120 self-play, 20 seeds x 640 matches, BOTH orders
+#        (2026-07-27, logs/null_2v2.log). sd 0.0149 against an expected 0.0175,
+#        inside the 95% chi-square band [0.0120, 0.0230]; mean 0.5020 with CI
+#        [0.4954, 0.5085]; mirror symmetry 0.4986, CI [0.4927, 0.5046]; 0/12800
+#        short records. NOT the duplicate-per-car signature, which would sit at
+#        expected/sqrt(2) = 0.0124 AND would have reported 1280 matches/seed
+#        rather than the correct 640 -- the match count is the check that
+#        distinguishes them, not the sd alone, since 0.0124 also falls inside
+#        the band.
+#        Measured on a box running the viewer, dashboard and sync rather than an
+#        idle one. For a NULL that is defensible where it would not be for a
+#        gate: both-orders centres the mean on 0.5 by construction, so the
+#        `gates-need-an-idle-box` win-share bias cancels, and load can only
+#        inflate the sd -- which came in BELOW expectation, not above.
+#
+# The 2v2 sd is smaller than 1v1's because both-orders halves the variance
+# (sqrt(2)) and 640 matches is 2x the 1v1 n. A 2v2 gate therefore needs a
+# SMALLER margin to be significant, not a larger one: >= 0.530 at 2 sd.
+NULL_BY_MODE = {1: (0.502, 0.024), 2: (0.502, 0.0149)}
 
 
 def _repo_root():
@@ -429,7 +448,9 @@ def main(argv=None):
           f"win_share={r['share']:.4f} +/- {r['se']:.4f}")
     print(_short_record_line(r))
     null = NULL_BY_MODE.get(args.mode)
-    ann = (f"null mean {null[0]:.3f} sd {null[1]:.3f}" if null else
+    # sd at 4dp: the 2v2 null is 0.0149 and 3dp rounds it to 0.015, which is
+    # the one number a reader needs exactly in order to judge a margin.
+    ann = (f"null mean {null[0]:.3f} sd {null[1]:.4f}" if null else
            f"null UNMEASURED at {args.mode}v{args.mode} -- run "
            f"scripts/match_gate_null.py --mode {args.mode} --both-orders")
     print(f"  verdict: {r['verdict']}  (threshold {r['threshold']:.3f}; {ann})")
