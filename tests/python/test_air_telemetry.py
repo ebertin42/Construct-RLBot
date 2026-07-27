@@ -68,6 +68,52 @@ def test_an_engine_without_the_gated_counter_reads_exactly_as_before():
     assert " lrn " not in s, "no split to report either"
 
 
+# --- (a2) the airborne fraction, on the SAME population as the gated one -----
+
+def test_air_any_frac_is_learner_split_so_it_shares_a_population_with_the_gate():
+    """THE division nobody had made. Ordering the aerial gate's two conditions
+    (airborne, then height) needs `air_gate_frac / air_any_frac`, and every
+    attempt divided the learner-only gated fraction by the ARENA-WIDE
+    `air_tch_frac` -- mixing a 21%-foreign arena into a statement about our
+    policy. Same category error that made an arena-wide r_aerial_touch of +2.23
+    read as ours when 0.0000 of it was.
+
+    Here the bot is airborne on 80% of its touches and we are on 10% of ours.
+    The arena-wide blend says 0.240; only the split says which is which.
+    """
+    s = line({
+        "agent_steps": 5000.0, "learner_agent_steps": 4000.0, "opp_agent_steps": 1000.0,
+        "touch_events": 250.0, "learner_touch_events": 200.0, "opp_touch_events": 50.0,
+        "airborne_touch_events": 60.0,
+        "learner_airborne_touch_events": 20.0, "opp_airborne_touch_events": 40.0,
+        "gated_aerial_touch_events": 12.0,
+        "learner_gated_aerial_touch_events": 2.0, "opp_gated_aerial_touch_events": 10.0,
+    })
+    assert "air_any_frac lrn 0.100 opp 0.800" in s
+    assert "air_tch_frac 0.240" in s, "the legacy arena-wide number is untouched"
+    # and now the quotient means something: 2/20 of OUR airborne touches clear
+    # the ramp, against 10/40 of the bot's.
+    assert "air_gate_frac lrn 0.0100 opp 0.2000" in s
+
+
+def test_air_any_frac_falls_back_to_the_arena_number_on_an_unsplit_engine():
+    """An older `.so` has no `learner_` counters, so the split degrades to the
+    arena-wide value under a name that no longer claims to be learner-only. It
+    must not fabricate a zero."""
+    s = line({"agent_steps": 9000.0, "touch_events": 300.0,
+              "airborne_touch_events": 120.0})
+    assert "air_any_frac 0.400" in s and " lrn " not in s
+
+
+def test_air_any_frac_does_not_divide_by_zero_on_a_touchless_iteration():
+    s = line({"agent_steps": 4000.0, "learner_agent_steps": 2000.0,
+              "opp_agent_steps": 2000.0,
+              "touch_events": 0.0, "learner_touch_events": 0.0,
+              "opp_touch_events": 0.0, "airborne_touch_events": 0.0,
+              "learner_airborne_touch_events": 0.0, "opp_airborne_touch_events": 0.0})
+    assert "air_any_frac lrn 0.000 opp 0.000" in s
+
+
 # --- (c) learner vs opponent ------------------------------------------------
 
 def test_touch_stats_split_learner_from_opponent():

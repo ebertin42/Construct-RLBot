@@ -1513,10 +1513,16 @@ class Trainer:
         mirrors, which is why `opp` is the engine's own counter rather than
         `total - lrn`.
 
-        TWO AERIAL FRACTIONS, and only one of them measures air play:
+        THREE AERIAL FRACTIONS, and only one of them measures air play:
 
         * `air_gate_frac` -- touches passing `aerial_touch`'s OWN gate (airborne
           AND ball above `aerial_z_lo`). This is the one to read.
+        * `air_any_frac` -- the SAME ratio as air_tch_frac but learner-split, so
+          it shares a population with air_gate_frac. Their quotient is the share
+          of our airborne touches that clear the height, which is what separates
+          "the reward is unreachable" from "we never leave the ground" -- the two
+          diagnoses that need opposite fixes and that no instrument here could
+          tell apart. Read the pair, not either alone.
         * `air_tch_frac` -- the historical `airborne_touch_events / touch_events`,
           kept only for continuity with 275M steps of existing log. IT IS
           ANTI-CORRELATED WITH AERIAL SKILL: a RANDOM policy reads 0.87-0.93 on
@@ -1592,6 +1598,34 @@ class Trainer:
                 l_ga / l_tev if l_tev > 0 else 0.0,
                 None if o_tev is None else (o_ga / o_tev if o_tev > 0 else 0.0),
                 ".4f"))
+        # `air_any_frac` -- airborne_touch_events / touch_events, LEARNER-SPLIT.
+        # Not a duplicate of air_tch_frac below: that one is arena-wide, and the
+        # arena is ~21% foreign cars at p12/p24 plus their mirrors. Every attempt
+        # to order the aerial gate's two conditions (airborne, then height) has
+        # divided air_gate_frac (learner-only) by air_tch_frac (arena-wide) and
+        # called the quotient "the share the airborne test removes". That mixes
+        # populations -- the same category error that made the arena-wide
+        # r_aerial_touch of +2.23 read as ours when 0.0000 of it was.
+        # `learner_airborne_touch_events` has existed in reward_terms() since the
+        # split shipped and was simply never printed, so this needs no engine work
+        # and lands on the running .so: air_any_frac and air_gate_frac now share a
+        # population, and their ratio is finally the thing everyone assumed it was.
+        l_ab, o_ab = split("airborne_touch_events")
+        # Emit ONLY when numerator and denominator come from the same population:
+        # either both arena-wide (no learner counters at all, the pre-split .so)
+        # or both learner. An engine that splits touches but not airborne touches
+        # would otherwise divide an arena-wide numerator by a learner denominator
+        # and print a ratio that can exceed 1 -- printing nothing beats printing
+        # the very confusion this field was added to remove.
+        # No touch-count condition: the divisions below already guard, and
+        # air_gate_frac prints 0.0000 on a touchless iteration -- a companion
+        # field that vanishes instead would break the pairing they are read as.
+        if "learner_airborne_touch_events" in t or o_steps is None:
+            out.append(pair(
+                "air_any_frac",
+                l_ab / l_tev if l_tev > 0 else 0.0,
+                None if o_tev is None else (o_ab / o_tev if o_tev > 0 else 0.0),
+                ".3f"))
         tev = t.get("touch_events", 0.0)
         if tev > 0:
             out.append(f"air_tch_frac {t.get('airborne_touch_events', 0.0) / tev:.3f}")

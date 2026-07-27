@@ -81,6 +81,37 @@ pub struct RewardConfig {
     /// which is why `validate` demands that gamma once this is nonzero.
     #[serde(default)]
     pub air_setup: f32,
+    /// Height floor for the `gated_aerial_touch_events` COUNTER only, never for
+    /// a payout. 0.0 (the default, and every tape written before 2026-07-27)
+    /// means "inherit `aerial_z_lo`", so existing configs are bit-identical.
+    ///
+    /// It exists because `aerial_z_lo` is read by three things at once -- the
+    /// `aerial_touch` payout, `air_setup`'s potential, and the counter -- so
+    /// moving the ramp to make the reward reachable ALSO moves the instrument
+    /// that would say whether it worked. Any post-change rise in air_gate_frac
+    /// would be partly definitional and the baseline it is measured against
+    /// (1,786 iterations, 312M-491M steps, mean 2.76e-4) would be destroyed.
+    /// Pin this at the historical 400.0 before touching `aerial_z_lo` and the
+    /// counter keeps meaning what it meant. Same discipline as never rebuilding
+    /// the gate `.so` mid-measurement.
+    #[serde(default)]
+    pub aerial_meas_z_lo: f32,
+    /// Separate height ramp for `air_setup`'s potential. Both 0.0 (the default)
+    /// means "inherit `aerial_z_lo`/`aerial_z_hi`", so existing tapes are
+    /// bit-identical.
+    ///
+    /// The shared ramp has a structural flaw that no hypothesis about the aerial
+    /// deficit had noticed: PHI is identically 0 whenever ball_z <= aerial_z_lo,
+    /// REGARDLESS of what the car is doing. So the one term whose stated job is
+    /// teaching the takeoff decision -- "the ball is going up, jump NOW", which
+    /// `aerial_touch` structurally cannot teach -- has exactly zero gradient in
+    /// the states where takeoff is decided. It can only pay for already being
+    /// airborne near an already-high ball. Splitting the ramps is what makes
+    /// that fixable as a single variable, without touching the payout.
+    #[serde(default)]
+    pub air_setup_z_lo: f32,
+    #[serde(default)]
+    pub air_setup_z_hi: f32,
 }
 
 /// Per-term reward telemetry (E9). Index space for the `[f64; N_TERMS]`
@@ -93,7 +124,7 @@ pub struct RewardConfig {
 /// The last four entries are COUNTS, not reward: they are what the §8.3
 /// farming tripwires (touches/min/car, airborne-touch fraction, reward per
 /// goal) are computed from.
-pub const N_TERMS: usize = 14;
+pub const N_TERMS: usize = 20;
 pub const T_GOAL: usize = 0;
 pub const T_TOUCH: usize = 1;
 pub const T_VEL_TO_BALL: usize = 2;
@@ -127,6 +158,32 @@ pub const T_AGENT_STEPS: usize = 12;
 /// ramp (reward_v0's zeros would otherwise make `height_ramp` a 0/0 inf and
 /// count every airborne touch).
 pub const T_AERIAL_TOUCH_EVENTS: usize = 13;
+/// Six-bucket histogram of BALL HEIGHT at an AIRBORNE learner touch, appended
+/// 2026-07-27 so every existing index survives.
+///
+/// THE measurement the whole aerial debate turned on and that nobody had ever
+/// made. `air_gate_frac` says how many airborne touches clear `aerial_z_lo`; it
+/// cannot say how far short the rest fall, so it cannot distinguish "the ramp
+/// sits just above the distribution" (lower it) from "the distribution is on the
+/// floor" (the z-floor is not the problem and lowering it just builds a hop-tap
+/// farm in front of the behaviour you want). Every z_lo proposed so far was
+/// anchored to a figure -- "91.6% of touches below 400uu, median 109.8uu" -- with
+/// no source in the repo, no tool that computes it, and, worse, over ALL touches
+/// when only AIRBORNE ones can ever be paid. This is the right population.
+///
+/// Same gate as `T_AIRBORNE_TOUCH_EVENTS` and deliberately NO cooldown and NO
+/// height test, so the six buckets sum EXACTLY to it -- that identity is the
+/// self-check that says the histogram is wired to the population it claims.
+/// Edges are ball-centre z: a resting ball is 93.15, a hop reaches ~360 and a
+/// double jump ~525, so the 300-500 bucket is "jumped but not really flying".
+pub const T_AIR_TOUCH_Z0: usize = 14; // < 150
+pub const T_AIR_TOUCH_Z1: usize = 15; // 150 - 300
+pub const T_AIR_TOUCH_Z2: usize = 16; // 300 - 500
+pub const T_AIR_TOUCH_Z3: usize = 17; // 500 - 800
+pub const T_AIR_TOUCH_Z4: usize = 18; // 800 - 1200
+pub const T_AIR_TOUCH_Z5: usize = 19; // >= 1200
+/// Upper edges for buckets 0..4; anything at or above the last lands in Z5.
+const AIR_TOUCH_Z_EDGES: [f32; 5] = [150.0, 300.0, 500.0, 800.0, 1200.0];
 pub const TERM_NAMES: [&str; N_TERMS] = [
     "goal",
     "touch",
@@ -142,6 +199,12 @@ pub const TERM_NAMES: [&str; N_TERMS] = [
     "goal_events",
     "agent_steps",
     "gated_aerial_touch_events",
+    "air_touch_z_lt150",
+    "air_touch_z_150_300",
+    "air_touch_z_300_500",
+    "air_touch_z_500_800",
+    "air_touch_z_800_1200",
+    "air_touch_z_ge1200",
 ];
 
 /// Ball radius. The `aerial_z_lo` floor in `validate`: a ramp whose bottom is
@@ -158,6 +221,27 @@ const BALL_RADIUS: f32 = 93.15;
 #[inline]
 fn height_ramp(ball_z: f32, cfg: &RewardConfig) -> f32 {
     ((ball_z - cfg.aerial_z_lo) / (cfg.aerial_z_hi - cfg.aerial_z_lo)).clamp(0.0, 1.0)
+}
+
+/// The floor the `gated_aerial_touch_events` COUNTER uses. Falls back to the
+/// payout's own floor, so a tape that does not set it reads exactly as before.
+#[inline]
+fn meas_z_lo(cfg: &RewardConfig) -> f32 {
+    if cfg.aerial_meas_z_lo > 0.0 { cfg.aerial_meas_z_lo } else { cfg.aerial_z_lo }
+}
+
+/// The ramp `air_setup`'s potential uses. Falls back to the shared
+/// `height_ramp`, so a tape that does not set the pair is bit-identical.
+/// `validate_aerial` guarantees `hi > lo` whenever the override is live, for
+/// the same inf/NaN reason `height_ramp` documents.
+#[inline]
+fn setup_ramp(ball_z: f32, cfg: &RewardConfig) -> f32 {
+    if cfg.air_setup_z_hi > cfg.air_setup_z_lo {
+        ((ball_z - cfg.air_setup_z_lo) / (cfg.air_setup_z_hi - cfg.air_setup_z_lo))
+            .clamp(0.0, 1.0)
+    } else {
+        height_ramp(ball_z, cfg)
+    }
 }
 
 impl RewardConfig {
@@ -225,6 +309,38 @@ impl RewardConfig {
         // the default 0.0 gamma silently degenerates to `-PHI(prev)`, a pure
         // penalty for having been airborne. train.py's check_win_prob_gamma is
         // extended to cover this case; this is the engine-side half.
+        // The measurement floor is allowed to sit ANYWHERE at or above the ball
+        // radius, including above `aerial_z_hi` (a deliberately strict ruler is
+        // a legitimate thing to want). Below the radius it would count a ball
+        // rolling on the floor as an aerial, which is the same failure the
+        // payout floor is guarded against -- and an instrument that lies is
+        // worse than a payout that leaks, because every later decision is made
+        // through it.
+        if self.aerial_meas_z_lo != 0.0 && self.aerial_meas_z_lo < BALL_RADIUS {
+            return Err(format!(
+                "aerial_meas_z_lo={} is below the ball radius ({BALL_RADIUS}): the \
+                 gated-aerial COUNTER would score a ball resting on the floor as an \
+                 aerial touch",
+                self.aerial_meas_z_lo));
+        }
+        // Half-configured air_setup ramp: same inf/NaN trap as the shared ramp,
+        // and `setup_ramp` only takes the override when `hi > lo`, so a lone
+        // `air_setup_z_lo` would silently fall back to the shared ramp and the
+        // run would report a split that is not happening.
+        let setup_ramp_set = self.air_setup_z_lo != 0.0 || self.air_setup_z_hi != 0.0;
+        if setup_ramp_set && !(self.air_setup_z_hi > self.air_setup_z_lo) {
+            return Err(format!(
+                "air_setup_z_lo={} / air_setup_z_hi={}: setting either demands \
+                 hi > lo. A lone bound does not error into a NaN here -- it falls \
+                 back to the SHARED ramp, so the run would look split and not be",
+                self.air_setup_z_lo, self.air_setup_z_hi));
+        }
+        if setup_ramp_set && self.air_setup_z_lo < BALL_RADIUS {
+            return Err(format!(
+                "air_setup_z_lo={} is below the ball radius ({BALL_RADIUS}): PHI \
+                 would be nonzero for a car airborne over a ball on the floor",
+                self.air_setup_z_lo));
+        }
         if self.air_setup != 0.0 && !(self.win_prob_gamma > 0.0) {
             return Err(format!(
                 "air_setup={} needs win_prob_gamma > 0 (the SHARED potential gamma, \
@@ -341,11 +457,19 @@ pub fn compute_terms(
         terms[T_TOUCH_EVENTS] += 1.0;
         if !me.state.is_on_ground {
             terms[T_AIRBORNE_TOUCH_EVENTS] += 1.0;
+            // Ball-height histogram over EXACTLY this population, so the six
+            // buckets sum to T_AIRBORNE_TOUCH_EVENTS -- see T_AIR_TOUCH_Z0.
+            // Unconditional on the ramp: this is the distribution you consult
+            // to CHOOSE a floor, so it must not presuppose one.
+            let b = AIR_TOUCH_Z_EDGES.iter().filter(|e| cur.ball.pos.z >= **e).count();
+            terms[T_AIR_TOUCH_Z0 + b] += 1.0;
             // `aerial_touch`'s own gate, minus the cooldown -- see
             // T_AERIAL_TOUCH_EVENTS. The `hi > lo` test is what keeps this at
             // zero on a tape with no ramp configured rather than counting every
-            // airborne touch through a 0/0 height_ramp.
-            if cfg.aerial_z_hi > cfg.aerial_z_lo && cur.ball.pos.z > cfg.aerial_z_lo {
+            // airborne touch through a 0/0 height_ramp. The THRESHOLD is
+            // `meas_z_lo`, not `aerial_z_lo`, so the payout ramp can move
+            // without moving the instrument that scores it.
+            if cfg.aerial_z_hi > cfg.aerial_z_lo && cur.ball.pos.z > meas_z_lo(cfg) {
                 terms[T_AERIAL_TOUCH_EVENTS] += 1.0;
             }
         }
@@ -541,7 +665,7 @@ pub fn air_potential(
     }
     let d = [ball_pos[0] - car_pos[0], ball_pos[1] - car_pos[1], ball_pos[2] - car_pos[2]];
     let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-    height_ramp(ball_pos[2], cfg) * (1.0 - dist / 2500.0).clamp(0.0, 1.0)
+    setup_ramp(ball_pos[2], cfg) * (1.0 - dist / 2500.0).clamp(0.0, 1.0)
 }
 
 /// Potential-based shaping on `air_potential`: `w * (gamma * PHI(s') - PHI(s))`.
@@ -1532,6 +1656,151 @@ mod tests {
                    "the old counter cannot tell these two apart -- that is the bug");
         assert_eq!(low[T_AERIAL_TOUCH_EVENTS], 0.0);
         assert_eq!(low[T_AERIAL_TOUCH], 0.0, "the reward gate agrees: h = 0 here");
+    }
+
+    /// The six buckets must partition the airborne-touch population exactly.
+    /// That identity IS the instrument's self-check: if they ever stop summing
+    /// to `T_AIRBORNE_TOUCH_EVENTS`, the histogram is measuring some other set
+    /// of touches than the one its readers think, and a z-floor chosen from it
+    /// would be anchored to the wrong distribution -- the precise failure that
+    /// made the unsourced "91.6% below 400uu" figure worthless (it was over ALL
+    /// touches when only airborne ones can ever be paid).
+    fn z_hist(t: &[f64; N_TERMS]) -> [f64; 6] {
+        let mut h = [0.0; 6];
+        h.copy_from_slice(&t[T_AIR_TOUCH_Z0..=T_AIR_TOUCH_Z5]);
+        h
+    }
+
+    #[test]
+    fn the_touch_height_histogram_partitions_the_airborne_population() {
+        let cfg = v9_cfg();
+        // One touch per bucket, at heights that are unambiguously inside it.
+        for (z, want) in [(100.0, 0), (200.0, 1), (400.0, 2),
+                          (600.0, 3), (1000.0, 4), (1500.0, 5)] {
+            let t = airborne_touch_terms(&cfg, z);
+            let h = z_hist(&t);
+            assert_eq!(h[want], 1.0, "ball z={z} belongs in bucket {want}, got {h:?}");
+            assert_eq!(h.iter().sum::<f64>(), t[T_AIRBORNE_TOUCH_EVENTS],
+                       "the buckets must sum to the population they partition");
+        }
+    }
+
+    #[test]
+    fn the_histogram_bucket_edges_are_half_open_from_below() {
+        // Exactly ON an edge lands in the HIGHER bucket, so the edges read as
+        // [lo, hi) and no touch is double-counted or dropped.
+        let cfg = v9_cfg();
+        for (z, want) in [(149.9, 0), (150.0, 1), (299.9, 1), (300.0, 2),
+                          (1199.9, 4), (1200.0, 5)] {
+            assert_eq!(z_hist(&airborne_touch_terms(&cfg, z))[want], 1.0,
+                       "ball z={z} must land in bucket {want}");
+        }
+    }
+
+    #[test]
+    fn the_histogram_counts_touches_the_aerial_gate_rejects() {
+        // The whole point: air_gate_frac says how MANY airborne touches clear
+        // the ramp, and is silent about how far the rest fall short. A 300uu
+        // touch pays nothing and gates nothing, and must still be visible --
+        // otherwise the distribution you consult to choose a floor is censored
+        // by the floor you already have.
+        let cfg = v9_cfg();                       // aerial_z_lo = 400
+        let t = airborne_touch_terms(&cfg, 300.0);
+        assert_eq!(t[T_AERIAL_TOUCH_EVENTS], 0.0, "precondition: gated out");
+        assert_eq!(t[T_AERIAL_TOUCH], 0.0, "precondition: paid nothing");
+        assert_eq!(z_hist(&t)[2], 1.0, "and yet it is counted, in 300-500");
+    }
+
+    #[test]
+    fn the_histogram_is_live_on_a_tape_with_no_ramp() {
+        // Unlike the gated counter, this one does NOT need a configured ramp:
+        // it presupposes no floor, so it is exactly the instrument a zero-weight
+        // probe tape needs. reward_v0 is what every gate and bench scores on.
+        let cfg = RewardConfig::load("../configs/reward_v0.toml").unwrap();
+        let t = airborne_touch_terms(&cfg, 1000.0);
+        assert_eq!(t[T_AERIAL_TOUCH_EVENTS], 0.0, "no ramp, no gate -- unchanged");
+        assert_eq!(z_hist(&t)[4], 1.0, "but the distribution is still measurable");
+    }
+
+    #[test]
+    fn the_measurement_floor_defaults_to_the_payout_floor() {
+        // Every tape written before 2026-07-27 leaves aerial_meas_z_lo at 0.0
+        // and MUST read bit-identically -- the 1,786-iteration air_gate_frac
+        // baseline is the only thing a future ramp change can be judged against.
+        let mut cfg = v9_cfg();
+        assert_eq!(cfg.aerial_meas_z_lo, 0.0, "precondition: unset in the shipped toml");
+        let before = airborne_touch_terms(&cfg, 500.0)[T_AERIAL_TOUCH_EVENTS];
+        cfg.aerial_meas_z_lo = cfg.aerial_z_lo;     // stating the default explicitly
+        assert_eq!(airborne_touch_terms(&cfg, 500.0)[T_AERIAL_TOUCH_EVENTS], before);
+    }
+
+    #[test]
+    fn the_measurement_floor_survives_a_payout_ramp_move() {
+        // THE reason the field exists. Drop the payout floor to 250 -- the
+        // change under consideration -- and the counter pinned at 400 must not
+        // move, or a rise in air_gate_frac would be partly definitional and the
+        // baseline would be destroyed.
+        let mut cfg = v9_cfg();
+        cfg.aerial_meas_z_lo = 400.0;
+        let pinned = airborne_touch_terms(&cfg, 300.0)[T_AERIAL_TOUCH_EVENTS];
+        assert_eq!(pinned, 0.0, "300 is under the pinned ruler");
+
+        cfg.aerial_z_lo = 250.0;                    // the payout ramp moves...
+        let t = airborne_touch_terms(&cfg, 300.0);
+        assert!(t[T_AERIAL_TOUCH] != 0.0, "...so the term now pays at 300uu...");
+        assert_eq!(t[T_AERIAL_TOUCH_EVENTS], 0.0,
+                   "...and the INSTRUMENT must be exactly where it was");
+    }
+
+    #[test]
+    fn the_air_setup_ramp_defaults_to_the_shared_ramp() {
+        let cfg = v9_cfg();
+        assert_eq!((cfg.air_setup_z_lo, cfg.air_setup_z_hi), (0.0, 0.0), "precondition");
+        for z in [0.0, 200.0, 400.0, 700.0, 1400.0, 2000.0] {
+            assert_eq!(setup_ramp(z, &cfg), height_ramp(z, &cfg),
+                       "unset means inherit, bit-for-bit, at z={z}");
+        }
+    }
+
+    #[test]
+    fn the_air_setup_ramp_can_reach_below_the_payout_floor() {
+        // The structural finding no aerial hypothesis had: with the shared ramp,
+        // PHI is identically 0 below aerial_z_lo, so the term whose job is
+        // teaching the TAKEOFF DECISION has zero gradient in every state where
+        // takeoff is decided. Splitting the ramps is what makes that reachable
+        // -- without touching the payout, so the two are separable variables.
+        let mut cfg = v9_cfg();
+        assert_eq!(height_ramp(200.0, &cfg), 0.0, "precondition: flat at takeoff height");
+        cfg.air_setup_z_lo = 100.0;
+        cfg.air_setup_z_hi = 1400.0;
+        assert!(setup_ramp(200.0, &cfg) > 0.0, "now there is a gradient to climb");
+        assert_eq!(height_ramp(200.0, &cfg), 0.0, "and the payout ramp did not move");
+    }
+
+    #[test]
+    fn a_half_configured_air_setup_ramp_is_rejected() {
+        // It would not NaN -- it would silently fall back to the shared ramp,
+        // so the run would report a split that is not happening. That is worse
+        // than a crash: it is a config whose log looks like the experiment you
+        // meant to run.
+        let mut cfg = v9_cfg();
+        cfg.air_setup_z_lo = 300.0;                 // hi left at 0.0
+        assert!(cfg.validate().is_err(), "a lone bound must not sail through");
+
+        cfg.air_setup_z_hi = 1400.0;
+        assert!(cfg.validate().is_ok());
+
+        cfg.air_setup_z_lo = 50.0;                  // under the ball radius
+        assert!(cfg.validate().is_err(), "PHI must not pay for a ball on the floor");
+    }
+
+    #[test]
+    fn a_measurement_floor_under_the_ball_radius_is_rejected() {
+        let mut cfg = v9_cfg();
+        cfg.aerial_meas_z_lo = 50.0;
+        assert!(cfg.validate().is_err(),
+                "an instrument that scores a resting ball as an aerial poisons every \
+                 decision made through it");
     }
 
     #[test]
