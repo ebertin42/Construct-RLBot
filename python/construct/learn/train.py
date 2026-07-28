@@ -1426,6 +1426,11 @@ class Trainer:
     # sampled-action frequency would need ~10^8 rows to resolve that at all,
     # which is exactly why the number has been invisible.
     _P_JUMP_ROWS = 8192
+    # Pooled airborne touches required before `air_z` reports a distribution.
+    # ~8 arrive per iteration at the live rate, so this emits about every 25
+    # iterations. Sized so the smallest bucket that matters is not a coin flip:
+    # the pre-change 300-500 share was 1.3%, i.e. ~3 events at n=200.
+    _AIR_Z_MIN = 200
 
     def _p_jump_idx(self, rows: int, device) -> torch.Tensor:
         """A uniform sample of `_P_JUMP_ROWS` of the batch's `rows`, drawn from a
@@ -1641,19 +1646,38 @@ class Trainer:
         #
         # Percentages, not counts: the counters reset on read, so raw counts move
         # with iteration length and cannot be compared across a config change.
-        # Suppressed entirely below a floor of airborne touches -- six percentages
-        # off 3 events is noise wearing the costume of a distribution, and this
-        # field exists to be read as evidence.
+        #
+        # ACCUMULATED ACROSS ITERATIONS, not per-iteration. The first version of
+        # this printed only when a SINGLE iteration cleared _AIR_Z_MIN airborne
+        # touches, and it never once fired: at ~93k learner steps/iter, 15
+        # decisions/s, ~3.8 touches/min/car and air_any_frac ~0.02 the rate is
+        # about EIGHT airborne touches per iteration. reward_terms() resets on
+        # read, so the count could never accumulate and the field was dead on
+        # arrival -- shipped, installed, and silent.
+        #
+        # The floor is still right; six percentages off eight events is noise
+        # wearing the costume of a distribution. So bank the buckets here and
+        # emit once the POOLED population is worth reading (~25 iterations),
+        # then reset. Prints roughly every 25 iterations instead of never.
         Z = ("lt150", "150_300", "300_500", "500_800", "800_1200", "ge1200")
         zk = ["learner_air_touch_z_" + b for b in Z]
         if all(k in t for k in zk):
             zc = [float(t[k]) for k in zk]
-            ztot = sum(zc)
             # The identity that says the histogram is wired to the population it
             # claims (engine-side assert has the same job). A mismatch means the
-            # buckets are counting some other set of touches, so report nothing.
-            if ztot >= 25 and abs(ztot - l_ab) < 1e-6:
-                out.append("air_z " + "/".join(f"{100.0 * c / ztot:.1f}" for c in zc))
+            # buckets are counting some other set of touches, so bank nothing --
+            # a polluted accumulator would outlive the iteration that polluted it.
+            if abs(sum(zc) - l_ab) < 1e-6:
+                acc = getattr(self, "_air_z_acc", None)
+                if acc is None:
+                    acc = self._air_z_acc = [0.0] * 6
+                for i, c in enumerate(zc):
+                    acc[i] += c
+                ztot = sum(acc)
+                if ztot >= self._AIR_Z_MIN:
+                    out.append("air_z " + "/".join(
+                        f"{100.0 * c / ztot:.1f}" for c in acc) + f" n{int(ztot)}")
+                    self._air_z_acc = [0.0] * 6
         tev = t.get("touch_events", 0.0)
         if tev > 0:
             out.append(f"air_tch_frac {t.get('airborne_touch_events', 0.0) / tev:.3f}")

@@ -122,42 +122,60 @@ def _z(**kw):
     return {f"learner_air_touch_z_{b}": float(kw.get(b, 0)) for b in Z}
 
 
-def test_air_z_reports_the_shape_as_percentages_of_the_airborne_population():
-    """Percentages, not counts: the counters reset on read, so raw counts scale
-    with iteration length and cannot be compared across a config change -- which
-    is the exact comparison this field exists for."""
-    s = line({
-        "agent_steps": 9000.0, "learner_agent_steps": 9000.0,
-        "touch_events": 3000.0, "learner_touch_events": 3000.0,
-        "airborne_touch_events": 100.0, "learner_airborne_touch_events": 100.0,
-        **_z(lt150=77, **{"150_300": 21}, **{"300_500": 1}, **{"500_800": 1}),
-    })
-    assert "air_z 77.0/21.0/1.0/1.0/0.0/0.0" in s
+def _z_line(terms_seq):
+    """Feed several iterations through ONE stub trainer so the accumulator
+    persists, and return the last line."""
+    stub = types.SimpleNamespace(_AIR_Z_MIN=Trainer._AIR_Z_MIN)
+    out = ""
+    for terms in terms_seq:
+        stub.engine = types.SimpleNamespace(reward_terms=lambda t=terms: t)
+        out = Trainer._reward_terms_line(stub)
+    return out
 
 
-def test_air_z_is_suppressed_when_the_buckets_do_not_sum_to_the_population():
-    """The wiring self-check. If the buckets stop partitioning the airborne
-    touches they are measuring some other set, and a plausible-looking
-    distribution would be worse than no distribution at all."""
-    s = line({
-        "agent_steps": 9000.0, "learner_agent_steps": 9000.0,
-        "touch_events": 3000.0, "learner_touch_events": 3000.0,
-        "airborne_touch_events": 100.0, "learner_airborne_touch_events": 100.0,
-        **_z(lt150=40, **{"150_300": 20}),          # sums to 60, not 100
-    })
-    assert "air_z" not in s
+def _iter_terms(airborne, hist):
+    return {
+        "agent_steps": 90000.0, "learner_agent_steps": 90000.0,
+        "touch_events": 400.0, "learner_touch_events": 400.0,
+        "airborne_touch_events": float(airborne),
+        "learner_airborne_touch_events": float(airborne),
+        **_z(**hist),
+    }
 
 
-def test_air_z_is_suppressed_on_too_few_airborne_touches():
-    """Six percentages off a handful of events is noise dressed as a
-    distribution, and this field is meant to be read as evidence."""
-    s = line({
-        "agent_steps": 9000.0, "learner_agent_steps": 9000.0,
-        "touch_events": 300.0, "learner_touch_events": 300.0,
-        "airborne_touch_events": 3.0, "learner_airborne_touch_events": 3.0,
-        **_z(lt150=3),
-    })
-    assert "air_z" not in s
+def test_air_z_accumulates_across_iterations_instead_of_never_firing():
+    """THE BUG THIS REPLACES. The first version only printed when a SINGLE
+    iteration cleared the floor, but the live rate is ~8 airborne touches per
+    iteration and reward_terms() resets on read -- so it was installed on the
+    training box and stayed silent forever.
+
+    25 iterations x 8 events = 200 = _AIR_Z_MIN, so the last one reports."""
+    per = {"lt150": 6, "150_300": 2}
+    seq = [_iter_terms(8, per) for _ in range(25)]
+    assert "air_z" not in _z_line(seq[:24]), "must stay silent below the floor"
+    s = _z_line(seq)
+    assert "air_z 75.0/25.0/0.0/0.0/0.0/0.0 n200" in s
+
+
+def test_air_z_resets_after_reporting_so_windows_do_not_overlap():
+    per = {"lt150": 8}
+    stub = types.SimpleNamespace(_AIR_Z_MIN=Trainer._AIR_Z_MIN)
+    fired = 0
+    for _ in range(75):                      # three full windows
+        terms = _iter_terms(8, per)
+        stub.engine = types.SimpleNamespace(reward_terms=lambda t=terms: t)
+        if "air_z" in Trainer._reward_terms_line(stub):
+            fired += 1
+    assert fired == 3, f"expected one report per 200 events, got {fired}"
+
+
+def test_air_z_banks_nothing_from_an_iteration_whose_buckets_do_not_sum():
+    """The wiring self-check. A polluted accumulator would outlive the single
+    bad iteration that polluted it, so a mismatch must bank nothing at all."""
+    good = _iter_terms(8, {"lt150": 8})
+    bad = _iter_terms(8, {"lt150": 4})       # sums to 4, not 8
+    seq = [bad] * 25 + [good] * 24
+    assert "air_z" not in _z_line(seq), "bad iterations must not count toward n"
 
 
 def test_air_z_absent_on_an_engine_without_the_buckets():
