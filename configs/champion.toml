@@ -53,7 +53,7 @@ schema_version = 1
 # Kept in checkpoints_champions/ on purpose: the pointer must never reference a
 # live rotating run directory (checkpoints_scratch/ is synced and reshuffled).
 # Verified to load before promotion (total_steps 1171502080, schema_version 1).
-champion_ck = "checkpoints_champions/ck_001171502080.pt"
+champion_ck = "checkpoints_champions/ck_001321267200.pt"
 
 # --- the bar ----------------------------------------------------------------
 # 0.52 = candidate must take >= 52% of combined goals across BOTH side orders.
