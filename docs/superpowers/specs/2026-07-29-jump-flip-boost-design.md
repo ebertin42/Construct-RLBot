@@ -94,15 +94,36 @@ run B.
 ### Lever 2 — new `boost_pickup` event term (engine)
 
 ```
-T_BOOST_PICKUP = 20   reward      cfg.boost_pickup * (gained / 100.0)
+T_BOOST_PICKUP = 20   reward      cfg.boost_pickup * sqrt_gain
 T_BOOST_GAINED = 21   instrument  raw boost units gained (coefficient-free)
 T_FLIP_EVENTS  = 22   instrument  dodge fires (has_flipped false -> true)
 N_TERMS 20 -> 23
 cfg.boost_pickup: f32  with #[serde(default)] = 0.0
 ```
 
-where `gained = cur.cars[i].state.boost - prev.cars[i].state.boost`, counted
-only when positive.
+where, with `b0 = prev.cars[i].state.boost` and `b1 = cur.cars[i].state.boost`:
+
+```
+sqrt_gain = (sqrt(b1) - sqrt(b0)) / 10.0        // sqrt(100) = 10 -> range [0,1]
+```
+
+counted only when positive.
+
+**SQUARE ROOT, not linear — the pad must only pay when the boost is NEEDED.**
+A linear `gained/100` handles *exactly* full correctly (a pad collected at 100
+boost gains 0, so it pays 0), but it prices 0->20 and 80->100 identically when
+the first is desperate and the second nearly worthless. Boost has diminishing
+marginal value, and `sqrt` is the standard RLGym shape for it:
+
+| pickup | payout fraction |
+|---|---|
+| 0 -> 100 (empty, big pad) | 1.000 |
+| 0 -> 12 (empty, small pad) | 0.346 |
+| 88 -> 100 (nearly full, big pad) | 0.062 |
+| 100 -> 100 (full) | 0.000 |
+
+A small pad while empty therefore pays 5.6x more than a big pad while nearly
+full. Still clamped to positive, so spending boost costs nothing.
 
 **Event, not potential — deliberately.** A potential on boost AMOUNT
 (`F = γΦ(s') - Φ(s)` with `Φ = boost`) penalises SPENDING boost and yields a
@@ -114,11 +135,13 @@ pad (12), matching their real value.
 live scale (`goal 10.0, touch 0.5, touch_accel 0.5, aerial_touch 1.5,
 air_setup 0.3, vel_to_ball 0.05`):
 
-- a big pad (gained 100) pays `0.2 * 1.0 = 0.2` — 40% of a `touch`
-- a small pad (gained 12) pays `0.2 * 0.12 = 0.024`
-- `vel_to_ball` pays up to 0.05 per decision, so a big pad is worth about
-  `0.2 / 0.05 = 4` decisions of forgone ball approach, i.e. roughly a 0.27s
-  detour at decision period 8
+- a big pad taken empty pays `0.2 * 1.000 = 0.2` — 40% of a `touch`
+- a small pad taken empty pays `0.2 * 0.346 = 0.069`
+- a big pad taken at 88 boost pays `0.2 * 0.062 = 0.012` — near-worthless, correctly
+- `vel_to_ball` pays up to 0.05 per decision, so a big pad taken empty is worth
+  about `0.2 / 0.05 = 4` decisions of forgone ball approach, i.e. roughly a
+  0.27s detour at decision period 8 — and a pad taken while nearly full buys
+  almost no detour at all, which is the point
 
 That is the intended shape: a pad already on the path is always worth taking
 (any positive value beats zero when the detour cost is zero), while a detour of
