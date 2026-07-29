@@ -1734,7 +1734,46 @@ class Trainer:
         tev = t.get("touch_events", 0.0)
         if tev > 0:
             out.append(f"air_tch_frac {t.get('airborne_touch_events', 0.0) / tev:.3f}")
-        for k in ("aerial_touch", "air_setup", "touch_accel", "touch"):
+        # Boost + flip instruments, per learner-car-minute like `tch/min/car`.
+        # SHIPPED WITHOUT THESE ONCE (2026-07-30): the engine computed
+        # boost_gained and flip_events and `reward_terms()` resets on read, so
+        # the counters went straight into a void and no external probe could
+        # recover them. An instrument that is not printed is not an instrument.
+        #
+        # `boost_gained` is the FARM TRIPWIRE for `boost_pickup`, and it has to
+        # be watched in its own right because the existing tripwire
+        # (touches/min/car) reads ~0 for a pad farmer -- byte-indistinguishable
+        # from "the run died". Denominated in raw units so retuning the
+        # coefficient does not move the ruler.
+        # Reuses `split`/`per_min`/`pair` so the denominator is the SAME one
+        # tch/min/car uses, and so the OPPONENT column comes free -- the foreign
+        # bots are the natural control for "is this rate normal for a car that
+        # plays football".
+        # Written out longhand on purpose. This runs inside the per-iteration log
+        # line of a live training run and CANNOT be tested against a rebuilt .so
+        # locally (the local .so is the frozen gate instrument), so an exception
+        # here would kill the run with no prior warning. `per_min` divides by
+        # agent_steps, so the opponent branch is only taken when its step count
+        # is a real number.
+        def rate_pair(key, label, fmt):
+            if key not in t:
+                return                      # older .so: term absent, stay silent
+            l_val, o_val = split(key)
+            l_rate = per_min(l_val, l_steps) if l_val is not None and l_steps else None
+            o_rate = per_min(o_val, o_steps) if o_val is not None and o_steps else None
+            if l_rate is None:
+                return
+            out.append(pair(label, l_rate, o_rate, fmt))
+
+        rate_pair("boost_gained", "boost/min/car", ".1f")
+        # flip_events counts dodges AND stalls but NOT double jumps -- and the
+        # two jump rows the action table gives most mass to ARE double jumps, so
+        # this can read 0.00 while jumping rises. A LOWER BOUND too: a
+        # flip-and-land inside one 8-tick window is invisible. Comparable across
+        # runs; not an exact flip total.
+        rate_pair("flip_events", "flips/min/car", ".2f")
+        for k in ("aerial_touch", "air_setup", "touch_accel", "touch",
+                  "boost_pickup"):
             if t.get(k, 0.0):
                 # SPLIT, for the same reason the touch counts are: r_aerial_touch
                 # is the exact term whose whole arena-wide value was measured to
@@ -1750,9 +1789,14 @@ class Trainer:
             # over every car in every arena, and goal/concede are exact negations,
             # so the goal term sums to ~0 by symmetry (measured: 218 goal events,
             # summed goal reward 0.00) and would only add noise to the ratio.
+            # `boost_pickup` MUST be in here: it is non-zero-sum in self-play
+            # (unlike `goal`, which cancels exactly), so a pad farm inflates
+            # shaping with no goals to divide by -- exactly the signature this
+            # ratio exists to catch. Absent from an older .so, hence the default.
             shaping = sum(t.get(k, 0.0) for k in
                           ("touch", "vel_to_ball", "touch_accel", "vel_ball_to_goal",
-                           "offensive_potential", "aerial_touch", "air_setup", "win_prob"))
+                           "offensive_potential", "aerial_touch", "air_setup", "win_prob",
+                           "boost_pickup"))
             out.append(f"shaping/goal {shaping / ge:.2f}")
         return " " + " ".join(out)
 
