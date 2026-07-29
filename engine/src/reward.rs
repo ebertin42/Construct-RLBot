@@ -112,6 +112,21 @@ pub struct RewardConfig {
     pub air_setup_z_lo: f32,
     #[serde(default)]
     pub air_setup_z_hi: f32,
+    /// Reward per boost pickup, scaled by `(sqrt(b1) - sqrt(b0))/10` so a pad pays
+    /// in proportion to how much the boost was NEEDED: 0->100 pays 1.0x this
+    /// coefficient, 0->12 pays 0.346x, 88->100 pays 0.062x, 100->100 pays 0.
+    /// NOT linear `gained/100`, which prices 0->20 and 80->100 the same.
+    ///
+    /// 0.2 means a big pad from empty is worth ~4 decisions of forgone ball
+    /// approach at `vel_to_ball = 0.05`, i.e. roughly a 0.27s detour -- so a pad
+    /// already on the path is always worth taking and a real detour never is.
+    /// That framing prices ONE pickup; it does not bound the loop. See
+    /// `T_BOOST_PICKUP` for the measured spend-and-refill farm (up to 57.7 per
+    /// 300s match at 0.2, against a 4-10 shaping budget) before choosing a value.
+    /// `serde(default)` -> 0.0, which is what keeps every existing tape
+    /// reward-identical (`v0_behavior_unchanged_by_new_fields` is the gate).
+    #[serde(default)]
+    pub boost_pickup: f32,
 }
 
 /// Per-term reward telemetry (E9). Index space for the `[f64; N_TERMS]`
@@ -121,10 +136,18 @@ pub struct RewardConfig {
 /// run -- the 2026-07-20 confound was an arm that ran fully INERT while every
 /// log line looked normal.
 ///
-/// The last four entries are COUNTS, not reward: they are what the §8.3
-/// farming tripwires (touches/min/car, airborne-touch fraction, reward per
-/// goal) are computed from.
-pub const N_TERMS: usize = 20;
+/// Indices 0-8 are reward contributions and 9-19 are COUNTS, not reward: the
+/// counts are what the §8.3 farming tripwires (touches/min/car, airborne-touch
+/// fraction, reward per goal) are computed from.
+///
+/// That reward-prefix/count-suffix split stopped being a clean partition at
+/// index 20: `boost_pickup` is a REWARD appended AFTER the counters, because
+/// renumbering is forbidden (this index space is positional and the telemetry
+/// baselines are read against a fixed order). Any consumer that sums "the reward
+/// slice" must therefore sum `T_GOAL..=T_AERIAL_TOUCH` PLUS `T_BOOST_PICKUP` --
+/// see `compute_terms_sums_to_compute`, and `reward_keys` in
+/// `tests/python/test_engine_v9.py`, which still hardcodes the nine-name prefix.
+pub const N_TERMS: usize = 23;
 pub const T_GOAL: usize = 0;
 pub const T_TOUCH: usize = 1;
 pub const T_VEL_TO_BALL: usize = 2;
@@ -184,6 +207,62 @@ pub const T_AIR_TOUCH_Z4: usize = 18; // 800 - 1200
 pub const T_AIR_TOUCH_Z5: usize = 19; // >= 1200
 /// Upper edges for buckets 0..4; anything at or above the last lands in Z5.
 const AIR_TOUCH_Z_EDGES: [f32; 5] = [150.0, 300.0, 500.0, 800.0, 1200.0];
+/// REWARD (not a count, despite sitting after the counters -- see `N_TERMS`):
+/// boost collected, priced on the SQRT of the amount gained so a pad pays in
+/// proportion to how much the boost was NEEDED. Measured in f32: 0->100 pays
+/// 1.000x the coefficient, 0->12 pays 0.346x, 88->100 pays 0.0619x, and a full
+/// car gains nothing so it pays exactly 0. Linear `gained/100` would price 0->20
+/// and 80->100 identically, which is wrong -- the first is desperate, the second
+/// worthless. An EVENT, not a potential: a potential on boost AMOUNT penalises
+/// SPENDING it and yields a hoarder, the same gamma-drag that left `air_setup`
+/// net negative for 2B steps.
+///
+/// MEASURED HAZARD, recorded here so nobody has to rediscover it. Because
+/// spending is deliberately never charged, the term is a RATCHET and the payout
+/// is PATH-DEPENDENT. Exact telescoping -- splitting a climb into pads earns
+/// nothing extra, pinned by `a_monotone_climb_pays_the_same_however_it_is_split`
+/// -- holds ONLY for a MONOTONE climb. A spend-and-refill loop resets the
+/// baseline and re-earns at the higher marginal rate: 12-from-empty chunks pay
+/// 0.005774 per boost unit against 0.002000 for one 0->100, i.e. 2.89x. The burn
+/// rate (`BOOST_USED_PER_SECOND` = 33.33) is the only cap, at 0.1925 reward/s =
+/// 57.7 per 300s match at coefficient 0.2 (a measured 6-pad routing loop reaches
+/// 31/match; a big-pad grand tour 30.6/match, and the six big pads are served to
+/// the net as labelled `obs_v1` entity rows with an availability flag, so that
+/// one is directly learnable). Against a stated shaping budget of 4-10 per match
+/// that makes 0.2 a SECOND touch term in magnitude, earned with zero touches --
+/// so the coefficient is the entire safety margin, and `T_BOOST_GAINED` (raw
+/// units, coefficient-free) is the tripwire that says whether it is being farmed.
+/// Pin the champion's boost_gained/min/car BEFORE shipping a nonzero coefficient.
+pub const T_BOOST_PICKUP: usize = 20;
+/// Instrument: raw boost units gained, independent of `cfg.boost_pickup`, so
+/// retuning the payout does not move the measurement. Same payout/instrument
+/// split as `aerial_z_lo` vs `aerial_meas_z_lo`. THE farm tripwire for
+/// `T_BOOST_PICKUP`, because it is denominated in the resource, not the reward.
+///
+/// A NET delta cannot hide a pad at `tick_skip = 8` -- but only because the
+/// smallest pad (12) exceeds one decision's maximum burn (33.33 * 8/120 = 2.22).
+/// That property breaks at `tick_skip >= 44`, where same-window spending could
+/// mask a pickup and this instrument would under-count.
+pub const T_BOOST_GAINED: usize = 21;
+/// Instrument: flips consumed, counted on the `has_flipped` RISING EDGE. Flips
+/// were previously unmeasurable -- "does the bot flip?" could only be answered by
+/// watching the viewer.
+///
+/// Reads FLIPS ONLY, which is narrower than it sounds. RocketSim sets
+/// `hasFlipped` in exactly one place, the dodge branch of
+/// `Car::_UpdateDoubleJumpOrFlip`, and clears it unconditionally on any tick the
+/// car is on the ground. So this counts dodges AND stalls (a stall is a flip with
+/// a cancelling dodge impulse; both v1 stall rows clear the 0.5 dodge deadzone),
+/// but NOT double jumps, which set `hasDoubleJumped` and leave `hasFlipped`
+/// alone. The two no-direction jump rows the action table gives the most mass to
+/// are DOUBLE jumps, so this counter reads 0 for that lever -- `p_jump` and
+/// `air_z` are its readouts, not this. Pinned by `a_double_jump_is_not_a_flip`.
+///
+/// It is a LOWER BOUND, not an exact count: `compute_terms` runs once per
+/// decision against a state 8 physics ticks old, so a flip that starts and lands
+/// inside one 67ms window is invisible and two flips separated by a landing in
+/// one window count as one. Comparable across runs; not a true flip total.
+pub const T_FLIP_EVENTS: usize = 22;
 pub const TERM_NAMES: [&str; N_TERMS] = [
     "goal",
     "touch",
@@ -205,6 +284,9 @@ pub const TERM_NAMES: [&str; N_TERMS] = [
     "air_touch_z_500_800",
     "air_touch_z_800_1200",
     "air_touch_z_ge1200",
+    "boost_pickup",
+    "boost_gained",
+    "flip_events",
 ];
 
 /// Ball radius. The `aerial_z_lo` floor in `validate`: a ramp whose bottom is
@@ -403,6 +485,65 @@ pub fn compute_terms(
     let me = &cur.cars[car_idx];
     let mut r = 0.0f32;
     terms[T_AGENT_STEPS] += 1.0;
+
+    // Boost pickup + flip instrument. Both read `prev`'s matching car, so they
+    // sit here rather than in the `touched` block -- neither depends on contact.
+    {
+        let was = &prev.cars[car_idx];
+        // A DEMO RESPAWN is not a pad, and this guard is the only thing that says
+        // so. `Car::Demolish` leaves boost untouched, then `Car::Respawn` writes
+        // `carSpawnBoostAmount` = BOOST_SPAWN_AMOUNT = 33.333 MID-EPISODE from
+        // `_PreTickUpdate` with no reset -- and `prev_state` is only re-latched
+        // inside `reset_episode`, so that +33.3 jump lands inside an ordinary
+        // (prev, cur) pair. Unguarded, a car demoed at 0 boost is paid
+        // 0.2*sqrt(33.333)/10 = 0.115, i.e. 58% of a big pad, FOR BEING
+        // DEMOLISHED, and `boost_gained` over-reads by up to 33.3 units per demo.
+        // Demos are on by default (DemoMode::NORMAL) and this engine never
+        // overrides the mutator config. On the respawn window `prev` is demoed and
+        // `cur` is not, so this excludes exactly that window and nothing else: the
+        // demo window itself has `gained == 0` because Demolish preserves boost.
+        if !was.state.is_demoed {
+            let gained = me.state.boost - was.state.boost;
+            if gained > 0.0 {
+                terms[T_BOOST_GAINED] += gained as f64;
+                if cfg.boost_pickup != 0.0 {
+                    // SQRT, not linear: boost has diminishing marginal value, so a
+                    // pad must pay in proportion to how much it was NEEDED. A pad
+                    // taken at 88 boost pays ~1/16 of the same pad taken empty, and
+                    // a full car gains 0 so it pays 0. Linear `gained/100` prices
+                    // 0->20 and 80->100 identically, which is wrong.
+                    // /10 normalises sqrt(100) = 10 to a [0,1] range.
+                    //
+                    // `max(0.0)` is NaN containment, not decoration:
+                    // `apply_replay_state` writes `cs.boost = sp.boost * 100.0`
+                    // unclamped and the replay filter (`reset_pool` F6) checks
+                    // FINITENESS only, so a negative replay boost reaches here.
+                    // sqrt of it is NaN, and since `prev_state` is latched to the
+                    // post-reset state the NaN would sit in BOTH states and be paid
+                    // every step for the whole episode -- silent poisoning, the
+                    // failure `height_ramp`'s doc comment was written against.
+                    let g = (me.state.boost.max(0.0).sqrt()
+                        - was.state.boost.max(0.0).sqrt())
+                        / 10.0;
+                    if g > 0.0 {
+                        // Not dead code despite `gained > 0.0`: near b = 100 a gain
+                        // of 7.6e-6 is sqrt-equal in f32 and yields g == 0.0.
+                        let b = cfg.boost_pickup * g;
+                        r += b;
+                        terms[T_BOOST_PICKUP] += b as f64;
+                    }
+                }
+            }
+        }
+        // RISING edge only: `has_flipped` stays true until >=3 wheels contact a
+        // surface (floor, wall or ceiling), which is the only thing that clears
+        // it, so testing the LEVEL would count one flip every decision of the
+        // air time. A demo cannot fabricate an edge: Demolish freezes the flags
+        // and Respawn rebuilds a default `CarState` with has_flipped = false.
+        if me.state.has_flipped && !was.state.has_flipped {
+            terms[T_FLIP_EVENTS] += 1.0;
+        }
+    }
 
     // goal / concede with aggression bias (bias 0.0 == old symmetric behavior)
     if let Some(team) = scored {
@@ -2226,5 +2367,248 @@ mod tests {
         assert_eq!(r, plain, "compute() must be compute_terms() with the counters discarded");
         let sum: f64 = terms[T_GOAL..=T_AERIAL_TOUCH].iter().sum();
         assert!((sum - r as f64).abs() < 1e-5, "terms {sum} != total {r}");
+
+        // The paid terms STOPPED being the contiguous `T_GOAL..=T_AERIAL_TOUCH`
+        // prefix when `boost_pickup` was appended at index 20 (renumbering is
+        // forbidden -- TERM_NAMES is positional). Exercise it with a NONZERO
+        // coefficient and a real boost delta, or this identity would hold for the
+        // new term only because the term is 0 on every shipped tape.
+        let bcfg = RewardConfig { boost_pickup: 0.2, ..v9_cfg() };
+        let (mut bprev, mut bcur) = boost_pair();
+        bprev.cars[0].state.boost = 0.0;
+        bcur.cars[0].state.boost = 60.0;
+        let mut bt = [0.0f64; N_TERMS];
+        let br = compute_terms(&bprev, &bcur, 0, Some(Team::Blue), &bcfg, &mut bt);
+        assert!(bt[T_BOOST_PICKUP] > 0.0,
+                "precondition: the appended reward term must actually pay in this fixture");
+        let bsum: f64 =
+            bt[T_GOAL..=T_AERIAL_TOUCH].iter().sum::<f64>() + bt[T_BOOST_PICKUP];
+        assert!((bsum - br as f64).abs() < 1e-5, "terms {bsum} != total {br}");
+    }
+
+    // ------------------------------------------------------ boost / flip (v10) --
+
+    /// Zero-arg `(prev, cur)` fixture for the boost/flip tests: one AIRBORNE blue
+    /// car with a forged contact, ball centre at 800uu. A thin wrapper over
+    /// `synth` -- these tests are about a car whose `state` they can write, not
+    /// about physics, and a stepped arena cannot hold a chosen boost value across
+    /// `step()`. NOTE: `synth` writes `cur = prev.clone()` AFTER setting up prev,
+    /// so a test must write BOTH `prev.cars[0].state.x` and `cur.cars[0].state.x`.
+    fn boost_pair() -> (GameState, GameState) {
+        synth(
+            [0.0, 0.0, 800.0], [0.0, 0.0, 0.0], [0.0, 1800.0, 0.0],
+            &[(Team::Blue, [0.0, -200.0, 700.0], true)],
+        )
+    }
+
+    /// `boost_pickup` alone for one `b0 -> b1` boost step at coefficient 0.2.
+    /// `RewardConfig::default()` is the real "all coefficients zero" tape (the
+    /// struct derives Default over f32/u32 only), so this isolates the new term:
+    /// `touch`/`touch_accel`/`aerial_touch` are all 0 even though `synth` forges a
+    /// live airborne contact.
+    fn boost_pay(b0: f32, b1: f32) -> f64 {
+        let (mut prev, mut cur) = boost_pair();
+        prev.cars[0].state.boost = b0;
+        cur.cars[0].state.boost = b1;
+        let cfg = RewardConfig { boost_pickup: 0.2, ..Default::default() };
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        t[T_BOOST_PICKUP]
+    }
+
+    /// A pad pickup is a POSITIVE boost delta, scaled by SQRT so it pays only
+    /// in proportion to how much the boost was NEEDED.
+    #[test]
+    fn boost_pickup_pays_on_sqrt_of_amount_gained() {
+        let (mut prev, mut cur) = boost_pair();
+        prev.cars[0].state.boost = 0.0;
+        cur.cars[0].state.boost = 100.0;
+        let cfg = RewardConfig { boost_pickup: 0.2, ..Default::default() };
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert!((t[T_BOOST_PICKUP] - 0.2).abs() < 1e-6,
+                "big pad from empty pays the full coefficient; got {}", t[T_BOOST_PICKUP]);
+        assert!((t[T_BOOST_GAINED] - 100.0).abs() < 1e-6,
+                "instrument counts RAW units, not the sqrt-shaped reward");
+
+        // small pad from empty: (sqrt(12) - 0)/10 = 0.3464
+        let mut t2 = [0.0f64; N_TERMS];
+        cur.cars[0].state.boost = 12.0;
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t2);
+        assert!((t2[T_BOOST_PICKUP] - 0.2 * 0.34641).abs() < 1e-5,
+                "small pad from empty; got {}", t2[T_BOOST_PICKUP]);
+    }
+
+    /// The whole point of sqrt: a pad taken when nearly full must pay almost
+    /// nothing, and a pad taken when FULL must pay exactly nothing. A linear
+    /// `gained/100` gets the full case right but prices 0->20 and 80->100 the
+    /// same, which is wrong -- the first is desperate, the second worthless.
+    #[test]
+    fn a_pad_pays_only_to_the_extent_the_boost_was_needed() {
+        // ALREADY FULL: driving over a pad gains nothing, so it pays nothing.
+        assert_eq!(boost_pay(100.0, 100.0), 0.0, "a full car gains nothing from a pad");
+
+        // NEARLY full: a big pad is worth ~1/16 of the same pad taken empty
+        // (measured in f32: g(88,100) = 0.061917, g(0,100) = 1.0 -> 1/16.15).
+        let empty_big = boost_pay(0.0, 100.0);
+        let nearly_full_big = boost_pay(88.0, 100.0);
+        assert!(nearly_full_big > 0.0, "12 units gained is still worth something");
+        assert!(nearly_full_big < empty_big / 10.0,
+                "a pad at 88 boost must pay <1/10 of the same pad at 0: {nearly_full_big} vs {empty_big}");
+
+        // A SMALL pad while empty must beat a BIG pad while nearly full --
+        // this is the ordering a linear scaling gets backwards.
+        assert!(boost_pay(0.0, 12.0) > nearly_full_big,
+                "need beats quantity: small-pad-when-empty must outpay big-pad-when-full");
+    }
+
+    /// Spending boost must NOT be penalised. This is the whole reason the term
+    /// is an EVENT and not a potential: a potential on boost amount yields a
+    /// hoarder, the same gamma-drag trap that left air_setup net negative.
+    #[test]
+    fn spending_boost_is_never_penalised() {
+        let (mut prev, mut cur) = boost_pair();
+        prev.cars[0].state.boost = 100.0;
+        cur.cars[0].state.boost = 40.0;
+        let cfg = RewardConfig { boost_pickup: 0.2, ..Default::default() };
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert_eq!(t[T_BOOST_PICKUP], 0.0, "burning boost must cost nothing");
+        assert_eq!(t[T_BOOST_GAINED], 0.0, "and must not register as a pickup");
+    }
+
+    /// A tape that does not set boost_pickup is bit-identical to today.
+    #[test]
+    fn boost_pickup_defaults_to_zero_reward() {
+        let (mut prev, mut cur) = boost_pair();
+        prev.cars[0].state.boost = 0.0;
+        cur.cars[0].state.boost = 100.0;
+        let cfg = RewardConfig::default(); // boost_pickup untouched -> 0.0
+        let mut t = [0.0f64; N_TERMS];
+        let r = compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert_eq!(t[T_BOOST_PICKUP], 0.0, "unset coefficient pays nothing");
+        assert_eq!(r, 0.0, "an all-zero tape stays byte-identical across a pickup");
+        assert!((t[T_BOOST_GAINED] - 100.0).abs() < 1e-6,
+                "but the INSTRUMENT still records, so v9 telemetry is comparable");
+    }
+
+    /// SPLITTING a monotone climb earns nothing extra: the sqrt deltas telescope,
+    /// so nine small pads from empty to full pay exactly what one big pad pays.
+    /// This is the anti-exploit property that makes the sqrt form safe for the
+    /// only path it is safe on.
+    #[test]
+    fn a_monotone_climb_pays_the_same_however_it_is_split() {
+        let ladder = [0.0f32, 12.0, 24.0, 36.0, 48.0, 60.0, 72.0, 84.0, 96.0, 100.0];
+        let split: f64 = ladder.windows(2).map(|w| boost_pay(w[0], w[1])).sum();
+        let single = boost_pay(0.0, 100.0);
+        assert!((split - single).abs() < 1e-6,
+                "pad-splitting on a monotone climb must be worth nothing: {split} vs {single}");
+    }
+
+    /// PINNED HAZARD, not a desirable property. Because spending is deliberately
+    /// never charged, the term is a RATCHET: burning boost resets the baseline, so
+    /// the same 100 units re-collected in 12-unit chunks from empty pay 2.89x what
+    /// one 0->100 refill pays. The burn rate (33.33 boost/s) caps this at
+    /// 0.1925 reward/s = 57.7 per 300s match at coefficient 0.2, against a stated
+    /// shaping budget of 4-10 per match. If this test ever changes, the farm
+    /// arithmetic in `T_BOOST_PICKUP`'s doc comment must be recomputed with it.
+    #[test]
+    fn burn_and_recollect_out_earns_one_full_refill_per_boost_unit() {
+        let per_unit_small = boost_pay(0.0, 12.0) / 12.0;
+        let per_unit_big = boost_pay(0.0, 100.0) / 100.0;
+        assert!((per_unit_small / per_unit_big - 2.887).abs() < 0.01,
+                "the spend-and-refill rate advantage is sqrt(100/12) = 2.887; got {}",
+                per_unit_small / per_unit_big);
+        assert!(boost_pay(0.0, 12.0) * 8.0 > boost_pay(0.0, 100.0) * 2.0,
+                "eight refills from empty out-earn two full tanks -- the farm is real");
+    }
+
+    /// A DEMO RESPAWN is not a pad. `Car::Respawn` writes boost = 33.333
+    /// mid-episode with no reset, so the (prev, cur) pair straddles a +33.3 jump
+    /// with no pad involved -- worth 58% of a big pad, for being demolished.
+    #[test]
+    fn a_demo_respawn_is_not_a_pad_pickup() {
+        let (mut prev, mut cur) = boost_pair();
+        prev.cars[0].state.is_demoed = true;
+        prev.cars[0].state.boost = 0.0;
+        cur.cars[0].state.is_demoed = false;
+        cur.cars[0].state.boost = 100.0 / 3.0; // BOOST_SPAWN_AMOUNT
+        let cfg = RewardConfig { boost_pickup: 0.2, ..Default::default() };
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert_eq!(t[T_BOOST_PICKUP], 0.0, "respawn boost must not pay -- no pad was taken");
+        assert_eq!(t[T_BOOST_GAINED], 0.0, "and must not inflate the instrument by 33.3 units");
+    }
+
+    /// A negative boost value must not poison the run with a NaN. `apply_replay_state`
+    /// writes `cs.boost = sp.boost * 100.0` unclamped and the replay filter checks
+    /// FINITENESS only, so a negative boost reaches here; `sqrt` of it is NaN, and
+    /// because `prev_state` is latched to the post-reset state the NaN would be
+    /// paid every step for the whole episode while every log line looked normal.
+    #[test]
+    fn a_negative_boost_cannot_produce_a_nan() {
+        let (mut prev, mut cur) = boost_pair();
+        prev.cars[0].state.boost = -5.0;
+        cur.cars[0].state.boost = 25.0;
+        let cfg = RewardConfig { boost_pickup: 0.2, ..Default::default() };
+        let mut t = [0.0f64; N_TERMS];
+        let r = compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert!(r.is_finite(), "reward must stay finite; got {r}");
+        assert!(t.iter().all(|x| x.is_finite()), "no term may be NaN: {t:?}");
+        assert!((t[T_BOOST_PICKUP] - 0.2 * 0.5).abs() < 1e-6,
+                "a negative baseline is clamped to empty; got {}", t[T_BOOST_PICKUP]);
+    }
+
+    /// The flip instrument fires on the has_flipped rising edge -- that is the
+    /// flip (a dodge, or a stall, which the sim also records as a flip), not the
+    /// first jump.
+    #[test]
+    fn flip_events_counts_the_flip_rising_edge() {
+        let (mut prev, mut cur) = boost_pair();
+        prev.cars[0].state.has_flipped = false;
+        cur.cars[0].state.has_flipped = true;
+        let cfg = RewardConfig::default();
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert_eq!(t[T_FLIP_EVENTS], 1.0, "rising edge is one flip");
+
+        // Still flipped on the next tick is the SAME flip, not a new one.
+        let mut t2 = [0.0f64; N_TERMS];
+        prev.cars[0].state.has_flipped = true;
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t2);
+        assert_eq!(t2[T_FLIP_EVENTS], 0.0, "held-high must not double count");
+    }
+
+    /// A DOUBLE JUMP is not a flip, and this matters for reading the experiment:
+    /// the two action rows the table doubles the mass of have zero directional
+    /// input, so their airborne rising edge is a double jump (`hasDoubleJumped`),
+    /// which RocketSim records WITHOUT touching `hasFlipped`. So `flip_events`
+    /// reads exactly 0 for the clean-air lever -- `p_jump` and `air_z` are its
+    /// readouts, not this counter.
+    ///
+    /// Written by mutating `has_double_jumped` directly: `test_support::build_state`
+    /// forces it false, so no fixture built through that helper can express this.
+    #[test]
+    fn a_double_jump_is_not_a_flip() {
+        let (mut prev, mut cur) = boost_pair();
+        prev.cars[0].state.has_flipped = false;
+        prev.cars[0].state.has_double_jumped = false;
+        cur.cars[0].state.has_flipped = false;
+        cur.cars[0].state.has_double_jumped = true;
+        let cfg = RewardConfig::default();
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert_eq!(t[T_FLIP_EVENTS], 0.0, "a double jump must not count as a flip");
+    }
+
+    /// TERM_NAMES is positional and consumed by name on the Python side.
+    #[test]
+    fn term_names_covers_every_index_and_is_unique() {
+        assert_eq!(TERM_NAMES[T_BOOST_PICKUP], "boost_pickup");
+        assert_eq!(TERM_NAMES[T_BOOST_GAINED], "boost_gained");
+        assert_eq!(TERM_NAMES[T_FLIP_EVENTS], "flip_events");
+        assert_eq!(T_FLIP_EVENTS, N_TERMS - 1, "the new terms are the LAST three");
+        let mut seen = std::collections::HashSet::new();
+        for n in TERM_NAMES { assert!(seen.insert(n), "duplicate term name {n}"); }
     }
 }

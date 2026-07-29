@@ -372,3 +372,69 @@ def test_p_jump_is_none_for_a_table_with_no_jump_column(tmp_path):
     batch = t.collect(8)
     t.net.action_table = t.net.action_table[:, :4]
     assert t._p_jump(batch) is None
+
+
+def test_p_jump_edge_conditions_on_the_PREVIOUS_action_not_the_current_one(tmp_path):
+    """The rising edge is the quantity that gates a dodge, and `p_jump` cannot see it.
+
+    RocketSim fires a jump only on `controls.jump && !lastControls.jump`, and an
+    action held across a whole decision is ONE edge. So a dodge needs
+    jump -> non-jump -> jump and the gating probability is
+    P(jump | prev was NOT a jump). Measured on the 2.078B checkpoint the two
+    branches differ ~2000x, so unconditioned `p_jump` overstates edge
+    accessibility by ~2 orders of magnitude.
+
+    This pins the CONDITIONING, because inverting it silently swaps the two
+    reported numbers and every conclusion drawn from them.
+    """
+    t = Trainer(air_cfg(tmp_path))
+    batch = t.collect(8)
+    got = t._p_jump_edge(batch)
+    if got is None:
+        pytest.skip("this sample landed entirely in one branch")
+    edge, hold, edge_frac = got
+
+    obs = batch["obs"]
+    any_obs = next(iter(obs.values()))
+    idx = t._p_jump_idx(any_obs.shape[0], any_obs.device)
+    sub = {k: v[idx] for k, v in obs.items()}
+    with torch.no_grad():
+        logits, _ = t.net(**sub)
+    jump = t.net.action_table[:, 5] > 0
+    mass = torch.softmax(logits, -1)[:, jump].sum(-1)
+
+    # prev[:, 0] is the IMMEDIATELY preceding action. Recompute independently.
+    prev_was_jump = jump[sub["prev"][:, 0]]
+    assert edge == pytest.approx(float(mass[~prev_was_jump].mean()), rel=1e-6)
+    assert hold == pytest.approx(float(mass[prev_was_jump].mean()), rel=1e-6)
+    assert edge_frac == pytest.approx(int((~prev_was_jump).sum()) / mass.shape[0], rel=1e-6)
+
+    # The branches must be drawn from DIFFERENT states, or the split did nothing.
+    assert 0.0 < edge_frac < 1.0
+    # And it must use column 0, not some other lag: conditioning on prev[:, 1]
+    # would give a different partition on any non-degenerate sample.
+    if sub["prev"].shape[1] > 1 and not torch.equal(sub["prev"][:, 0], sub["prev"][:, 1]):
+        lag1 = jump[sub["prev"][:, 1]]
+        if int((~lag1).sum()) not in (0, mass.shape[0]) and not torch.equal(lag1, prev_was_jump):
+            assert edge != pytest.approx(float(mass[~lag1].mean()), rel=1e-9), \
+                "conditioning on lag-1 must not reproduce the lag-0 answer"
+
+
+def test_p_jump_edge_returns_none_rather_than_nan_on_a_one_sided_sample(tmp_path):
+    """A mean over zero states is nan, and a nan printed as %.3e reads as data.
+
+    At p_jump ~2.5e-3 nearly every sampled state has a non-jump predecessor, so
+    the hold branch being empty is the COMMON case, not a corner.
+    """
+    t = Trainer(air_cfg(tmp_path))
+    batch = t.collect(8)
+    obs = batch["obs"]
+    # Force every predecessor to be a jump row -> edge branch empty.
+    jump_row = int((t.net.action_table[:, 5] > 0).nonzero()[0])
+    obs["prev"] = torch.full_like(obs["prev"], jump_row)
+    assert t._p_jump_edge(batch) is None, "empty edge branch must not report a mean"
+
+    # And the mirror: no predecessor is a jump row -> hold branch empty.
+    non_jump = int((t.net.action_table[:, 5] <= 0).nonzero()[0])
+    obs["prev"] = torch.full_like(obs["prev"], non_jump)
+    assert t._p_jump_edge(batch) is None, "empty hold branch must not report a mean"

@@ -392,10 +392,16 @@ impl Engine {
 
     /// Per-term reward telemetry summed over every arena since the last call,
     /// RESET ON READ (E9). Returns `{term_name: float}` with `TERM_NAMES`'
-    /// keys: the first nine are reward contributions, the last four are event
-    /// counts (`touch_events`, `airborne_touch_events`, `goal_events`,
-    /// `agent_steps`) that the farming tripwires are computed from --
-    /// touches/min/car and the airborne-touch fraction have no other source.
+    /// keys: indices 0-8 are reward contributions, 9-19 are event counts
+    /// (`touch_events`, `airborne_touch_events`, `goal_events`, `agent_steps`,
+    /// `gated_aerial_touch_events` and the six `air_touch_z_*` buckets) that the
+    /// farming tripwires are computed from -- touches/min/car and the
+    /// airborne-touch fraction have no other source.
+    ///
+    /// `boost_pickup` (index 20) breaks that prefix/suffix split: it is a REWARD
+    /// appended after the counters, because renumbering is forbidden. Anything
+    /// summing "the reward keys" must include it; `boost_gained` and
+    /// `flip_events` are counts. See `reward::N_TERMS`.
     ///
     /// The bare `TERM_NAMES` keys count EVERY agent-step, including foreign-
     /// and opponent-driven cars: they describe the reward function, not the

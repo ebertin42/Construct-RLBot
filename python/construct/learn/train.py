@@ -1489,8 +1489,61 @@ class Trainer:
             return None
         any_obs = next(iter(obs.values()))
         idx = self._p_jump_idx(any_obs.shape[0], any_obs.device)
-        logits, _ = self.net(**{k: v[idx] for k, v in obs.items()})
+        sub = {k: v[idx] for k, v in obs.items()}
+        logits, _ = self.net(**sub)
         return float(torch.softmax(logits, dim=-1)[:, jump].sum(-1).mean())
+
+    @torch.no_grad()
+    def _p_jump_edge(self, batch) -> tuple[float, float, float] | None:
+        """`p_jump` SPLIT BY WHETHER THE PREVIOUS ACTION WAS A JUMP.
+
+        Returns (edge, hold, edge_frac): mean jump mass on states whose previous
+        action was NOT a jump row (the RISING EDGE), the same on states where it
+        was (the HOLD), and the fraction of sampled states in the edge branch.
+
+        WHY THIS EXISTS AND WHY `p_jump` ALONE IS MISLEADING. RocketSim fires a
+        jump only on a rising edge -- `jumpPressed = controls.jump &&
+        !lastControls.jump` -- and an action held across a whole decision is ONE
+        edge. So a dodge needs jump -> non-jump -> jump across three decisions,
+        and the gating quantity is P(jump | prev was not a jump), NOT the
+        unconditioned mean `p_jump` reports.
+
+        Measured on ck_002078264320 (2.078B steps) over randomized states, the
+        two branches differ by ~2000x: essentially all of `p_jump`'s mass sits on
+        the CONTINUATION branch, which produces no new edge and therefore no
+        dodge and no double jump. `p_jump` overstates edge accessibility by
+        roughly two orders of magnitude, so a rise in it can be pure hold-mass
+        while the behaviour that needs an edge stays impossible. Anything that
+        claims to have restored jumping must move `edge`, not `p_jump`.
+
+        `prev` is [B,5] int64 action indices (model_v1.py:127); column 0 is the
+        immediately-preceding executed action (episode.rs:883-891, ring shifted
+        before the step). None whenever `_p_jump` is None, plus when a branch is
+        empty in this sample -- reporting a mean over zero states would print a
+        confident nan.
+        """
+        tbl = getattr(self.net, "action_table", None)
+        obs = batch.get("obs")
+        if tbl is None or not isinstance(obs, dict) or tbl.ndim != 2 or tbl.shape[1] < 6:
+            return None
+        prev = obs.get("prev")
+        if prev is None or prev.ndim != 2 or prev.shape[1] < 1:
+            return None
+        jump = tbl[:, 5] > 0.0
+        if not bool(jump.any()):
+            return None
+        any_obs = next(iter(obs.values()))
+        idx = self._p_jump_idx(any_obs.shape[0], any_obs.device)
+        sub = {k: v[idx] for k, v in obs.items()}
+        logits, _ = self.net(**sub)
+        mass = torch.softmax(logits, dim=-1)[:, jump].sum(-1)
+        prev_was_jump = jump.to(sub["prev"].device)[sub["prev"][:, 0]]
+        n_edge = int((~prev_was_jump).sum())
+        if n_edge == 0 or n_edge == mass.shape[0]:
+            return None
+        return (float(mass[~prev_was_jump].mean()),
+                float(mass[prev_was_jump].mean()),
+                n_edge / float(mass.shape[0]))
 
     def _reward_terms_line(self) -> str:
         """Per-term reward sums + the §8.3 farming tripwires, per iteration.
@@ -1807,6 +1860,13 @@ class Trainer:
                     # Scientific notation deliberately: the readings that matter
                     # span 1e-5 to 4e-2 and %.3f prints three of them as 0.000.
                     msg += f" p_jump {pj:.3e}"
+                    # `p_jump` alone cannot tell a restored RISING EDGE from pure
+                    # hold-mass, and the two branches differ ~2000x. Only `edge`
+                    # gates dodges and double jumps -- see `_p_jump_edge`.
+                    pje = self._p_jump_edge(batch)
+                    if pje is not None:
+                        msg += (f" p_jump_edge {pje[0]:.3e} hold {pje[1]:.3e}"
+                                f" edge_frac {pje[2]:.3f}")
                 msg += self._reward_terms_line()
                 print(msg, flush=True)
             if it % self.cfg.run.get("save_every_iters", 20) == 0:
