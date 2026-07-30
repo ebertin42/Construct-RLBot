@@ -1,0 +1,659 @@
+# v10 -- run B's train config. IDENTICAL to train_v9_fromscratch.toml except
+# `reward_config_path`, which points at reward_v10_planar.toml. (2026-07-30)
+#
+# Run B is the expendable arm; run A (checkpoints_v9, train_v9_fromscratch.toml)
+# is the control and must not be perturbed. Keeping every other knob byte-equal
+# is what makes the foreign-bot bench a readable A/B: one flag, one difference.
+# Resumed from run B's own newest checkpoint, not forked from A -- the arm bench
+# found no detectable strength difference between the two lineages (t=1.18
+# unpaired, se ~0.064), so B's own weights are a valid contested start and avoid
+# a 100M-step lineage jump.
+#
+# NOTE the earlier entropy arm is OVER and its result is negative: entropy 0.0142
+# raised the jump rising edge from 6.34e-4 to 8.73e-4 (corrected t=+3.39, rho .55,
+# n_eff 41) but the dose-response is ~linear, so reaching a useful 1.9e-2 needs
+# entropy ~0.31 = 52x baseline. B was returned to 0.006 before this change so the
+# reward flag is the only live variable.
+#
+# v9 -- FROM SCRATCH, equal 1s/2s/3s, air play, external opposition in EVERY
+# regime. (2026-07-26). Fresh net, NOT a fine-tune.
+#
+# v8's three structural problems, and v9's answers:
+#   1. 3v3 had 9.9% of learner rows and 1.4% of gradient mass, zero 3v3
+#      self-play, and zero external opposition at any team size above 1v1.
+#      -> [6,3,2] arenas + per-BLOCK opponent placement (33.7/33.4/32.9% rows).
+#   2. ppo.py normalised advantages ONCE, GLOBALLY, so a 3v3 row's advantage
+#      stayed ~9.5x smaller than a 1v1 row's and one entropy_coef meant two
+#      different things. That IS the L6 mechanism.
+#      -> per-team-size advantage standardisation ([ppo] adv_norm = "group").
+#   3. Nothing in reward.rs paid for air play.
+#      -> configs/reward_v9_aerial.toml.
+#
+# Launch: python -m construct.learn.train configs/train_v9_fromscratch.toml
+# (fresh net, UNBOUNDED). Read NOTHING from the first ~20M steps (L7).
+
+# v1_air, NOT v1: the 104-row action table (v1.1's 92 + a doubled 12-row
+# clean-air block). THE ACTION TABLE SETS THE POLICY'S OUTPUT DIMENSION, so it
+# can only ever be chosen at a from-scratch launch -- this is the one chance.
+#
+# v1.1 cannot express "jump without air roll" AT ANY INDEX: its handbrake is
+# derived from rotation (`hb = jump && (pitch||yaw||roll)`) and its aerial loop
+# skips `jump && yaw`, so 18 of its 20 jump rows force an air roll and 17 of
+# them are dodges (a dodge CANCELS an aerial). Measured on the two tables:
+#
+#                                     v1.1 (92)      v1-air (104)
+#   clean jump (jump, no yaw/roll/hb)  2  2.17%      14  13.46%
+#   jump+boost, no yaw/roll, no roll   1  1.09%       7   6.73%
+#   P(clean jump | jump)                  10.0%          43.8%
+#   P(hold 3 = a full-height takeoff)  1.03e-5        2.44e-3   (237x)
+#     -> per 93,440-row iteration        0.96 ->        228
+#     -> per car, one every            108 min ->      27 s
+#
+# reward_v9_aerial.toml's own numbers say every height it pays for is above a
+# hop (hop 231.9, double jump 393.6, hop+boost 612.6, full aerial 1238.1, with
+# aerial_z_lo = 400), and all of those need the sustained clean jump v1.1 makes
+# unsamplable. No reward can shape a sequence that is never tried -- v9 had the
+# air-reward half of ZealanL's prescription (RLGym-PPO-Guide, the RocketSim
+# author, who names our exact symptom: "bots naturally forget jumping") and not
+# the "doubling jump actions in discrete action parsers" half. Append-only, so
+# schema/v1.toml and every existing checkpoint are untouched.
+#
+# CONSEQUENCE FOR READING THE LOGS: ln(N) moves 4.5218 -> 4.6444 (+2.7%), so
+# entropy and entropy_ratio are NOT comparable to v8's, and this run's
+# entropy_coef is measured against a 2.7% larger ceiling.
+# CONSEQUENCE FOR GATING: one Engine binds ONE table, so a v1-air checkpoint
+# and the 92-row champion cannot share an engine instance -- cross-table
+# evaluation needs one engine per side.
+schema_path = "schema/v1_air.toml"
+reward_config_path = "configs/reward_v10_planar.toml"   # v10: ONLY diff vs run A
+curriculum_config_path = "configs/curriculum_v3_match.toml"
+
+[env]
+# 144, not v8's 192: [6,3,2] at 192 gives 628 cars (1.36x v8) AND 487 rows
+# (1.61x), a ~1.6x slower iteration. 144 lands at 470 cars ~= v8's measured 462,
+# so throughput is preserved while the mix changes. The invariant that matters
+# is a_m proportional to 1/m, not the total -- scale to 192 later if the box has
+# headroom, keeping [6,3,2].
+num_arenas = 144
+blue = 1        # INERT. lib.rs: when team_size_weights is set, blue and orange
+orange = 1      # are ignored entirely (each mixed arena is (s,s)).
+seed = 0
+# EQUAL LEARNER ROWS, which is the only "equal" that means anything.
+# Equal ARENAS gives rows 1:2:3 (17/33/50%), not equal. With foreign and league
+# placed as the same fraction INSIDE EACH BLOCK, rows_m = a_m * m * (2 - phi -
+# lambda), so equal rows <=> a_m ~ 1/m <=> 6:3:2, INDEPENDENT of opponent_frac
+# and the league fraction. Retune either and the split stays balanced.
+#
+# At 144: allocate_team_sizes -> 79 / 39 / 26 arenas.
+#   1v1: 26 foreign + 9 league + 44 self ->  26 +  9 +  88 = 123 rows (33.7%)
+#   2v2: 13 foreign + 4 league + 22 self ->  26 +  8 +  88 = 122 rows (33.4%)
+#   3v3:  9 foreign + 3 league + 14 self ->  27 +  9 +  84 = 120 rows (32.9%)
+#   total 365 learner rows/step, 470 cars simulated.
+# External-opposition share of EXPERIENCE (L5) = phi/(2-phi-lambda) = 21.5% in
+# EVERY regime, plus 7.1% league. v8's tuned target was 24.4% -- same band, now
+# uniform instead of 100%/0%/0%.
+#
+# THAT IS THE LEAGUE-LIVE BUDGET AND IT IS *NOT* WHAT THIS RUN LAUNCHES WITH.
+# The league pool is empty for a v1-air run until v9 promotes its own first
+# checkpoint (see [league] at the bottom of this file), so all 16 league arenas
+# start as self-play. Measured through the same plan_block_assignment:
+#   1v1: 26 foreign +  0 league + 53 self ->  26 + 106 = 132 rows (33.8%)
+#   2v2: 13 foreign +  0 league + 26 self ->  26 + 104 = 130 rows (33.2%)
+#   3v3:  9 foreign +  0 league + 17 self ->  27 + 102 = 129 rows (33.0%)
+#   total 391 learner rows/step, 470 cars simulated (cars do not move -- a
+#   league arena and a self-play arena both hold 2m cars).
+# THE EQUAL-ROWS INVARIANT SURVIVES, which is the property [6,3,2] exists for:
+# rows_m = a_m * m * (2 - phi - lambda), so dropping lambda to 0 rescales all
+# three blocks by the same factor and the split stays 33.8/33.2/33.0. What DOES
+# move is the external share, 21.5% -> 19.7/20.0/20.9%, still inside v8's band.
+#
+# CONSEQUENCE FOR EVERY "93,440 rows/iter" BELOW: that is 365 x 256, the
+# league-live batch. At launch the batch is 391 x 256 = 100,096 rows (+7.1%).
+# Nothing in the arguments below turns on the difference -- minibatches go
+# 12 -> 13 per epoch (36 -> 39 Adam steps/iter), per-group rows 31,488 ->
+# ~33,300 (still 16x over min_group_rows), and the fresh-net advantage
+# statistics were measured per row. The batch shrinks back to 93,440 the
+# iteration after the league fills.
+team_size_weights = [6, 3, 2]
+
+[net]
+d_model = 128
+layers = 2
+heads = 4
+ff = 512
+
+[ppo]
+rollout_steps = 256
+gamma = 0.9954
+lam = 0.95
+# LR: LAUNCH AT 3e-4, ANNEAL TO 1e-4 LATER. The guide (ZealanL, RLGym-PPO-Guide
+# learner_settings.md) stages it 2e-4 "cannot score" / 1e-4 "attempting to score"
+# / <=0.8e-4 "complex mechanics", and v9 is one run that crosses all three. Two
+# things stop us from simply adopting 1e-4 up front:
+#
+# 1. THE GUIDE'S NUMBER IS NOT ON OUR SCALE. rlgym-ppo's minibatch is a GRADIENT-
+#    ACCUMULATION chunk -- its ppo_learner zero_grads once, backwards each
+#    minibatch, then steps ONCE per ppo_batch_size (= ts_per_iteration) -- so at
+#    2-3 epochs it takes 2-3 Adam steps per iteration. ppo.py steps per MINIBATCH:
+#    93,440 rows / 8192 = 12 minibatches x 3 epochs = 36 Adam steps per iteration.
+#    Adam's step is ~lr in size regardless of batch size, so at an EQUAL lr our
+#    loop already moves the weights ~12x further per iteration than the guide's.
+#    Porting 1e-4 across without that correction is not "the guide's setting".
+#    (It also has separate policy and value NETWORKS, hence its "keep policy_lr =
+#    critic_lr" advice; EntityPolicyNet is one shared trunk with two heads and one
+#    Adam, so that advice is satisfied by construction and value_coef = 1.0 is the
+#    knob that plays the role of critic_lr here.)
+#
+# 2. OUR INSTRUMENT SAYS 3e-4 IS NOT AGGRESSIVE EARLY. clip_frac from the v8
+#    from-scratch run (checkpoints_scratch/train_remote.log, lr 3e-4, mb 8192,
+#    same rollout, first contiguous segment), mean over 100-iter windows:
+#      iters    1- 400  clip 0.007-0.019 (max 0.039)  ent 4.48->4.35  ep_rew flat ~240-355
+#      iters  401- 600  clip 0.050-0.064               ent 4.17->3.88  ep_rew 509->745   <- ignition
+#      iters  601-2200  clip 0.067-0.094 (max 0.144)   ent 3.8 ->3.6   ep_rew 855->1250
+#    A clip=0.2 trust region with clip_frac at 0.007-0.019 is barely engaged: for
+#    the first ~32M steps the update is an order of magnitude BELOW the usual
+#    healthy 0.1-0.2 band, and ignition only came at ~35-40M steps. Cutting lr at
+#    launch lengthens exactly that window -- and v9 makes the early problem harder,
+#    not easier (2/3 of rows are 2v2/3v3, where per-car reward events are ~3x
+#    rarer). The champion, the only policy this project has that beats every
+#    internal arm, was itself trained at lr 3e-4 / mb 8192 (verified in
+#    checkpoints_champions/ck_001171502080.pt's stored ppo block).
+#    HONEST LIMIT: clip_frac only proves the trust region is not being violated.
+#    It is NOT sensitive to the failure the guide's low lr is meant to prevent --
+#    the 320M->592M skill decay (journal, I(S;A) collapse) happened with clip_frac
+#    looking exactly this healthy. So the low-clip reading justifies "not lower at
+#    LAUNCH"; it does not justify "3e-4 forever".
+#
+# Hence the anneal, and hence its shape: 3e-4 flat to 200M steps, then linear to
+# 1e-4 by 600M. The hold is chosen so the schedule is A NO-OP FOR THE ENTIRE
+# WINDOW IN WHICH v9 IS JUDGED -- L7 says read nothing before ~20M, the G-gates
+# land well inside 200M, and v8's whole "cannot score"/"attempting to score" arc
+# finished by ~114M. By the time the ramp bites, this run has already been decided
+# by the five other things v9 changes; the lr is not competing with them for the
+# explanation. 1e-4 rather than 0.8e-4 because of (1) above: at 36 Adam steps per
+# iteration the difference between those two is far below anything we can measure,
+# and 1e-4 is the value the guide names for the stage v9 will actually be in.
+#
+# RISK, stated plainly: the anneal is a NEW MECHANISM (train.lr_at) on a launch
+# that already moves reward, arena mix, advantage normalisation and the opponent
+# ladder. It is mitigated by being an exact no-op when lr_final is absent (every
+# other config), by being keyed on total_steps so a resume cannot rewind it, and
+# by `resume_train.py --lr / --lr-final` being the kill switch. Delete these three
+# lines and v9 is a flat-3e-4 run, byte-identical to v8's setting.
+lr = 3e-4
+lr_final = 1e-4
+lr_hold_steps = 200_000_000
+lr_anneal_steps = 400_000_000
+clip = 0.2
+# THE change that makes equal shares survivable. ppo.py used to do
+#     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+# ONCE over the whole mixed batch -- a single scalar, which preserves the
+# measured 9.48x 1v1:3v3 magnitude ratio EXACTLY (mean|TD advantage| on
+# ck_001283829760: 1v1 0.2275 / 2v2 0.0322 / 3v3 0.0240). Row count cannot fix
+# this: the entropy pull and the useful signal BOTH scale linearly with a
+# group's row count, so their ratio is share-independent and collapse is decided
+# purely by per-row |A|/entropy_coef. That is why v8 had to skew the arena mix
+# instead, and why the skew then collapsed 1v1 (L6's second failure).
+#
+# "group" standardises within each team size (label comes from the engine via
+# collect()["learner_team_size"] -- NEVER derived in Python, the worker split is
+# (num_arenas - assigned)/(threads - t) with auto-detected threads and a silent
+# mis-label would mis-scale everything undetectably). Returns are NOT touched,
+# so the critic target is unchanged.
+#
+# WHEN IT ACTUALLY BITES -- measured on the launch config (144 arenas, [6,3,2],
+# fresh net, two independent 93,440-row batches): under GLOBAL normalisation the
+# per-group mean|A| are 0.285/0.211/0.245 and 0.263/0.204/0.218, a 1v1:3v3
+# spread of only 1.16-1.21x. The 9.48x quoted above is a property of a TRAINED,
+# ball-touching policy (ck_001283829760), not of a random one. So at launch
+# adv_norm = "group" is close to a no-op and provides no protection during the
+# early window; it earns its keep as the policy starts scoring and the 1v1
+# advantage scale pulls away. Set the entropy coef for the LAUNCH regime, not
+# for the regime this line protects.
+#
+# sigma_g is floored at 0.05*sigma_batch. The 0.285/0.0404/0.0301 sigmas that
+# number was originally derived from were BACK-COMPUTED from mean|A| through a
+# Gaussian identity that the real advantage distribution does not satisfy (see
+# entropy_coef below). MEASURED sigma per group on the launch config is
+# 0.55/0.36/0.44 against sigma_batch 0.457, i.e. the smallest group sits at
+# 0.79*sigma_batch and the floor is 16x below it -- nowhere near binding. The
+# floor is safe, just not for the stated reason. Floor hits are logged as
+# adv_group_floor_hits and must stay 0.
+# "global" = historical behavior, byte-identical. Every other config keeps it.
+# KILL SWITCH on a resume: scripts/resume_train.py --adv-norm global.
+adv_norm = "group"
+min_group_rows = 2048      # a group smaller than this folds into the global
+                           # pool rather than being standardised on noise.
+                           # Actual per group here is 31,488 rows -- 15x over.
+group_std_floor = 0.05
+# STAYS AT v8's 0.003. It was raised to 0.006 on the reasoning that under group
+# normalisation mean|A_norm| = sqrt(2/pi) = 0.798 in every group, so 0.006 would
+# buy 133x. That is a GAUSSIAN identity and the advantage distribution violates
+# it by ~3.3x. MEASURED on the exact launch config (144 arenas, [6,3,2],
+# reward_v9_aerial, fresh net, two independent 93,440-row batches):
+#   group-normalised mean|A|/sigma_g:  1v1 0.236/0.237  2v2 0.270/0.240
+#                                      3v3 0.255/0.214
+#   kurtosis of the advantage:         98 - 388   (Gaussian = 3)
+# The tails are what break the identity: on a fresh net almost every row has a
+# near-zero advantage and a handful are enormous, so sigma is set by the tail
+# while mean|A| is set by the bulk.
+#
+# Bounded by the only two calibration points that exist, both measured:
+#   coef 0.01, mix [0.7,0.2,0.1]: 1v1 121.7x -> HEALTHY (element p4 0.469)
+#                                 3v3  12.8x -> COLLAPSED (95% of uniform)
+# THE 0.24 IS SPECIFIC TO rollout_steps = 256. Measured on a scaled-down smoke
+# of this same config (24 arenas, rollout_steps 16) the same log line reads
+# |A| 0.72-0.81, i.e. almost exactly the Gaussian 0.798 -- a 16-step GAE sum
+# cannot contain a goal spike, so the tail that breaks the identity is not there.
+# Do not "disprove" the 0.24 with a smoke run; read it at the launch rollout.
+#
+# At the measured 0.24, 0.006 is 40x -- BELOW the only ratio ever measured
+# healthy and only ~3x above the only one measured collapsed, and the failure it
+# is closest to is the one that turns 3v3 into uniform-random. 0.003 is 80x.
+# ~0.002 would hit the 121.7x anchor numerically, but that anchor is NOT a like-
+# for-like number: it was measured on a TRAINED policy under GLOBAL
+# normalisation, where 1.217 is the 1v1 group's mean|A| divided by the whole
+# batch's sigma. Nobody has measured group-normalised mean|A_norm| on a trained
+# policy, so tuning to hit 121.7x exactly is false precision. 0.003 is the value
+# team play was measured to commit at, it is one fewer thing moving next to
+# adv_norm = "group", and it leaves 0.006 as the clean A/B.
+#
+# The reason 0.003 is not simply a repeat of v8's second failure: at 0.003 the
+# policy DID specialise and 1v1 collapsed (element p4 0.417 -> 0.03-0.11 on two
+# seeds) -- but that specialisation had a DIRECTION only because the experience
+# mix was [0.7,0.2,0.1]. Equal rows remove the majority to specialise toward,
+# which is the whole point of [6,3,2]. If 1v1 falls anyway on this mix, that is
+# new information and the A/B to 0.006 is the response, not the starting point.
+#
+# DO NOT re-derive this from an identity. The trainer prints mean|A_norm| PER
+# GROUP every iteration ("grp 1v1 33.7%|A|0.223 ..."); read the real number off a
+# real run after ~20M steps (L7) and divide.
+entropy_coef = 0.003
+value_coef = 1.0
+epochs = 3
+# STAYS AT 8192, against the guide's 25,000-50,000. 365 rows x 256 steps =
+# 93,440/iter -> 12 minibatches per epoch (11 full + a 3,328-row remainder),
+# x3 epochs = 36 Adam steps per iteration.
+#
+# WHY NOT 25,000. The guide's number is measured in a loop with different
+# semantics: rlgym-ppo's PPOLearner zero_grads once per BATCH, calls backward()
+# on each minibatch, and steps the optimizer ONCE after the whole batch -- its
+# minibatch is a VRAM/accumulation chunk and changing it does not change how many
+# times the weights move. ppo.py steps per minibatch. So 8192 -> 25,000 would not
+# be "the guide's setting"; here it silently cuts the optimizer from 36 steps per
+# iteration to 12 (50,000 -> 6), which is a ~3x deceleration stacked on top of the
+# lr change, i.e. ~9x in aggregate, applied to a run that already needed ~35-40M
+# steps to reach first ignition at the FAST setting.
+#
+# The half of the guide's advice that DOES port, we already satisfy:
+# ts_per_iteration 50k early / 100k on ball contact / 200-300k when scoring --
+# 93,440 sits in the middle band -- and 2-3 epochs, where we run 3.
+#
+# 8192 is also the only value with local evidence: the champion
+# (ck_001171502080, 192 1v1 arenas -> 98,304 rows/iter) trained at 8192 = 12
+# minibatches = 36 Adam steps/iter, which v9 reproduces almost exactly, and v8
+# (77,312 rows/iter) at 30.
+#
+# NOT AN ARGUMENT FOR RAISING IT: group standardisation. `standardise_advantages`
+# is called ONCE on the FULL batch in ppo_update, BEFORE the epoch/minibatch
+# loops, so `min_group_rows = 2048` is compared against 31,488 rows per group no
+# matter what this number is -- minibatch size cannot change how often a group
+# folds into the global fallback. And per-minibatch group composition is not
+# fragile either: at 8192 rows and a 1/3 share the count per group is 2731 +/- 43
+# (1.6%), on advantages that are already unit-scaled per group.
+#
+# THE ONE REAL ARGUMENT FOR A LARGER MINIBATCH is gradient noise per step: the
+# advantage distribution measured on this exact launch config has kurtosis 98-388
+# (see entropy_coef above), so an individual minibatch's gradient can be set by a
+# handful of goal spikes. That argues for accumulating gradients, not for fewer
+# optimizer steps -- and ppo.py has no accumulation path. Adding one is a bigger
+# change than v9 should carry; revisit it as a standalone A/B.
+minibatch_size = 8192
+
+[run]
+device = "cuda"
+checkpoint_dir = "checkpoints_v9"
+save_every_iters = 20
+log_every_iters = 1
+
+# --- foreign opponents: TWELVE slots = (bot x team size) --------------------
+# L3 said difficulty is per BOT and is not the bot-vs-bot ladder order (at a
+# shared p4 vs ck_001171502080: immortal 0.896, element 0.677, necto 0.615*,
+# nexto 0.146).  *pre-2026-07-26 instrument -- see the NECTO CAVEAT under
+# decision_periods below. Measurement extends that to team size: the same net vs nexto
+# scores 41:21 at 1v1 p6 but 4:115 at 3v3 p6. One period per BOT would apply one
+# rung to wildly different regimes, so each (bot, mode) gets its own slot.
+#
+# Nexto and Necto are EARL attention models that size their obs from
+# state.cars.len() and were 1s-3s bots in the wild; measured over 9000
+# steps/arena vs a random opponent, goals/600s are 67/71/67 (nexto) and
+# 62/61/65 (necto) at 1v1/2v2/3v3.
+#
+# ELEMENT AND IMMORTAL ARE NO LONGER 1v1-ONLY (2026-07-26). This file used to
+# say they were, and confined them to the 1v1 block, because AdvancedObs-107 is
+# literally "self + ONE other car" and build_advanced_obs overran its buffer at
+# 2v2. That treated a property of the EXTRACTED ARTIFACT as a property of the
+# bot: upstream RLMarlbot shares the limitation (its advanced_obs.py loops over
+# all other cars with no padding, so it would emit 169 floats into a 107-wide
+# net), but nothing stops US truncating. Above 1v1 they now see the OPPONENT
+# NEAREST THE BALL and nothing else -- not their teammates, not the other
+# opponents (engine obs_advanced::build_advanced_obs_one_other).
+#
+# Measured, 4000 steps/row x 3 seeds vs a random opponent: a truncated
+# element/immortal at 2v2 and 3v3 is indistinguishable from the same bot at
+# 1v1. element goals/600s 58+-5 (3v3) vs 61+-5 (1v1), ball-facing 0.570 vs
+# 0.555, approach 0.579 vs 0.531; no spin (ground |ang_vel.z| 0.8-1.1 rad/s vs
+# a 5.5 cap), no idling, zero insane physics states. Against nexto they track a
+# NON-truncated necto control cell for cell as team size grows, so the collapse
+# with team size is the cost of playing nexto, not the cost of truncation. At
+# 1v1 the truncated builder is BYTE-IDENTICAL to the old one (regression-tested
+# in engine/tests/immortal_obs_test.rs), so every existing 1v1 bench row stays
+# comparable -- unlike the necto reset fix, this change invalidates nothing.
+#
+# WHY BOTHER: they are the two EASIEST bots we have (at a shared p4: immortal
+# 0.896, element 0.677 vs nexto 0.146) and were excluded from exactly the two
+# blocks where the net is weakest and the rung controller has nowhere easier to
+# go -- M0 measured necto/3v3 at 0.278/0.222, below the band AT the floor. They
+# are also ~5x cheaper per car-forward than nexto at 3v3 (0.23-0.26 ms vs
+# 1.29 ms), and the 3v3 block currently runs only the two expensive bots.
+#
+# HONEST LABEL: above 1v1 these two are a DEGRADED LOCAL VARIANT, not the
+# ported bot. "We beat Element at 3v3" is meaningless outside this repo. Keep
+# bench_foreign.py / Immortal-1v1 as the absolute ruler
+# (`champion-unbeaten-external-lever`). See docs/foreign-opponents.md.
+#
+# TRIPWIRE: the bot cannot see 1 (2v2) or 3 (3v3) of our cars, so "occupy the
+# visible slot with car A, walk car B in" is a free goal that exists against no
+# real opponent -- the `replay-bc-cannot-play` failure mode of training against
+# an arm with a structural hole. Three things bound it: near-ball selection
+# means the car contesting the ball IS the visible one; the [0.35,0.65] band
+# caps how much experience can come from a slot we are farming; and these are 4
+# of 12 slots. If win share against an element/immortal TEAM slot ratchets to
+# the easy pin and STAYS there while the nexto/necto slots do not, that is the
+# exploit -- pull the slots.
+#
+# 12 slots is EXACTLY the cap in lib.rs (`set_foreign_opponents`:
+# `opponents.len() > 12`), raised from 8 for these four. A fifth bot, or a bot
+# at a fourth team size, requires raising it again. The trainer asserts this at
+# startup rather than letting a worker error out mid-run.
+[foreign]
+enabled = true
+slots = [
+  { kind = "element",  mode = 1, weights = "~/.cache/construct/element_weights.npz" },
+  { kind = "immortal", mode = 1, weights = "~/.cache/construct/immortal_weights.npz" },
+  { kind = "necto",    mode = 1, weights = "~/.cache/construct/necto_weights.npz" },
+  { kind = "nexto",    mode = 1, weights = "~/.cache/construct/nexto_weights.npz" },
+  { kind = "necto",    mode = 2, weights = "~/.cache/construct/necto_weights.npz" },
+  { kind = "nexto",    mode = 2, weights = "~/.cache/construct/nexto_weights.npz" },
+  # NEW 2026-07-26 -- truncated obs (nearest opponent to the ball only).
+  { kind = "element",  mode = 2, weights = "~/.cache/construct/element_weights.npz" },
+  { kind = "immortal", mode = 2, weights = "~/.cache/construct/immortal_weights.npz" },
+  { kind = "necto",    mode = 3, weights = "~/.cache/construct/necto_weights.npz" },
+  { kind = "nexto",    mode = 3, weights = "~/.cache/construct/nexto_weights.npz" },
+  { kind = "element",  mode = 3, weights = "~/.cache/construct/element_weights.npz" },
+  { kind = "immortal", mode = 3, weights = "~/.cache/construct/immortal_weights.npz" },
+]
+# PER BLOCK, not of the whole run. 1/3 of each block's arenas get a foreign
+# opponent: 26 of 79 (1v1), 13 of 39 (2v2), 9 of 26 (3v3) = 48 total. Under v8's
+# front-stamping this fraction would have overflowed the 1v1 block and hard-
+# errored; per-block placement is what makes it expressible at all.
+#
+# Every block now round-robins over FOUR slots of its own mode: the 1v1
+# block's 26 arenas over 4 (6-7 each), the 2v2 block's 13 over 4 (3-4 each),
+# the 3v3 block's 9 over 4 (2-3 each). A block only ever receives slots of its
+# own mode.
+#
+# The team blocks are THIN in training arenas per slot (2-4), which is fine and
+# is not what the band is calibrated on -- the auto-curriculum reads the
+# separate eval engines (`eval_arenas_by_mode` below, held at 6 arenas/slot),
+# not the training assignment. Training experience per slot being uneven across
+# a block just means a slot's arenas contribute proportionally; it does not
+# bias any rung decision.
+opponent_frac = 0.3333
+
+# COLD-START RUNGS. NOT v8's [4,3,4,5] -- those were benched against a
+# 1.17B-step champion and are four WALLS for a random net (D1/L7).
+#
+# NOT p12 EITHER, which is what this line said until it was measured. M0 (the
+# pre-launch task this file used to defer) is ~7 minutes of engine time, not
+# hours: build the Trainer from THIS config with a fresh random net and call
+# `_measure_foreign_winrates({m})` per mode -- 18 matches/slot, the same n the
+# [0.35,0.65] band is calibrated for. Result, TWO INDEPENDENT RUNS of the p24
+# column (one on a busy box, which the `gates-need-an-idle-box` lesson says
+# biases our win share ~2-3 points LOW):
+#
+#             1 car, p12          1 car, p24 (ladder index 11)
+#             (the old seeds)     run A     run B (busy box)
+#   mode 1  element  0.083        0.389     0.306
+#           immortal 0.114        0.295     0.405
+#           necto    0.056        0.444     0.361
+#           nexto    0.167        0.389     0.500
+#   mode 2  necto    0.028        0.417     0.306
+#           nexto    0.083        0.417     0.417
+#   mode 3  necto    0.000        0.278     0.222
+#           nexto    0.028        0.639     0.417
+#
+# Seven of eight slots sit >=2 sd below the band at p12 -- the same D1/L7 failure
+# v8's seeds were rejected for, reproduced with a different number. At p24 the
+# two runs agree on the shape (5-6 of 8 in band, the rest just under 0.35) and
+# disagree slot-by-slot by up to 0.15, which is exactly the 0.085-0.118 single-
+# eval sd the band was sized for -- do not read a single slot off one run. The
+# controller does recover from p12, but slowly: under
+# the staggered eval a slot is measured every 60 iters, a rung change resets its
+# EMA and the dwell costs 2 more measurements, so even with the 2-rung jump the
+# slots only reach p24 around iteration 200-240 ~= 22-35M learner steps. That is
+# 21.5% of the experience in EVERY regime spent uncontested during exactly the
+# window `regime-change-needs-a-contested-start` says must start near 50%.
+#
+# necto at 3v3 (0.278 / 0.222, the weakest slot in BOTH runs) still wants a rung
+# easier than p24, which is why `period_ladder` below now extends past it. It
+# gets there in one controller step instead of never.
+#
+# NECTO CAVEAT: run A's necto rows were measured on the pre-2026-07-26 engine,
+# which leaked necto's boost/demo clocks across episode resets (see
+# engine/src/foreign.rs::reset_car). necto is the ONE bot whose numbers moved.
+# Run B is on the post-fix build, and necto's rows did not move outside the
+# single-eval sd -- but necto is also the one bot measured NOT to be bit-
+# reproducible run-to-run even within one build, so treat its rungs as the
+# noisiest four of the eight.
+# THE FOUR NEW SLOTS WERE MEASURED, NOT COPIED (2026-07-26). Same instrument
+# (`_measure_foreign_winrates({2,3})`, fresh random net, 6 arenas/slot ~= 18
+# matches, 352 s), so these are directly comparable to the p24 columns above:
+#
+#            slot           1 car, p24    prior run A / run B
+#   mode 2   necto             0.361         0.417 / 0.306
+#            nexto             0.472         0.417 / 0.417
+#            element  (NEW)    0.333            --
+#            immortal (NEW)    0.389            --
+#   mode 3   necto             0.333         0.278 / 0.222
+#            nexto             0.611         0.639 / 0.417
+#            element  (NEW)    0.417            --
+#            immortal (NEW)    0.472            --
+#
+# The four pre-existing slots reproduce their earlier columns within the
+# 0.085-0.118 single-eval sd, which is what licenses reading the new ones off
+# the same run. The mode-1 block was re-measured on the SAME build as a
+# regression check that truncation is inert at 1v1 -- element 0.361, immortal
+# 0.333, necto 0.361, nexto 0.389 against run A/B's 0.389/0.306, 0.295/0.405,
+# 0.444/0.361, 0.389/0.500: every slot within one sd, nothing moved. (The
+# byte-identity of the truncated and untruncated obs at 1v1 is also asserted
+# directly, engine/tests/immortal_obs_test.rs.) Three of the four new slots land IN the [0.35,0.65] band at
+# p24 and element/2v2 sits 0.017 under it -- well inside one sd -- so p24 is
+# the right seed for all twelve and the controller starts contested in every
+# regime. That is the `regime-change-needs-a-contested-start` requirement, and
+# it is the first time the 2v2 and 3v3 blocks have had a slot that starts there
+# rather than climbing to it.
+#
+# THE 1v1 EASINESS ORDERING DID NOT SURVIVE TRUNCATION -- measuring this was
+# the point. At 1v1 element is one of the two EASIEST bots (0.677 vs nexto's
+# 0.146 at a shared p4), but truncated at 2v2 it is the HARDEST of the four
+# (0.333 vs nexto 0.472). Blinding a bot to most of the arena does not make it
+# easier to beat in any simple way: it keeps chasing the ball, and at 2v2 that
+# is still a competent opponent. Seeding these from the 1v1 ordering would have
+# started them ~2 rungs too easy.
+#
+# All twelve at ONE car: `foreign_cars` is the knob the controller leans on
+# above 1v1, but the probe measured it to have weak authority for these two --
+# blind cars crowd the ball, and element's touches/min/car fall 44.7 (1 car) ->
+# 14.5 (3 cars) while the goal rate vs random moves 54 -> 58, inside noise. Let
+# the period ladder do the work for the new slots.
+foreign_cars = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+decision_periods = [24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24]
+
+[foreign.auto_curriculum]
+enabled = true
+# TWO knobs per slot, controlled LEXICOGRAPHICALLY, because measurement shows
+# decision_period has almost no authority above 1v1: same net, reward_v0 tape,
+# 3v3 goal share for us at nexto p12/p24/p48/p96 = 0.092/0.256/0.314/0.371 --
+# at ONE DECISION EVERY 6.4 SECONDS a full nexto team still out-scores us. At
+# 1v1 the same knob sweeps 0.02 -> 0.95 across p1->p12. Car count is the knob
+# that works at m>1, and a partial foreign team (1 nexto + 2 mirrors of our own
+# policy) is a CONTESTED arena by construction.
+#
+#   too easy: period index -= 1; if pinned, foreign_cars += 1 and reset the
+#             period to the EASIEST in the new car count
+#   too hard: period index += 1; if pinned, foreign_cars -= 1 and reset the
+#             period to the HARDEST in the new car count
+# This is monotone BY CONSTRUCTION OF THE RULE, so we never need to know a
+# priori whether (2 cars, p12) is harder than (1 car, p1) -- the controller
+# finds out. ANY change resets that slot's EMA (stale evidence ratchets twice --
+# regression-tested by test_auto_curriculum).
+# Extended past 24 (2026-07-26). A slot pinned at the easiest rung with ONE
+# foreign car has nowhere to go: `_rung_easier` tries `foreign_cars -= 1` and
+# returns, so it sits there losing forever. M0 measured immortal at 0.295 and
+# necto/3v3 at 0.278 at 1c/p24, i.e. below the band AT THE EASIEST EXPRESSIBLE
+# RUNG. 32 and 48 cost nothing (a slot that does not need them never visits
+# them) and they are appended at the EASY end so every existing ladder index is
+# unchanged. The 3v3 sweep says the knob still has authority out there: nexto
+# 3v3 goal share p12/p24/p48/p96 = 0.092/0.256/0.314/0.371.
+#
+# TRIMMED BACK TO p24 AS THE FLOOR (2026-07-26, second edit). The extension
+# above was reasoned from a COLD-START measurement -- a random net that could
+# not reach the band at p24 -- and it was right about that. What it did not
+# anticipate is what a trained net does with an escape hatch: v9's element/1v1
+# slot walked DOWN to p32 and then sat at a comfortable 0.567 for 210M steps,
+# inside the band and therefore never touched again. A rung the controller is
+# happy with is a rung the policy is never forced past. v8's ladder floor was
+# p12 and its 1v1 slots had to learn their way out of it; that is the difference
+# the exploration diagnosis is pointing at (67 of 104 action rows dead here
+# against 2 of 92 in v8 at the same stage).
+#
+# THE PRICE, stated because it is the exact risk the extension was added for:
+# a slot that genuinely cannot hold 0.35 at 1c/p24 is now pinned at the easiest
+# expressible rung and will sit below the band losing. M0's weakest cold-start
+# reads were necto/3v3 0.278/0.222 and immortal/1v1 0.295. If a slot parks under
+# 0.35 for tens of millions of steps AFTER the warmup, the honest response is to
+# put its rung back (a two-character edit), not to widen the band.
+#
+# TRIM SAFETY, checked rather than assumed: p24 is `decision_periods`' seed and
+# is the LAST entry here, so a cold start seeds every slot at index 11 and no
+# index can run off the end -- `_rung_harder` only ever decrements from a valid
+# index or resets to len-1, `_rung_easier` only increments below len-1 or resets
+# to 0. A checkpoint whose stored rung was p32 (5 team slots were expected
+# there) restores onto the NEAREST surviving entry, p24 -- one rung in the old
+# ladder -- because `_restore_curriculum_state` re-derives the index from the
+# stored PERIOD whenever the stored index no longer names it. p48 would land on
+# p24 as well, which is two rungs; nothing is measured to be out there, but that
+# is the one case where a restore moves a slot further than one step.
+period_ladder = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24]
+band = 5.0                 # ep_rew fallback only
+# 20 -> 40 (2026-07-26). With `eval_stagger` a slot is measured every
+# `adjust_every * n_modes` iters, so this sets the measurement cadence at 120
+# iters/slot rather than 60. Two reasons. (1) COST: the eval engines now run 12
+# slots at 6 arenas each instead of 8, and every measurement is wall time not
+# spent training. (2) The pairing with `adjust_dwell` below -- halving the
+# cadence and halving the dwell leaves the time a slot must sit still before it
+# may move UNCHANGED at ~120 iters, while cutting the number of full eval passes
+# in half. The band arithmetic (one eval's sd 0.085-0.118 against a
+# [0.35,0.65] half-width of 0.15) is a property of the 18 matches per slot, not
+# of the cadence, so it is untouched.
+adjust_every = 40
+ema_alpha = 0.2            # ep_rew fallback only
+wr_ema_alpha = 0.3
+# Band and dwell are v8's, and they are ONLY valid because matches-per-slot is
+# held at 18 (below). One eval's sd is 0.085-0.118; a +/-0.05 half-width made
+# the controller move on 85-90% of evals and wander 4 rungs. Do not narrow
+# either without redoing that arithmetic.
+win_lo = 0.35
+win_hi = 0.65
+# 2 -> 1 (2026-07-26), and ONLY valid alongside `adjust_every` 20 -> 40 above.
+# The dwell is denominated in MEASUREMENTS but what it is protecting against is
+# acting on a policy that has not changed since the last decision, which is a
+# quantity of ITERATIONS. At 20/2 a slot sat still 3 measurements x 60 iters =
+# 180 iters between moves; at 40/1 it is 2 x 120 = 240. The dwell is shorter and
+# the wait is LONGER, so the L4 simulation's conclusion (move rate 0.11-0.22, a
+# 2-rung settled band at the same mean win rate) is not being weakened here --
+# a slot still folds two independent measurements into its EMA before acting,
+# which is the property that arithmetic actually turned on.
+adjust_dwell = 1
+# ONE EXTENSION to the tested law: a 2-rung move when |ema - 0.5| > 0.35, i.e.
+# ~3 sd outside the band. That is not a noise-driven move, and it buys back the
+# ratchet speed lost to the staggered eval below.
+big_move_margin = 0.35
+# L2: the eval must run the regime it gates. THREE engines, one per team size,
+# each built with the training curriculum (match_mode) and reward_v0.toml, each
+# running its slots at their CURRENT (foreign_cars, period).
+# Round-robin ONE MODE PER CYCLE: a full 8-slot eval at hard rungs costs ~116s
+# wall against ~100s of training per 20 iters (nexto is ~1.9ms per car-forward
+# and a 3v3 arena runs 3 of them per step). Staggering cuts that ~3x and keeps
+# 6 arenas -> ~18 matches per SLOT per measurement, which is what the band above
+# is calibrated against. Each slot is measured every 60 iters.
+#
+# 24/24/24, was 24/12/12 (2026-07-26). SIX ARENAS PER SLOT IS THE INVARIANT,
+# not the arena count: the mode-2 and mode-3 blocks went from 2 slots to 4 when
+# element/immortal joined them, and leaving these at 12 would have halved them
+# to 3 arenas -> ~9 matches/slot. One eval's sd scales as 1/sqrt(n), so that
+# would widen it from 0.085-0.118 to ~0.12-0.17 while the [0.35,0.65] band and
+# the 2-eval dwell stayed sized for 18 -- the controller would start moving on
+# noise, which is exactly the wander the band exists to prevent.
+# The added cost is bounded because the two new slots per block are the CHEAP
+# bots: element/immortal are ~0.23-0.26 ms per car-forward against nexto's
+# 1.29 ms at 3v3, so 12 extra arenas of them cost well under half of the 12
+# existing nexto/necto ones.
+eval_arenas_by_mode = [24, 24, 24]   # 4 slots x 6 arenas at EVERY mode
+eval_stagger = true
+# A match only ends at 300s (~4500 steps). At 3000 steps ZERO matches complete,
+# the win rate is None, and the controller silently falls back to the gameable
+# ep_rew EMA. 14000 -> ~3 matches/arena.
+eval_steps = 14000
+
+# --- league --------------------------------------------------------------
+# PER BLOCK, same as foreign: 9 / 4 / 3 arenas = 16 total (11.1%). Under v8 the
+# league was stamped on the TAIL, which -- with [0.85,0.1,0.05] -- put ALL of
+# 3v3 and most of 2v2 in the league, meaning 100% of 3v3 experience came from
+# one frozen 1v1-trained near-random opponent. That was an accident of tail
+# assignment, not a decision (_refresh_opponents' own docstring flagged it).
+# Value here is SYMMETRY-BREAKING against a frozen opponent, not skill transfer,
+# and it compounds only once a TEAM-trained checkpoint is promoted. The one
+# prior own-lineage league attempt failed its gate at 0.4570 (1v1, near-identical
+# trapped checkpoints) -- different situation, but it is the prior.
+#
+# INERT AT LAUNCH, BY CONSTRUCTION -- LEFT ENABLED ON PURPOSE (2026-07-26).
+# league/registry_champions.jsonl holds exactly one entry, the 92-row champion
+# ck_001171502080. This run decodes with the 104-row v1-air table, and
+# choose_opponents filters the pool by action_table as well as schema_version
+# (schema_version is 1 for BOTH tables and therefore cannot tell them apart),
+# so `choose_opponents(...) == []` at launch -- verified, not assumed. That
+# filter is CORRECT: one engine binds one decode table, so a 92-row arm in this
+# run is not a weaker opponent, it is an unplayable one that set_opponents
+# rejects and _refresh_opponents degrades to "keep previous assignment".
+#
+# Enabled rather than disabled because the condition is temporary and clears
+# itself: the first v1-air checkpoint promoted into this registry becomes a
+# legal pick, and champion_gate/league-tick now stamp `action_table` on the
+# entry so it is recognised as one (before 2026-07-26 they did not, which would
+# have kept the league dead for the life of the run, silently). Until then the
+# 16 league arenas run as self-play -- the [env] block above gives that budget
+# in full, and the trainer prints a loud LEAGUE IS INERT block at startup so
+# the state is on the record from iteration 0 rather than in one line every
+# 200 iterations.
+#
+# To run without it instead: set enabled = false. The arena composition is
+# identical either way at launch; the only difference is whether the run picks
+# the league up mid-flight after a promotion.
+[league]
+enabled = true
+opponent_frac = 0.115
+slots = 4
+registry = "league/registry_champions.jsonl"
+refresh_iters = 200

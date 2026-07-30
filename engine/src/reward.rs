@@ -6,6 +6,34 @@ pub struct RewardConfig {
     pub goal: f32,
     pub touch: f32,
     pub vel_to_ball: f32,
+    /// Fix for `vel_to_ball`'s vertical asymmetry -- prerequisite (b) in
+    /// `T_AIR_HANG`'s block. The projection in `compute_terms` is a full 3-D dot
+    /// clamped at 0 BELOW, so a car that hops under an overhead ball is PAID for
+    /// its +v_z while the descent is FREE rather than charged: a stationary pogo
+    /// earns +5.79/match with zero ball contact. Setting this drops the
+    /// VELOCITY's vertical contribution while the car is airborne (the direction
+    /// stays the true 3-D unit vector, so the scale is unchanged).
+    ///
+    /// Why not a symmetric `clamp(-1.0, 1.0)` instead, which would restore the
+    /// telescoping the clamp destroys and be provably unfarmable? Because it also
+    /// CHARGES a car for retreating, and rotating back to net is correct play.
+    /// That cost is unmeasured here; the pogo income is measured. Do not switch
+    /// to the symmetric form without measuring what it does to rotation.
+    ///
+    /// DEFAULT false ON PURPOSE, two independent reasons:
+    ///   1. `v0_behavior_unchanged_by_new_fields` -- and with it every gate
+    ///      number, every bench number and GOAL_THRESHOLD 9.4 -- is a property of
+    ///      the 3-D form. A default of true would silently invalidate all of them.
+    ///   2. This term pays ~37/match on both live runs, so flipping it is a
+    ///      regime change and needs a ~50% contested start
+    ///      ([[regime-change-needs-contested-start]]).
+    ///
+    /// On the ground `v_z` is ~0 outside wall and ramp play, so the flag is very
+    /// nearly a no-op there. The discontinuity at the ground/air boundary is real
+    /// but small for that reason, and it is preferred over dropping `v_z`
+    /// unconditionally, which would change ground driving too.
+    #[serde(default)]
+    pub vel_to_ball_planar_air: bool,
     #[serde(default)]
     pub aggression_bias: f32, // concede = -goal*(1-bias)
     #[serde(default)]
@@ -827,7 +855,11 @@ pub fn compute_terms(
     let (bp, mp, mv) = (cur.ball.pos, me.state.pos, me.state.vel);
     let d = [bp.x - mp.x, bp.y - mp.y, bp.z - mp.z];
     let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
-    let proj = (mv.x * d[0] + mv.y * d[1] + mv.z * d[2]) / dist;
+    // See `vel_to_ball_planar_air`: airborne +v_z toward an overhead ball is paid
+    // and the descent is free, so a pogo farms this term without touching the
+    // ball. `d` stays the full 3-D separation either way.
+    let mvz = if cfg.vel_to_ball_planar_air && !me.state.is_on_ground { 0.0 } else { mv.z };
+    let proj = (mv.x * d[0] + mv.y * d[1] + mvz * d[2]) / dist;
     let v2b = cfg.vel_to_ball * (proj / 2300.0).clamp(0.0, 1.0);
     r += v2b;
     terms[T_VEL_TO_BALL] += v2b as f64;
@@ -3163,5 +3195,120 @@ mod tests {
         assert_eq!(t[T_AIR_HANG_EVENTS], 0.0,
                    "a car handed its air phase by a RESET must qualify zero times");
         assert_eq!(t[T_AIR_HANG], 0.0, "and must be paid nothing");
+    }
+
+    // --- vel_to_ball_planar_air: the pogo ratchet ---
+
+    /// One car, hand-built state, `vel_to_ball` the only live weight.
+    fn v2b_state(pos: [f32; 3], vel: [f32; 3], on_ground: bool,
+                 ball: [f32; 3]) -> GameState {
+        crate::test_support::build_state(
+            &[crate::test_support::FixtureCar {
+                pos, vel, ang_vel: [0.0; 3], forward: [1.0, 0.0, 0.0],
+                up: [0.0, 0.0, 1.0], boost: 0.5, on_ground, has_flip: true,
+                is_demoed: false, team_orange: false,
+            }],
+            ball, [0.0; 3], [0.0; 3], &[], &[],
+        )
+    }
+
+    fn v2b_only(planar_air: bool) -> RewardConfig {
+        RewardConfig {
+            goal: 0.0, touch: 0.0, vel_to_ball: 0.05,
+            vel_to_ball_planar_air: planar_air,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn planar_air_kills_the_pogo_ratchet_but_not_ground_or_lateral_pay() {
+        // THE reason this flag exists. A pogo under an overhead ball is a closed
+        // cycle -- up, then down, back where it started -- so it must earn ZERO.
+        // With the 3-D projection the ascent is paid and the descent clamps to 0,
+        // which is income for a car that never touches the ball: measured
+        // +5.79/match. The flag has to remove that WITHOUT touching the two
+        // things the term is for.
+        let car = [0.0, 0.0, 300.0];
+        let overhead = [0.0, 0.0, 1200.0];
+        let up = v2b_state(car, [0.0, 0.0, 1000.0], false, overhead);
+        let down = v2b_state(car, [0.0, 0.0, -1000.0], false, overhead);
+
+        // Baseline (flag off): ascent paid, descent free -> the cycle is +EV.
+        let off = v2b_only(false);
+        let asc_off = compute(&up, &up, 0, None, &off);
+        let desc_off = compute(&down, &down, 0, None, &off);
+        assert!(asc_off > 0.0, "precondition: 3-D form pays the ascent, got {asc_off}");
+        assert_eq!(desc_off, 0.0, "precondition: the descent is free, not charged");
+        assert!(asc_off + desc_off > 0.0, "precondition: pogo cycle is +EV at 3-D");
+
+        // Flag on: both legs of the cycle pay nothing.
+        let on = v2b_only(true);
+        assert_eq!(compute(&up, &up, 0, None, &on), 0.0,
+                   "airborne +v_z toward an overhead ball must not be paid");
+        assert_eq!(compute(&down, &down, 0, None, &on), 0.0,
+                   "and the descent still must not be charged");
+
+        // A real airborne approach -- horizontal closing speed -- is untouched.
+        let lateral = v2b_state(car, [1000.0, 0.0, 0.0], false, [900.0, 0.0, 300.0]);
+        let lat_on = compute(&lateral, &lateral, 0, None, &on);
+        let lat_off = compute(&lateral, &lateral, 0, None, &off);
+        assert_eq!(lat_on, lat_off, "lateral airborne approach must be unchanged");
+        assert!(lat_on > 0.0, "and must still be paid, got {lat_on}");
+
+        // Ground driving is untouched even when v_z is nonzero (ramp/wall play).
+        let ramp = v2b_state([0.0, 0.0, 100.0], [800.0, 0.0, 400.0], true,
+                             [900.0, 0.0, 900.0]);
+        assert_eq!(compute(&ramp, &ramp, 0, None, &on),
+                   compute(&ramp, &ramp, 0, None, &off),
+                   "on the ground the flag must be a no-op at any v_z");
+    }
+
+    #[test]
+    fn planar_air_defaults_off_so_every_gate_number_survives() {
+        // The flag is `serde(default)`; a config that never mentions it must parse
+        // to the 3-D form. GOAL_THRESHOLD 9.4 and every bench/gate number are
+        // properties of that form -- see v0_behavior_unchanged_by_new_fields.
+        let c: RewardConfig =
+            toml::from_str("goal = 10.0\ntouch = 0.5\nvel_to_ball = 0.05").unwrap();
+        assert!(!c.vel_to_ball_planar_air);
+        assert!(!RewardConfig::default().vel_to_ball_planar_air);
+    }
+
+    #[test]
+    fn the_two_live_tapes_differ_in_exactly_this_one_flag() {
+        // WIRING, end to end, from the files the trainers actually load. serde
+        // IGNORES unknown fields, so a misspelled key in the TOML -- or a wheel
+        // built before the field existed -- would silently train run B on run A's
+        // tape while every log line claimed otherwise. A .so sha diff cannot
+        // catch that; only parsing the real file can. This test is also why an
+        // aggregate rollout probe is not needed to establish wiring: the airborne
+        // v_z income of a policy that barely jumps is too small to resolve
+        // against run-to-run noise, so absence of a rollout effect would prove
+        // nothing either way.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let load = |p: &str| -> RewardConfig {
+            let s = std::fs::read_to_string(root.join(p))
+                .unwrap_or_else(|e| panic!("{p}: {e}"));
+            toml::from_str(&s).unwrap_or_else(|e| panic!("{p}: {e}"))
+        };
+        let a = load("configs/reward_v9_aerial.toml");   // run A, the control
+        let b = load("configs/reward_v10_planar.toml");  // run B, the arm
+        assert!(!a.vel_to_ball_planar_air, "run A's tape must keep the 3-D form");
+        assert!(b.vel_to_ball_planar_air, "run B's tape must set the flag");
+        // And nothing else may differ, or a bench delta is not attributable.
+        assert_eq!(a.vel_to_ball, b.vel_to_ball);
+        assert_eq!(a.goal, b.goal);
+        assert_eq!(a.touch, b.touch);
+        assert_eq!(a.touch_accel, b.touch_accel);
+        assert_eq!(a.vel_ball_to_goal, b.vel_ball_to_goal);
+        assert_eq!(a.aerial_touch, b.aerial_touch);
+        assert_eq!(a.aerial_z_lo, b.aerial_z_lo);
+        assert_eq!(a.aerial_z_hi, b.aerial_z_hi);
+        assert_eq!(a.air_setup, b.air_setup);
+        assert_eq!(a.air_hang, b.air_hang);
+        assert_eq!(a.boost_pickup, b.boost_pickup);
+        assert_eq!(a.team_spirit, b.team_spirit);
+        assert_eq!(a.opp_spirit, b.opp_spirit);
+        assert_eq!(a.touch_cooldown_ticks, b.touch_cooldown_ticks);
     }
 }
