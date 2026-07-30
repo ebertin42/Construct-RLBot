@@ -1772,8 +1772,22 @@ class Trainer:
         # flip-and-land inside one 8-tick window is invisible. Comparable across
         # runs; not an exact flip total.
         rate_pair("flip_events", "flips/min/car", ".2f")
+        # Hang-gate crossings per car-minute. THE point of this instrument is
+        # that flips/min/car is structurally BLIND to a minimum hop: a hop sets
+        # neither hasFlipped nor hasDoubleJumped, so it reads 0.00 through a spam
+        # run. air_hang_events counts air phases that survive to AIR_HANG_T.
+        rate_pair("air_hang_events", "hang/min/car", ".2f")
+        # Airborne DUTY: the denominator that decides whether a hang rate is
+        # high because the policy flies or because it hops constantly. Without
+        # it the numerator above is uninterpretable.
+        if "air_decisions" in t and "agent_steps" in t:
+            l_ad, o_ad = split("air_decisions")
+            if l_ad is not None and l_steps:
+                l_duty = l_ad / l_steps
+                o_duty = (o_ad / o_steps) if (o_ad is not None and o_steps) else None
+                out.append(pair("air_duty", l_duty, o_duty, ".3f"))
         for k in ("aerial_touch", "air_setup", "touch_accel", "touch",
-                  "boost_pickup"):
+                  "boost_pickup", "air_hang"):
             if t.get(k, 0.0):
                 # SPLIT, for the same reason the touch counts are: r_aerial_touch
                 # is the exact term whose whole arena-wide value was measured to
@@ -1796,7 +1810,7 @@ class Trainer:
             shaping = sum(t.get(k, 0.0) for k in
                           ("touch", "vel_to_ball", "touch_accel", "vel_ball_to_goal",
                            "offensive_potential", "aerial_touch", "air_setup", "win_prob",
-                           "boost_pickup"))
+                           "boost_pickup", "air_hang"))
             out.append(f"shaping/goal {shaping / ge:.2f}")
         return " " + " ".join(out)
 

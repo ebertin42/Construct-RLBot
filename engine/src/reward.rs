@@ -127,6 +127,19 @@ pub struct RewardConfig {
     /// reward-identical (`v0_behavior_unchanged_by_new_fields` is the gate).
     #[serde(default)]
     pub boost_pickup: f32,
+    /// Flat reward, once per air phase, when the car's POST-JUMP hang clock
+    /// crosses `AIR_HANG_T`. SHIPPED AT 0.0 AND ABSENT FROM EVERY TAPE, on
+    /// purpose -- see `T_AIR_HANG` for the review that says why, and read it
+    /// before setting this to anything.
+    ///
+    /// The one-line version: the gate is sound (the cheapest hop spam qualifies
+    /// exactly zero times, measured) but the coefficient is not pinnable. It
+    /// cannot be sized without `sigma_raw`, which nothing logs, and the money it
+    /// unlocks is mostly not its own -- raising P(jump edge) at all opens a
+    /// PRE-EXISTING +5.8/match `vel_to_ball` pogo ratchet that this coefficient
+    /// cannot cap and that setting it back to 0.0 cannot unlearn.
+    #[serde(default)]
+    pub air_hang: f32,
 }
 
 /// Per-term reward telemetry (E9). Index space for the `[f64; N_TERMS]`
@@ -144,10 +157,14 @@ pub struct RewardConfig {
 /// index 20: `boost_pickup` is a REWARD appended AFTER the counters, because
 /// renumbering is forbidden (this index space is positional and the telemetry
 /// baselines are read against a fixed order). Any consumer that sums "the reward
-/// slice" must therefore sum `T_GOAL..=T_AERIAL_TOUCH` PLUS `T_BOOST_PICKUP` --
+/// slice" must therefore sum `T_GOAL..=T_AERIAL_TOUCH` PLUS `T_BOOST_PICKUP`
+/// PLUS `T_AIR_HANG` (index 23, appended 2026-07-30 for the same reason) --
 /// see `compute_terms_sums_to_compute`, and `reward_keys` in
 /// `tests/python/test_engine_v9.py`, which still hardcodes the nine-name prefix.
-pub const N_TERMS: usize = 23;
+/// Both appended rewards are 0.0 on every shipped tape, so the hardcoded prefix
+/// is currently still exact; that is a coincidence of the coefficients, not a
+/// property of the layout.
+pub const N_TERMS: usize = 26;
 pub const T_GOAL: usize = 0;
 pub const T_TOUCH: usize = 1;
 pub const T_VEL_TO_BALL: usize = 2;
@@ -263,6 +280,142 @@ pub const T_BOOST_GAINED: usize = 21;
 /// inside one 67ms window is invisible and two flips separated by a landing in
 /// one window count as one. Comparable across runs; not a true flip total.
 pub const T_FLIP_EVENTS: usize = 22;
+/// REWARD (a second non-prefix reward slot -- see `N_TERMS`), and the one term
+/// in this file that ships DELIBERATELY INERT: `air_hang` is absent from every
+/// tape, so this index reads exactly 0.0 on every run. `T_AIR_HANG_EVENTS` and
+/// `T_AIR_DECISIONS` are the deliverable; this slot exists so that the payout
+/// can be exercised by a test and priced against a measured event rate without
+/// anyone having to re-derive the plumbing later.
+///
+/// WHAT IT WOULD PAY FOR. One flat payment per air phase, on the RISING crossing
+/// of `air_time_since_jump` through `AIR_HANG_T` (1.2 s). It exists because the
+/// learner will not take off: P(jump | previous action was NOT a jump) -- the
+/// rising edge RocketSim needs to start a jump (`jumpPressed = jump &&
+/// !lastControls.jump`, Car.cpp:107) -- measures 6.655e-4 (mean over 714 live
+/// iterations, 2.088-2.153B steps, log10 sd 0.286), against ~1.9e-2 implied by
+/// the foreign opponents' airborne fraction. Entropy cannot bridge it: x1.42
+/// entropy bought x1.38 edge, so the target needs ~52x baseline.
+///
+/// WHY THE CROSSING, AND WHY IT IS AT MOST ONCE PER AIR PHASE. This is a physics
+/// property, not a cooldown. `air_time_since_jump` accumulates only on an
+/// airborne tick with `has_jumped && !is_jumping`, and is set to 0 on every
+/// other tick including every grounded one (Car.cpp:688-701); `is_jumping` can
+/// only be armed from `is_on_ground && jumpPressed` (Car.cpp:569-570), so it can
+/// never be re-armed mid-air. Within one air phase the clock is therefore
+/// strictly monotone from 0, so a rising crossing fires exactly once per phase,
+/// and only for a phase a real jump impulse from a surface started.
+///
+/// That last clause is the whole false-fire story, and it is why this reads the
+/// post-jump clock rather than a `is_on_ground` transition. On the raw
+/// ground->air proxy, MEASURED false fires with zero jump input: 7-9/min from
+/// driving off the curved corner (RocketSim's `is_on_ground` is
+/// `numWheelsInContact >= 3` with no surface test, so a wall reads GROUNDED --
+/// see `wall_riding_is_not_airborne`), one per demo respawn, and 2 per 40
+/// decisions for a bumped car. All of them leave `has_jumped` false, so all of
+/// them read `air_time_since_jump == 0` forever. Same for the ~28% of
+/// car-episodes that SPAWN airborne (`random_reset`'s 50% coin x curriculum_v3's
+/// 0.6 random weight): the kickoff reset that precedes every reset branch
+/// zeroes the jump flags, so a spawned car's fall is unpaid no matter how long
+/// it lasts -- pinned by
+/// `an_airborne_spawn_pays_no_hang_bonus_and_the_reset_launders_the_jump_state`.
+///
+/// MEASURED, `engine/examples/hang_gate_probe.rs`, 200 s per tape at tick_skip
+/// 8, qualifying crossings/min at T = 1.2:
+///
+/// * hop, jump released after 1 decision -- **0.0/min**, 93.2% airborne, apex
+///   121.5 uu, no boost. This is the maximising tape for ANY flat per-takeoff
+///   payment (60.6-69.6 takeoffs/min) and the hang gate pays it NOTHING: its
+///   air phase is 1.13 s, and of the 200 phases measured, 98% peaked below 1.0 s
+///   of post-jump clock and NONE reached 1.2 s.
+/// * hop, jump held 2 / 3 / 4+ decisions -- 5.7 / **28.2** / 27.3/min, apex 263.
+/// * hop then double jump -- 22.5/min, apex 567.3.
+/// * jump + pitch back + boost (a real aerial) -- 0.3/min, 36.9 boost per phase.
+/// * drive into the corner, no jump; drive flat, no jump; sit still -- 0.0/min.
+/// * wall climb then jump off at z>300 -- 9.6/min.
+///
+/// THE VERDICT (2026-07-30 review), recorded here so it is not re-litigated from
+/// scratch. Three things kill the coefficient and none of them are fixable from
+/// inside this term:
+///
+/// 1. The ranking is still inverted. 28.2/min for a 263 uu hop against 0.3/min
+///    for a real aerial is 94:1, because a flat per-air-phase payment pays
+///    1/phase-duration and a real aerial hangs 6 s and costs a full tank. The
+///    gate removes the FREE minimum hop; it does not make air play the best way
+///    to collect. Raising T does not fix it either: at T = 1.4/2.0 the held hop
+///    falls to 10.5/1.8 but hop-then-double-jump only falls to 21.9/18.9, i.e.
+///    every threshold selects a farm rather than eliminating one.
+/// 2. The coefficient is unpinnable. The entropy-regularised-optimum model gives
+///    r = beta * sigma_raw * ln(odds ratio); the live beta is 0.006
+///    (checkpoints_v9/train_remote.log:3811) and `sigma_raw` -- the sd of the RAW
+///    per-row advantage -- is NOT logged, because `standardise_advantages` runs
+///    before the `|A|` print, so the logged number is 1 by construction. The
+///    honest range is 0.0134-0.0282 per event, a 2.1x band. At the measured
+///    28.2/min that is 141 events per 300 s match = 1.9-4.0/match of this term's
+///    own money, for a car that never touches the ball.
+/// 3. The money it unlocks is mostly not its own. `vel_to_ball` (see the `proj`
+///    line in `compute_terms`) is a full 3-D projection clamped at 0 below, so a
+///    hop's +v_z under an overhead ball is PAID and the descent is free rather
+///    than charged. Measured +5.79/match for a stationary pogo under a high
+///    ball, zero ball contact. The only thing suppressing that today is the
+///    6.655e-4 jump edge -- exactly the barrier this term exists to remove. So
+///    total exposure is ~7.7-9.8/match, of which ~5.8 is pre-existing income
+///    that this coefficient cannot cap and that setting it back to 0.0 cannot
+///    unlearn. The tape is removable; the learned ratchet is not.
+///
+/// PREREQUISITES, in order, before this is worth a second look: (a) log
+/// `sigma_raw`; (b) fix `vel_to_ball` to drop the vertical component while
+/// airborne (a regime change -- it moves a term paying ~37/match on two live
+/// runs, so it needs a ~50% contested start); (c) pin the champion's and the
+/// foreign bots' `air_hang_events`/min/car with THIS instrument, which is what
+/// would say whether an outcome gate (one payment per air phase whose peak car z
+/// exceeds ~450, above the measured 393.6 double-jump ceiling) can bootstrap off
+/// the 1.67% of airborne touches already above 300 uu.
+pub const T_AIR_HANG: usize = 23;
+/// Instrument: qualifying hang crossings, independent of `cfg.air_hang`, so
+/// retuning the payout cannot move the ruler it would be judged by. Same split
+/// as `T_BOOST_PICKUP`/`T_BOOST_GAINED` and `aerial_z_lo`/`aerial_meas_z_lo`.
+///
+/// A LOWER BOUND on real qualifying phases, like `T_FLIP_EVENTS`: `compute_terms`
+/// runs once per decision against a state 8 ticks old, so the crossing is
+/// observed on the decision boundary after it happened. It cannot over-count --
+/// the clock is monotone within a phase and 0 across a landing.
+///
+/// This is the counter to read, because nothing else in the log can see this
+/// behaviour class. `flips/min/car` reads exactly 0.00 through every hop-spam
+/// tape measured (a minimum hop sets neither `has_flipped` nor
+/// `has_double_jumped`; see `T_FLIP_EVENTS`), and `airborne_touch_events` scores
+/// 0.87-0.93 for a RANDOM policy.
+pub const T_AIR_HANG_EVENTS: usize = 24;
+/// Instrument: decisions on which the car was airborne. Duty cycle, against the
+/// `T_AGENT_STEPS` denominator this array already carries.
+///
+/// The crossing count alone cannot separate a pogo from air play -- a
+/// 93.2%-airborne hop farm and a bot that flies both raise it. Duty is the axis
+/// that separates them: measured 92.1-93.2% for every spam tape, against a
+/// learner baseline of 3.8-15% and foreign opponents at 19-23%. Read the pair,
+/// never either alone.
+pub const T_AIR_DECISIONS: usize = 25;
+/// Seconds of POST-JUMP hang time that define a qualifying air phase.
+///
+/// 1.2 sits in the gap between the two hop families, which is the only reason a
+/// duration gate discriminates at all: the cheapest hop (jump released after one
+/// 8-tick decision) has a 1.13 s air phase, and over 200 measured phases 98% of
+/// its post-jump clocks peaked below 1.0 s and none reached 1.2 s, while a
+/// full-hold hop (0.2 s = `JUMP_MAX_TIME`) measures 1.40 s on its first phase.
+/// A RAMP is not available here -- the quantity is a one-shot crossing -- so the
+/// threshold IS load-bearing, unlike `aerial_z_lo`.
+///
+/// It is also a WEAK discriminator, and the margin is one decision wide: 1.2 s is
+/// 18 decisions, and the two families are 4-6 decisions apart. Anything that
+/// changes `tick_skip`, gravity, or the car config moves both sides of that gap
+/// and this number has to be re-measured (`engine/examples/hang_gate_probe.rs`
+/// prints the per-phase distribution for every T in one run).
+///
+/// Deliberately a constant and not a config field: it is the instrument's
+/// definition, and the project's own rule (`aerial_meas_z_lo`) is that the ruler
+/// must not move when the payout is retuned. Changing this number invalidates
+/// every `air_hang_events` baseline ever recorded.
+pub const AIR_HANG_T: f32 = 1.2;
 pub const TERM_NAMES: [&str; N_TERMS] = [
     "goal",
     "touch",
@@ -287,6 +440,9 @@ pub const TERM_NAMES: [&str; N_TERMS] = [
     "boost_pickup",
     "boost_gained",
     "flip_events",
+    "air_hang",
+    "air_hang_events",
+    "air_decisions",
 ];
 
 /// Ball radius. The `aerial_z_lo` floor in `validate`: a ramp whose bottom is
@@ -542,6 +698,53 @@ pub fn compute_terms(
         // and Respawn rebuilds a default `CarState` with has_flipped = false.
         if me.state.has_flipped && !was.state.has_flipped {
             terms[T_FLIP_EVENTS] += 1.0;
+        }
+        // Airborne duty (instrument). Denominator is T_AGENT_STEPS, incremented
+        // once per call above.
+        //
+        // The `!is_demoed` guard is LOAD-BEARING and was missing on first write.
+        // A demoed car reads is_on_ground = false for the whole ~3 s respawn
+        // delay, so without it every airborne demolition injects ~45 decisions
+        // of fake flight at tick_skip = 8 -- and duty is the DENOMINATOR that
+        // decides whether a hang rate means "flies" or "hops constantly", so
+        // inflating it silently deflates the thing it exists to normalise.
+        // Demos are on by default (DemoMode::NORMAL) and this engine never
+        // overrides the mutator config.
+        //
+        // KNOWN RESIDUAL, not fixed here: a car that lands on its ROOF also
+        // reads is_on_ground = false indefinitely, so it still counts as
+        // airborne. Detecting it needs an orientation or wheel-contact test I
+        // cannot validate against the frozen gate .so, so it is documented
+        // rather than guessed at. It inflates duty upward, which makes any hang
+        // RATE computed against it conservative (too low) -- the safe direction
+        // for a farm tripwire.
+        if !me.state.is_on_ground && !me.state.is_demoed {
+            terms[T_AIR_DECISIONS] += 1.0;
+        }
+        // HANG CROSSING. RISING edge of the POST-JUMP clock through AIR_HANG_T,
+        // which fires at most once per air phase as a physics property -- see
+        // T_AIR_HANG for the proof and for why the coefficient is 0.0.
+        //
+        // `!me.state.is_on_ground` is NOT redundant. RocketSim increments this
+        // clock in `_PreTickUpdate` (from the previous tick's is_on_ground) and
+        // recomputes is_on_ground in `_PostTickUpdate`, so the LANDING tick can
+        // read is_on_ground = true with a still-positive clock. Without the
+        // guard, a hop whose clock crosses on exactly the tick it touches down
+        // would be paid for hang time it no longer has.
+        //
+        // No demo guard is needed, unlike `boost_pickup` above. A demoed car
+        // early-returns from both tick-update halves, so its clock FREEZES; a
+        // frozen value cannot rise, and `Car::Respawn` rebuilds a default
+        // CarState (clock 0), which can only produce a falling edge.
+        if !me.state.is_on_ground
+            && was.state.air_time_since_jump < AIR_HANG_T
+            && me.state.air_time_since_jump >= AIR_HANG_T
+        {
+            terms[T_AIR_HANG_EVENTS] += 1.0;
+            if cfg.air_hang != 0.0 {
+                r += cfg.air_hang;
+                terms[T_AIR_HANG] += cfg.air_hang as f64;
+            }
         }
     }
 
@@ -2384,6 +2587,20 @@ mod tests {
         let bsum: f64 =
             bt[T_GOAL..=T_AERIAL_TOUCH].iter().sum::<f64>() + bt[T_BOOST_PICKUP];
         assert!((bsum - br as f64).abs() < 1e-5, "terms {bsum} != total {br}");
+
+        // Same again for the SECOND non-prefix reward slot, `air_hang` at index
+        // 23. Exercised with a nonzero coefficient for the same reason: on every
+        // shipped tape it is 0.0, so the identity would hold vacuously.
+        let hcfg = RewardConfig { air_hang: 0.008, ..v9_cfg() };
+        let (hprev, hcur) = hang_pair(AIR_HANG_T - 0.1, AIR_HANG_T + 0.05);
+        let mut ht = [0.0f64; N_TERMS];
+        let hr = compute_terms(&hprev, &hcur, 0, Some(Team::Blue), &hcfg, &mut ht);
+        assert!(ht[T_AIR_HANG] > 0.0,
+                "precondition: the appended reward term must actually pay here");
+        let hsum: f64 = ht[T_GOAL..=T_AERIAL_TOUCH].iter().sum::<f64>()
+            + ht[T_BOOST_PICKUP]
+            + ht[T_AIR_HANG];
+        assert!((hsum - hr as f64).abs() < 1e-5, "terms {hsum} != total {hr}");
     }
 
     // ------------------------------------------------------ boost / flip (v10) --
@@ -2607,8 +2824,344 @@ mod tests {
         assert_eq!(TERM_NAMES[T_BOOST_PICKUP], "boost_pickup");
         assert_eq!(TERM_NAMES[T_BOOST_GAINED], "boost_gained");
         assert_eq!(TERM_NAMES[T_FLIP_EVENTS], "flip_events");
-        assert_eq!(T_FLIP_EVENTS, N_TERMS - 1, "the new terms are the LAST three");
+        assert_eq!(TERM_NAMES[T_AIR_HANG], "air_hang");
+        assert_eq!(TERM_NAMES[T_AIR_HANG_EVENTS], "air_hang_events");
+        assert_eq!(TERM_NAMES[T_AIR_DECISIONS], "air_decisions");
+        // The indices are FROZEN, not "the last three": appending is safe only
+        // because nothing may ever be renumbered. `flip_events` stopped being
+        // last when the air-hang trio was appended on 2026-07-30.
+        assert_eq!(T_FLIP_EVENTS, 22, "index 22 is flip_events forever");
+        assert_eq!(T_AIR_DECISIONS, N_TERMS - 1, "the air-hang trio is the LAST three");
         let mut seen = std::collections::HashSet::new();
         for n in TERM_NAMES { assert!(seen.insert(n), "duplicate term name {n}"); }
+    }
+
+    // ------------------------------------------------- air hang (2026-07-30) --
+    //
+    // The instrument for the takeoff-exploration question, shipped at weight
+    // 0.0. See `T_AIR_HANG` for the verdict these tests encode: the gate is
+    // sound and the payout is not, so the EVENT counters are the deliverable
+    // and the coefficient is the thing nobody may set without new evidence.
+
+    /// A (prev, cur) pair whose single AIRBORNE car's `air_time_since_jump`
+    /// moves `t0` -> `t1`, carrying the flag combination a real post-jump air
+    /// phase carries: `has_jumped` set (a surface applied a jump impulse) and
+    /// `is_jumping` cleared (the hold is over). That is the ONLY combination
+    /// under which RocketSim accumulates the clock at all -- every other
+    /// combination zeroes it (Car.cpp:697-701).
+    fn hang_pair(t0: f32, t1: f32) -> (GameState, GameState) {
+        let (mut prev, mut cur) = boost_pair();
+        for gs in [&mut prev, &mut cur] {
+            gs.cars[0].state.has_jumped = true;
+            gs.cars[0].state.is_jumping = false;
+        }
+        prev.cars[0].state.air_time_since_jump = t0;
+        cur.cars[0].state.air_time_since_jump = t1;
+        (prev, cur)
+    }
+
+    /// The term array for one `hang_pair` at coefficient `w`.
+    fn hang_terms(t0: f32, t1: f32, w: f32) -> [f64; N_TERMS] {
+        let (prev, cur) = hang_pair(t0, t1);
+        let cfg = RewardConfig { air_hang: w, ..Default::default() };
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        t
+    }
+
+    /// Run one control tape on a single-car arena for `decs` decisions and
+    /// accumulate `compute_terms` over every one of them, exactly as
+    /// `EpisodeArena::step` does: ONE call per decision against a `prev` latched
+    /// 8 physics ticks earlier. Returns (terms, air phases), where a phase is a
+    /// maximal run of airborne decisions -- the denominator the "at most one
+    /// payment per air phase" bound is stated against.
+    ///
+    /// Car start and ball placement copy `engine/examples/hang_gate_probe.rs`
+    /// exactly, so the rates asserted here are the rates measured there.
+    fn air_tape(
+        decs: u32,
+        cfg: &RewardConfig,
+        tape: &dyn Fn(&rocketsim_rs::sim::CarState, bool) -> CarControls,
+    ) -> ([f64; N_TERMS], u32) {
+        use rocketsim_rs::math::{RotMat, Vec3};
+        ensure_init(None);
+        let mut arena = Arena::default_standard();
+        arena.pin_mut().add_car(Team::Blue, CarConfig::octane());
+        arena.pin_mut().reset_to_random_kickoff(Some(1));
+        let id = arena.pin_mut().get_game_state().cars[0].id;
+        let mut cs = arena.pin_mut().get_car(id);
+        cs.pos = Vec3::new(0.0, -2000.0, 17.0);
+        cs.vel = Vec3::new(0.0, 0.0, 0.0);
+        cs.ang_vel = Vec3::new(0.0, 0.0, 0.0);
+        cs.rot_mat = RotMat {
+            forward: Vec3::new(0.0, 1.0, 0.0),
+            right: Vec3::new(-1.0, 0.0, 0.0),
+            up: Vec3::new(0.0, 0.0, 1.0),
+        };
+        cs.boost = 100.0;
+        arena.pin_mut().set_car(id, cs).unwrap();
+        // Ball parked far away and at rest: this is about the car only, and a
+        // contact would drag `touch`/`vel_to_ball` into the numbers.
+        let mut b = arena.pin_mut().get_ball();
+        b.pos = Vec3::new(0.0, 4000.0, 93.15);
+        b.vel = Vec3::new(0.0, 0.0, 0.0);
+        arena.pin_mut().set_ball(b);
+
+        let mut t = [0.0f64; N_TERMS];
+        let mut prev = arena.pin_mut().get_game_state();
+        let (mut phases, mut in_air, mut last_jump) = (0u32, false, false);
+        for _ in 0..decs {
+            let st = arena.pin_mut().get_car(id);
+            let c = tape(&st, last_jump);
+            last_jump = c.jump;
+            arena.pin_mut().set_car_controls(id, c).unwrap();
+            arena.pin_mut().step(8);
+            let cur = arena.pin_mut().get_game_state();
+            compute_terms(&prev, &cur, 0, None, cfg, &mut t);
+            let air = !cur.cars[0].state.is_on_ground;
+            if air && !in_air {
+                phases += 1;
+            }
+            in_air = air;
+            prev = cur;
+        }
+        (t, phases)
+    }
+
+    /// The whole mechanism: a RISING crossing of the post-jump hang clock, once
+    /// per air phase. A LEVEL test on the same quantity would pay every decision
+    /// of the hang (15x/s), which is the flat-touch farm in a new costume.
+    #[test]
+    fn the_hang_gate_fires_once_on_the_crossing_and_never_on_the_level() {
+        let w = 0.008;
+        let t = hang_terms(AIR_HANG_T - 0.1, AIR_HANG_T + 0.05, w);
+        assert_eq!(t[T_AIR_HANG_EVENTS], 1.0, "the crossing is one event");
+        assert!((t[T_AIR_HANG] - w as f64).abs() < 1e-9,
+                "the payout is the flat coefficient; got {}", t[T_AIR_HANG]);
+
+        // ALREADY above, one decision later in the SAME air phase.
+        let held = hang_terms(AIR_HANG_T + 0.05, AIR_HANG_T + 0.12, w);
+        assert_eq!(held[T_AIR_HANG_EVENTS], 0.0, "held-high must not double count");
+        assert_eq!(held[T_AIR_HANG], 0.0);
+
+        // Never reached: a hop that lands before the threshold.
+        let short = hang_terms(0.5, AIR_HANG_T - 0.01, w);
+        assert_eq!(short[T_AIR_HANG_EVENTS], 0.0, "below the threshold pays nothing");
+
+        // The `cur` side is inclusive, so landing exactly on T fires.
+        let exact = hang_terms(AIR_HANG_T - 0.1, AIR_HANG_T, w);
+        assert_eq!(exact[T_AIR_HANG_EVENTS], 1.0, "cur == T is a crossing");
+    }
+
+    /// THE false-fire immunity, and the reason the gate reads
+    /// `air_time_since_jump` rather than `air_time` or a ground->air transition.
+    /// Measured on the raw transition proxy: 7-9 fires/min from driving off the
+    /// curved corner with ZERO jump input, one per demo respawn, and two per 40
+    /// decisions for a bumped car. All of them read `air_time_since_jump == 0`,
+    /// because RocketSim only accumulates that clock while `has_jumped`
+    /// (Car.cpp:697-701) and only ever sets `has_jumped` from
+    /// `is_on_ground && jumpPressed` (Car.cpp:569-578).
+    #[test]
+    fn the_hang_gate_reads_the_post_jump_clock_not_raw_air_time() {
+        let (mut prev, mut cur) = boost_pair();
+        for (gs, at) in [(&mut prev, 5.0f32), (&mut cur, 5.07f32)] {
+            gs.cars[0].state.has_jumped = false;
+            gs.cars[0].state.is_jumping = false;
+            gs.cars[0].state.air_time = at;
+            gs.cars[0].state.air_time_since_jump = 0.0;
+        }
+        let cfg = RewardConfig { air_hang: 0.008, ..Default::default() };
+        let mut t = [0.0f64; N_TERMS];
+        let r = compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert_eq!(t[T_AIR_HANG_EVENTS], 0.0,
+                   "5 s of air the car never jumped for must qualify zero times");
+        assert_eq!(r, 0.0, "and must not move the reward at all");
+        assert_eq!(t[T_AIR_DECISIONS], 1.0, "but the duty instrument still counts it");
+    }
+
+    /// A crossing that lands on the TOUCHDOWN decision is not hang time the car
+    /// still has. RocketSim increments the clock in `_PreTickUpdate` off the
+    /// previous tick's `is_on_ground` and recomputes `is_on_ground` in
+    /// `_PostTickUpdate`, so a landing state can carry a positive clock -- which
+    /// is why the payout carries an explicit airborne guard rather than relying
+    /// on the clock's own grounded zeroing. Not caught by any of the measured
+    /// tapes; pinned here so the guard cannot be "simplified" away.
+    #[test]
+    fn a_crossing_on_the_landing_decision_is_not_paid() {
+        let (mut prev, mut cur) = hang_pair(AIR_HANG_T - 0.1, AIR_HANG_T + 0.05);
+        cur.cars[0].state.is_on_ground = true; // wheels down on this decision
+        let cfg = RewardConfig { air_hang: 0.008, ..Default::default() };
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert_eq!(t[T_AIR_HANG_EVENTS], 0.0, "a landed car is not hanging");
+        assert_eq!(t[T_AIR_HANG], 0.0);
+        assert_eq!(t[T_AIR_DECISIONS], 0.0, "and the duty instrument agrees");
+
+        // Sanity: the SAME pair with the wheels still off the ground does fire,
+        // so the assertion above is about the guard and not about the clock.
+        prev.cars[0].state.is_on_ground = false;
+        cur.cars[0].state.is_on_ground = false;
+        let mut air = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut air);
+        assert_eq!(air[T_AIR_HANG_EVENTS], 1.0);
+    }
+
+    /// Shipped state: the coefficient is absent from every tape, so the term is
+    /// inert, while the RULER still records. Same payout/instrument split as
+    /// `boost_pickup`/`boost_gained` -- retuning the payout must never move the
+    /// measurement the retune would be judged by.
+    #[test]
+    fn air_hang_defaults_to_zero_reward_but_the_instrument_still_records() {
+        let (prev, cur) = hang_pair(AIR_HANG_T - 0.1, AIR_HANG_T + 0.05);
+        let mut t = [0.0f64; N_TERMS];
+        let r = compute_terms(&prev, &cur, 0, None, &RewardConfig::default(), &mut t);
+        assert_eq!(r, 0.0, "an all-zero tape stays byte-identical across a crossing");
+        assert_eq!(t[T_AIR_HANG], 0.0, "unset coefficient pays nothing");
+        assert_eq!(t[T_AIR_HANG_EVENTS], 1.0, "but the coefficient-free ruler records");
+    }
+
+    /// The duty instrument, whose denominator is the existing `agent_steps`.
+    /// It is the second half of the pair: a crossing count alone cannot tell a
+    /// 93%-airborne pogo from real air play, and `flip_events` reads exactly
+    /// 0.00 through every hop-spam tape measured (a minimum hop sets neither
+    /// `has_flipped` nor `has_double_jumped`), so it is structurally blind here.
+    #[test]
+    fn air_decisions_counts_airborne_decisions_and_nothing_else() {
+        let (mut prev, mut cur) = boost_pair(); // `synth` builds AIRBORNE cars
+        let cfg = RewardConfig::default();
+        let mut t = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+        assert_eq!(t[T_AIR_DECISIONS], 1.0, "an airborne decision counts");
+        assert_eq!(t[T_AGENT_STEPS], 1.0, "the duty denominator is agent_steps");
+
+        prev.cars[0].state.is_on_ground = true;
+        cur.cars[0].state.is_on_ground = true;
+        let mut g = [0.0f64; N_TERMS];
+        compute_terms(&prev, &cur, 0, None, &cfg, &mut g);
+        assert_eq!(g[T_AIR_DECISIONS], 0.0, "a grounded decision is not air time");
+        assert_eq!(g[T_AGENT_STEPS], 1.0);
+    }
+
+    /// THE farm test. The maximising tape for any flat per-takeoff payment is
+    /// the CHEAPEST hop: release the jump after one decision and re-press the
+    /// instant the wheels touch. Measured 60.6-69.6 takeoffs/min, 93.2%
+    /// airborne, apex 121.5 uu, zero boost -- and it qualifies for the hang gate
+    /// exactly ZERO times: its air phase is 1.13 s, and over 200 measured phases
+    /// 98% of its post-jump clocks peaked below 1.0 s and none reached 1.2 s.
+    ///
+    /// This is the property the whole design rests on: the tape that maximises a
+    /// per-transition bonus is the tape this gate pays nothing for.
+    #[test]
+    fn the_maximum_rate_pogo_earns_no_hang_payment_at_all() {
+        let secs = 60.0f64;
+        let cfg = RewardConfig { air_hang: 0.008, ..Default::default() };
+        let (t, phases) = air_tape(900, &cfg, &|st, lj| CarControls {
+            jump: if lj {
+                st.is_jumping && st.jump_time < 1.0 / 15.0 - 1e-4
+            } else {
+                st.is_on_ground
+            },
+            ..Default::default()
+        });
+        assert!(phases >= 40,
+                "precondition: this tape must BE a hop farm; got {phases} phases in {secs}s");
+        let duty = t[T_AIR_DECISIONS] / t[T_AGENT_STEPS];
+        assert!(duty > 0.85, "precondition: the pogo is ~93% airborne; got {duty}");
+        assert_eq!(t[T_AIR_HANG_EVENTS], 0.0,
+                   "the fastest, cheapest, highest-duty hop spam must qualify ZERO times");
+        assert_eq!(t[T_AIR_HANG], 0.0, "so it earns nothing even at a nonzero coefficient");
+    }
+
+    /// PINNED FARM CEILING, not a desirable property. The best QUALIFYING hop
+    /// tape holds the jump the full 0.2 s (`JUMP_MAX_TIME`) and reaches
+    /// 28.2 crossings/min over 200 s -- 141 per 300 s match, apex ~263 uu, zero
+    /// boost, zero ball contact. That is the farm any nonzero coefficient buys,
+    /// and it is why the coefficient is 0.0. If this number moves, the arithmetic
+    /// in `T_AIR_HANG`'s doc comment must be recomputed with it.
+    ///
+    /// The structural half of the bound is a physics property, not a cooldown:
+    /// `air_time_since_jump` is zeroed on every grounded tick and `is_jumping`
+    /// can only be re-armed from the ground, so within one air phase the clock
+    /// is strictly monotone and the crossing fires AT MOST ONCE per phase.
+    #[test]
+    fn the_hang_gate_bounds_the_hop_farm_at_one_payment_per_air_phase() {
+        let secs = 60.0f64;
+        let cfg = RewardConfig::default();
+        let (t, phases) = air_tape(900, &cfg, &|st, lj| CarControls {
+            jump: if lj { st.is_jumping && st.jump_time < 0.1999 } else { st.is_on_ground },
+            ..Default::default()
+        });
+        let ev = t[T_AIR_HANG_EVENTS];
+        assert!(ev > 0.0, "precondition: the qualifying tape must actually qualify");
+        assert!(ev <= phases as f64,
+                "at most ONE payment per air phase: {ev} payments in {phases} phases");
+        let per_min = 60.0 * ev / secs;
+        assert!(per_min <= 60.0 / AIR_HANG_T as f64,
+                "physics ceiling is one crossing per {AIR_HANG_T}s of hang; got {per_min}/min");
+        assert!(per_min <= 35.0,
+                "measured hop-farm ceiling is 28.2/min over 200 s; got {per_min}/min");
+    }
+
+    /// An episode that SPAWNS a car airborne must collect nothing for the fall it
+    /// was handed. ~46% of `random_reset` cars start in the air (measured
+    /// 184/400), and at curriculum_v3's 0.6 random weight that is ~28% of
+    /// car-episodes.
+    ///
+    /// Also pins the state the 2026-07-30 review called a live physics bug: that
+    /// neither reset path writes `has_jumped`/`is_jumping`/`has_double_jumped`/
+    /// `air_time`/`air_time_since_jump`, so "flip availability is inherited from
+    /// an unrelated episode". MEASURED FALSE, and this is the test that says so:
+    /// `reset_episode` calls `reset_to_random_kickoff` FIRST on every branch
+    /// (episode.rs:518) and RocketSim's kickoff does
+    /// `CarState spawnState; ... SetState(spawnState)` (Arena.cpp:180-192) with
+    /// `_internalState = state` (Car.cpp:34), so the get->mutate->set idiom in
+    /// `random_reset`/`apply_replay_state` inherits FRESH ZEROS, not stale flags.
+    #[test]
+    fn an_airborne_spawn_pays_no_hang_bonus_and_the_reset_launders_the_jump_state() {
+        ensure_init(None);
+        let mut arena = Arena::default_standard();
+        arena.pin_mut().add_car(Team::Blue, CarConfig::octane());
+        let bounds = crate::curriculum::RandomStateBounds::default();
+        // Drive the REAL reset path until it hands back a car high enough in the
+        // air to out-hang the threshold on the way down.
+        let mut spawn = None;
+        for seed in 0..400u64 {
+            arena.pin_mut().reset_to_random_kickoff(Some(1));
+            let mut rng = crate::sampler::Pcg32::new(seed);
+            crate::curriculum::random_reset(arena.pin_mut(), &mut rng, &bounds);
+            let st = arena.pin_mut().get_game_state().cars[0].state;
+            if !st.is_on_ground && st.pos.z >= 1000.0 && st.vel.z > -200.0 {
+                spawn = Some(st);
+                break;
+            }
+        }
+        let st = spawn.expect("random_reset must give a high airborne spawn within 400 seeds");
+        assert!(!st.has_jumped, "the kickoff reset must launder has_jumped");
+        assert!(!st.is_jumping, "... and is_jumping");
+        assert!(!st.has_double_jumped, "... and has_double_jumped");
+        assert!(!st.has_flipped, "... and has_flipped");
+        assert_eq!(st.air_time, 0.0, "... and air_time");
+        assert_eq!(st.air_time_since_jump, 0.0, "... and air_time_since_jump");
+
+        let id = arena.pin_mut().get_game_state().cars[0].id;
+        let cfg = RewardConfig { air_hang: 0.008, ..Default::default() };
+        let mut t = [0.0f64; N_TERMS];
+        let mut prev = arena.pin_mut().get_game_state();
+        let mut max_air = 0.0f32;
+        for _ in 0..45 {
+            arena.pin_mut().set_car_controls(id, CarControls::default()).unwrap();
+            arena.pin_mut().step(8);
+            let cur = arena.pin_mut().get_game_state();
+            compute_terms(&prev, &cur, 0, None, &cfg, &mut t);
+            max_air = max_air.max(cur.cars[0].state.air_time);
+            prev = cur;
+        }
+        assert!(max_air > AIR_HANG_T,
+                "precondition: the spawn must hang past the threshold; got {max_air}s");
+        assert!(t[T_AIR_DECISIONS] >= 18.0,
+                "precondition: >= 1.2 s of airborne decisions; got {}", t[T_AIR_DECISIONS]);
+        assert_eq!(t[T_AIR_HANG_EVENTS], 0.0,
+                   "a car handed its air phase by a RESET must qualify zero times");
+        assert_eq!(t[T_AIR_HANG], 0.0, "and must be paid nothing");
     }
 }

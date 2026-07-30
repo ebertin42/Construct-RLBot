@@ -111,10 +111,37 @@ FULL_MATCH_STEPS = 4500
 #        `gates-need-an-idle-box` win-share bias cancels, and load can only
 #        inflate the sd -- which came in BELOW expectation, not above.
 #
+#   3v3: same v9 ck_000572549120 self-play as 2v2 (104-row table), 20 seeds x
+#        640 matches, BOTH orders (2026-07-29,
+#        ~/construct-measure/null_3v3_result.log). sd 0.0172 against an expected
+#        0.0174 -- inside the 95% band [0.0119, 0.0229] and within 1% of
+#        expectation; mean 0.4938 with CI [0.4863, 0.5014], consistent with 0.5;
+#        mirror symmetry 0.4968, CI [0.4897, 0.5039]. Measured on an otherwise
+#        idle box (the viewer was stopped for the duration).
+#        NOTE the duplicate-per-car signature for 3v3 is expected/sqrt(3) =
+#        0.0101, NOT the 2v2 sqrt(2) figure -- it scales with cars per side.
+#        Ruled out by match count as above: 640/seed, not 1920.
+#        2 of 12801 records were short (contained physics blowups), and the one
+#        seed carrying them reported 641 records rather than 640. That is 0.008%
+#        of the run and shifts that seed's share by <0.002 against sd 0.017, but
+#        it is the reason the per-seed count is not uniformly 640.
+#
 # The 2v2 sd is smaller than 1v1's because both-orders halves the variance
 # (sqrt(2)) and 640 matches is 2x the 1v1 n. A 2v2 gate therefore needs a
 # SMALLER margin to be significant, not a larger one: >= 0.530 at 2 sd.
-NULL_BY_MODE = {1: (0.502, 0.024), 2: (0.502, 0.0149)}
+# 3v3's threshold is >= 0.534 at 2 sd above 0.5 (the same 0.5-based convention
+# match_gate_null.py prints, and the same one that gave 2v2 its 0.530).
+#
+# DO NOT explain 3v3's larger MEASURED sd (0.0172 vs 2v2's 0.0149) by its higher
+# draw rate -- that reasoning is backwards, and I shipped it backwards on
+# 2026-07-30. Expected sd is sqrt((1 - draw_rate) / (4 * n_per_seed)), so MORE
+# draws means a SMALLER sd:
+#     2v2  draw 0.214 -> expected 0.01752
+#     3v3  draw 0.224 -> expected 0.01741   <- lower, not higher
+# The two expectations are within 1% of each other; the measured gap is simply
+# where each run landed inside its own chi-square band (2v2 came in 15% BELOW
+# its expectation, 3v3 within 1% of its own). Draws do not explain it.
+NULL_BY_MODE = {1: (0.502, 0.024), 2: (0.502, 0.0149), 3: (0.4938, 0.0172)}
 
 
 def _repo_root():
