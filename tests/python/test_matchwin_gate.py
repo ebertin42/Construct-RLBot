@@ -422,9 +422,13 @@ def test_the_2v2_null_is_measured_not_borrowed_from_1v1():
     2v2 would launder an uncalibrated verdict, which is why 2v2 sat absent for
     days rather than being guessed."""
     from scripts.matchwin_gate import NULL_BY_MODE
-    assert set(NULL_BY_MODE) == {1, 2}, "3v3 must stay absent until measured"
+    assert set(NULL_BY_MODE) == {1, 2, 3}, "a mode must be absent until measured"
     assert NULL_BY_MODE[2] == (0.502, 0.0149)
     assert NULL_BY_MODE[2][1] != NULL_BY_MODE[1][1], "not borrowed"
+    # 3v3 was measured 2026-07-29 on the same 104-row policy as 2v2. Each sd is
+    # its own measurement -- if any two modes ever match exactly, one was copied.
+    assert NULL_BY_MODE[3] == (0.4938, 0.0172)
+    assert len({sd for _, sd in NULL_BY_MODE.values()}) == 3, "no sd reused"
 
 
 def test_the_2v2_null_sd_is_not_the_duplicate_record_signature():
@@ -443,4 +447,24 @@ def test_a_2v2_gate_now_reports_a_calibrated_null():
     UNMEASURED' and the verdict could not be read as significant."""
     from scripts.matchwin_gate import NULL_BY_MODE
     assert NULL_BY_MODE.get(2) is not None
-    assert NULL_BY_MODE.get(3) is None, "3v3 must still say UNMEASURED"
+    assert NULL_BY_MODE.get(3) is not None, "3v3 measured 2026-07-29"
+
+
+def test_the_3v3_null_sd_is_not_the_duplicate_record_signature():
+    """The 3v3 signature is expected/sqrt(3) = 0.0101, NOT the 2v2 sqrt(2)
+    figure -- it scales with cars per side, so quoting 0.0124 here would clear
+    a duplicating run. Match count (640/seed, not 1920) is the real check."""
+    from scripts.matchwin_gate import NULL_BY_MODE
+    sd = NULL_BY_MODE[3][1]
+    assert sd > 0.0110, f"sd {sd} is at the 3v3 duplicate-per-car signature 0.0101"
+    assert 0.0119 <= sd <= 0.0229, "inside the 95% chi-square band for this run"
+
+
+def test_the_3v3_null_mean_is_consistent_with_one_half():
+    """Both-orders centres the mean on 0.5 by construction. A mean that drifts
+    off it means the flip arithmetic is wrong, not that the policy is biased --
+    so this is an arithmetic check, not a strength claim. CI was
+    [0.4863, 0.5014]."""
+    from scripts.matchwin_gate import NULL_BY_MODE
+    mean, sd = NULL_BY_MODE[3]
+    assert abs(mean - 0.5) < 2 * sd, "mean is not consistent with 0.5"
