@@ -8,7 +8,7 @@ HOST="${1:-elliot@192.168.86.117}"
 RDIR="${2:-construct}"
 
 mkdir -p checkpoints checkpoints_entity checkpoints_scratch checkpoints_v9 \
-         checkpoints_v10 league
+         checkpoints_v10 checkpoints_v11 league
 while true; do
     rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints/" checkpoints/ 2>/dev/null
     rsync -az "$HOST:$RDIR/checkpoints/train_v0.log" checkpoints/train_remote.log 2>/dev/null
@@ -27,6 +27,15 @@ while true; do
     # only on the box and the comparison is impossible.
     rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_v10/" checkpoints_v10/ 2>/dev/null
     rsync -az "$HOST:$RDIR/checkpoints_v10/v10_s20260730.log" checkpoints_v10/train_remote.log 2>/dev/null
+    # v11 — the NULL CONTROL for the planar-air flag (2026-07-31). Forked from
+    # checkpoints_v10/ck_002278225920.pt, i.e. run B's OWN starting weights, but with
+    # v9's control tape. B and C therefore share weights AND lineage history and differ
+    # only in vel_to_ball_planar_air, so B-vs-C at matched steps isolates the flag.
+    # (B-vs-A never could: v9's and v10's copies of that checkpoint have DIFFERENT
+    # sha256, so run B never forked from run A.) Synced for the same reason as v10 --
+    # the bench runs LOCALLY, so without this the comparison is impossible.
+    rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_v11/" checkpoints_v11/ 2>/dev/null
+    rsync -az "$HOST:$RDIR/checkpoints_v11/v11_s20260731.log" checkpoints_v11/train_remote.log 2>/dev/null
     # v8 from-scratch run — RETIRED 2026-07-26 at 1.589B (superseded by v9). Kept
     # syncing so its final checkpoints stay pullable; delete once archived.
     rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_scratch/" checkpoints_scratch/ 2>/dev/null

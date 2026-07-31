@@ -1,5 +1,13 @@
-"""Training dashboard for the live from-scratch run. One dark page, a panel per
-workstream:
+"""Training dashboard for the live runs. One dark page, A TAB PER RUNNING ARM,
+plus a panel per workstream.
+
+TABS (2026-07-31, three concurrent arms — see RUNS below). The per-run panels
+(live run + curriculum) show whichever tab is selected; gate / SSL / system are
+global and identical under every tab, so they are not duplicated. The selected
+tab is stored in localStorage, so a page left open on run C stays on run C.
+Each tab carries a live dot — green advancing, amber log stale >5 min, grey not
+synced — because a training log outlives the process that writes it, and a dead
+arm must look dead here rather than merely stop moving.
 
   main        the live run             checkpoints_scratch/train_remote.log (synced)
   curriculum  per-bot difficulty       the same log's auto-curriculum lines --
@@ -47,10 +55,37 @@ REPO = Path(__file__).resolve().parent.parent
 # for the common case; set CONSTRUCT_DASH_MAIN_LOG / CONSTRUCT_DASH_CKPT_DIR to
 # follow a different lineage.
 import os as _os
+# v9 is the live run since 2026-07-26 (fresh net, 104-row air action table, equal
+# 1s/2s/3s). The v8 from-scratch lineage in checkpoints_scratch was retired at
+# 1.589B; point the env vars at it to inspect that history.
 MAIN_LOG = Path(_os.environ.get(
-    "CONSTRUCT_DASH_MAIN_LOG", REPO / "checkpoints_scratch" / "train_remote.log"))
+    "CONSTRUCT_DASH_MAIN_LOG", REPO / "checkpoints_v9" / "train_remote.log"))
 CKPT_DIR = Path(_os.environ.get(
-    "CONSTRUCT_DASH_CKPT_DIR", REPO / "checkpoints_scratch"))
+    "CONSTRUCT_DASH_CKPT_DIR", REPO / "checkpoints_v9"))
+
+# --- the live arms, one dashboard tab each -------------------------------------
+# THREE runs since 2026-07-31. Each has its own log and checkpoint dir, and the
+# per-run panels (live run + curriculum) render whichever tab is selected; the
+# gate / SSL / system panels are global and shown under every tab.
+#
+# `role` is the sentence that says what a tab MEANS, because the whole point of
+# three arms is that they are not interchangeable: reading B's curve as if it
+# were A's is exactly the confusion that made B-vs-A uninterpretable for a week.
+#
+# MAIN_LOG / CKPT_DIR above still drive the FIRST entry, so the env overrides keep
+# working for inspecting a retired lineage.
+RUNS = [
+    {"id": "a", "label": "A · control", "log": MAIN_LOG, "ckpt": CKPT_DIR,
+     "role": "v9 control lineage — reward_v9_aerial.toml, no planar flag."},
+    {"id": "b", "label": "B · planar-air", "log": REPO / "checkpoints_v10" / "train_remote.log",
+     "ckpt": REPO / "checkpoints_v10",
+     "role": "reward_v10_planar.toml (vel_to_ball_planar_air = true). Its own lineage "
+             "since the entropy arm — NOT a fork of A."},
+    {"id": "c", "label": "C · null control", "log": REPO / "checkpoints_v11" / "train_remote.log",
+     "ckpt": REPO / "checkpoints_v11",
+     "role": "forked from B's OWN start (v10 ck_002278225920) with A's control tape. "
+             "B vs C at matched steps isolates the flag; B vs A never could."},
+]
 SSL_LOG = REPO / "logs" / "ssl_pull.log"
 SSL_DIR = REPO / "data" / "replays" / "ssl"
 GATE_HISTORY = REPO / "logs" / "matchwin_history.jsonl"        # appended by matchwin_gate.py
@@ -433,8 +468,8 @@ def cached_parse(path, fn, tag=None):
     return val
 
 
-def checkpoint_info():
-    cks = sorted(CKPT_DIR.glob("ck_*.pt"))
+def checkpoint_info(ckpt_dir=None):
+    cks = sorted((ckpt_dir or CKPT_DIR).glob("ck_*.pt"))
     if not cks:
         return {}
     total = sum(f.stat().st_size for f in cks)
@@ -561,24 +596,32 @@ SLOW = SlowSampler()
 # payload
 # ---------------------------------------------------------------------------
 
-def _parse_main(text):
+def _make_parse_main(log_path):
     """parse_train_log + estimated wall times (anchored at the log's mtime —
     consistent with the cache key, which includes mtime). Runs once per file
-    change, so the O(rows) walk stays off the steady-state request path."""
-    out = parse_train_log(text)
-    try:
-        anchor = MAIN_LOG.stat().st_mtime
-    except OSError:
-        anchor = time.time()
-    for r, (t, rough) in zip(out["rows"], estimate_train_times(out["rows"], anchor, out["restarts"])):
-        r["ts_est"] = round(t, 1)
-        if rough:
-            r["ts_rough"] = True
-    return out
+    change, so the O(rows) walk stays off the steady-state request path.
+
+    Closes over the log path so each run anchors on ITS OWN mtime; using a single
+    global here would date every arm's wall-clock estimates to whichever log was
+    written last."""
+    def _parse(text):
+        out = parse_train_log(text)
+        try:
+            anchor = log_path.stat().st_mtime
+        except OSError:
+            anchor = time.time()
+        for r, (t, rough) in zip(out["rows"],
+                                 estimate_train_times(out["rows"], anchor, out["restarts"])):
+            r["ts_est"] = round(t, 1)
+            if rough:
+                r["ts_rough"] = True
+        return out
+    return _parse
 
 
-def _main_payload(now):
-    train = cached_parse(MAIN_LOG, _parse_main, tag="main")
+def _main_payload(now, log_path=None, ckpt_dir=None):
+    log_path = log_path or MAIN_LOG
+    train = cached_parse(log_path, _make_parse_main(log_path), tag="main")
     rows = downsample(train["rows"], MAX_POINTS, tail=150)
     last = rows[-1] if rows else None
     eta = None
@@ -586,11 +629,11 @@ def _main_payload(now):
         nxt = (last["steps"] // 100_000_000 + 1) * 100_000_000
         eta = int((nxt - last["steps"]) / last["sps"])
     try:
-        age = int(now - MAIN_LOG.stat().st_mtime)
+        age = int(now - log_path.stat().st_mtime)
     except OSError:
         age = None
     return {"rows": rows, "restarts": train["restarts"], "containment": train["containment"],
-            "ckpt": checkpoint_info(), "eta_s": eta, "log_age_s": age}
+            "ckpt": checkpoint_info(ckpt_dir), "eta_s": eta, "log_age_s": age}
 
 
 def _ssl_payload(now):
@@ -605,9 +648,21 @@ def _ssl_payload(now):
 
 def payload():
     now = time.time()
+    runs = {}
+    for r in RUNS:
+        log, ckpt = Path(r["log"]), Path(r["ckpt"])
+        # A run whose log has not synced yet (a freshly launched arm) must render as
+        # an EMPTY tab, not vanish and not crash the whole page -- cached_parse and
+        # checkpoint_info both already degrade to {} / [] on a missing path.
+        runs[r["id"]] = {
+            "label": r["label"], "role": r["role"], "log": str(log.relative_to(REPO)),
+            "main": _main_payload(now, log, ckpt),
+            "curriculum": cached_parse(log, parse_curriculum, tag="curr"),
+        }
     return {
-        "main": _main_payload(now),
-        "curriculum": cached_parse(MAIN_LOG, parse_curriculum, tag="curr"),
+        "runs": runs,
+        "run_order": [r["id"] for r in RUNS],
+        # global panels -- identical under every tab, so they are NOT duplicated per run
         "gate": cached_parse(GATE_HISTORY, parse_gate_history, tag="gate"),
         "ssl": _ssl_payload(now),
         "sys": list(SAMPLER.history),
@@ -664,6 +719,24 @@ svg.chart.rule .mark, svg.chart.rule .dot { fill:var(--rule-series) }
 .bot.easing .verdict { color:var(--rule) }
 .bot .verdict .sub2 { display:block; color:var(--muted); font-size:10.5px }
 .parity { stroke:var(--muted); stroke-width:1; stroke-dasharray:4 3 }
+/* --- run tabs: one per live arm -------------------------------------------
+   The arms are NOT interchangeable (A control / B planar flag / C null control),
+   so each tab states its role and carries a live dot: green = advancing, amber =
+   log stale, grey = nothing synced yet. A dead arm must look dead here, because
+   the log file outlives the process that writes it. */
+.tabs { display:flex; gap:8px; margin:0 0 14px; flex-wrap:wrap }
+.tab { background:var(--panel); border:1px solid var(--border); border-radius:9px;
+       padding:8px 13px; cursor:pointer; color:var(--ink2); text-align:left;
+       font:inherit; line-height:1.25; min-width:150px }
+.tab:hover { border-color:var(--muted) }
+.tab.on { background:var(--card); border-color:var(--series); color:var(--ink) }
+.tab .t { font-weight:650; font-size:13px; display:flex; align-items:center; gap:6px }
+.tab .s { font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums }
+.tab.on .s { color:var(--ink2) }
+.dot { width:7px; height:7px; border-radius:50%; background:var(--muted); flex:none }
+.dot.live { background:#4bbf73 }
+.dot.stale { background:var(--rule) }
+.runrole { color:var(--muted); font-size:11.5px; margin:-6px 0 12px }
 .panel h2 { font-size:13px; font-weight:650; color:var(--ink2); margin-bottom:10px;
             text-transform:uppercase; letter-spacing:.05em }
 .panel h2 .meta { font-weight:400; text-transform:none; letter-spacing:0;
@@ -720,6 +793,9 @@ tr.curr td { background:var(--accent) }
 </style></head><body data-palette="#3987e5">
 <h1>Construct — training</h1>
 <div class="sub" id="status">loading…</div>
+
+<div class="tabs" id="tabs"></div>
+<div class="runrole" id="runrole"></div>
 
 <section class="panel main">
   <h2>Live run · from-scratch vs external bots<span class="meta" id="main-meta"></span></h2>
@@ -1029,9 +1105,39 @@ function renderSys(d) {
 }
 
 let LAST = null;
+// Selected arm. Survives refreshes and reloads, so a tab you left open on run C
+// does not silently snap back to A every 5 seconds.
+let RUN = localStorage.getItem("construct.run") || "a";
+
+function renderTabs(d) {
+  const bar = document.getElementById("tabs");
+  bar.innerHTML = "";
+  d.run_order.forEach(id => {
+    const r = d.runs[id], rows = r.main.rows, last = rows[rows.length-1];
+    const age = r.main.log_age_s;
+    // grey = never synced; amber = log has not moved in 5 min (an eval iteration
+    // can stretch a normal gap past a minute, so 60s would cry wolf); green = live.
+    const state = last == null ? "" : (age != null && age > 300 ? "stale" : "live");
+    const b = document.createElement("button");
+    b.className = "tab" + (id === RUN ? " on" : "");
+    b.innerHTML = `<div class="t"><span class="dot ${state}"></span>${r.label}</div>` +
+                  `<div class="s">${last ? fmtSteps(last.steps) + " · " + last.sps.toLocaleString() + " sps"
+                                         : "no data synced"}</div>`;
+    b.onclick = () => { RUN = id; localStorage.setItem("construct.run", id);
+                        if (LAST) renderAll(LAST); };
+    bar.appendChild(b);
+  });
+}
+
 function renderAll(d) {
-  renderMain(d.main);
-  renderCurriculum(d.curriculum);
+  // A stored id can name a run that no longer exists (RUNS edited between
+  // sessions); fall back rather than render a blank page.
+  if (!d.runs[RUN]) RUN = d.run_order[0];
+  const r = d.runs[RUN];
+  renderTabs(d);
+  document.getElementById("runrole").textContent = r.role + "  ·  " + r.log;
+  renderMain(r.main);
+  renderCurriculum(r.curriculum);
   renderGate(d.gate);
   renderSSL(d.ssl);
   renderSys(d);
