@@ -29,7 +29,10 @@ fi
 # checkpoints_hc/<arm>/, the legacy lineage to checkpoints_entity/. We stream
 # whichever holds the freshest checkpoint (newest by mtime = the live frontier),
 # so the viewer auto-follows the current arm wherever it writes.
-WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_scratch checkpoints_entity checkpoints_hc}"
+# checkpoints_v9 FIRST: v9 is the live run since 2026-07-26 (the v8 lineage in
+# checkpoints_scratch was retired at 1.589B). Selection is by mtime, so listing
+# v9 first only matters on a tie, but it documents which lineage is live.
+WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_v9 checkpoints_scratch checkpoints_entity checkpoints_hc}"
 # Curriculum the viewer renders under -- MUST match the live arm's curriculum so
 # "what you watch matches what it learns". Default is the match-win regime
 # (full 300s matches + score); set CONSTRUCT_WATCH_CURRICULUM='' to render
@@ -44,7 +47,7 @@ WATCH_CURRICULUM="${CONSTRUCT_WATCH_CURRICULUM-configs/curriculum_v3_match.toml}
 # plain self-play.
 FOREIGN_ROSTER=(element immortal necto nexto self)
 FOREIGN_CACHE="${CONSTRUCT_FOREIGN_CACHE:-$HOME/.cache/construct}"
-SCRATCH_LOG="${CONSTRUCT_SCRATCH_LOG:-checkpoints_scratch/train_remote.log}"
+SCRATCH_LOG="${CONSTRUCT_SCRATCH_LOG:-checkpoints_v9/train_remote.log}"
 WATCH_FOREIGN="${CONSTRUCT_WATCH_FOREIGN:-1}"
 current_period() {  # $1 = bot kind. Periods are PER BOT since 2026-07-25, so the
                     # viewer must read that bot's own rung out of the newest
