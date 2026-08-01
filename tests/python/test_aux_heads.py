@@ -326,3 +326,36 @@ def test_a_net_built_from_an_aux_checkpoint_loads_strictly():
                                     if False))
     with pytest.raises(RuntimeError, match="Unexpected key"):
         plain.load_state_dict(sd)
+
+
+def test_a_diverging_recon_head_is_dropped_not_propagated():
+    """An auxiliary loss must never inject an unbounded gradient into a well-trained
+    trunk. Seen TWICE on the first update after a (re)start: raw recon 1.7e24 on a fresh
+    fork (clip_frac 0.05 -> 0.356, ep_rew 2297 -> 2041) and 1.9e22 on a resume.
+
+    The target is bounded (obs features max at |x| ~ 2.6), so a huge recon is always the
+    PREDICTION diverging -- never bad data -- and dropping it is safe.
+    """
+    from construct.learn.aux import RECON_CAP
+    net = _net(aux=True)
+    with torch.no_grad():                      # force the head to produce absurd output
+        net.aux_recon.weight.fill_(1e12); net.aux_recon.bias.zero_()
+    pooled = torch.randn(4, 32, requires_grad=True)
+    loss, info = aux_losses(net, pooled, torch.randn(4, 17, 26),
+                            torch.zeros(4, 17, dtype=torch.bool), torch.zeros(4, 3),
+                            w_recon=0.1, w_reward=0.0)
+    assert info["aux_recon"] > RECON_CAP, "the test did not actually diverge the head"
+    assert info.get("aux_recon_skipped") == 1.0, "divergence must be COUNTED, not silent"
+    loss.backward()
+    assert torch.allclose(pooled.grad, torch.zeros_like(pooled.grad)), \
+        "a dropped recon term must send no gradient into the trunk"
+
+
+def test_a_normal_recon_loss_is_not_dropped():
+    """The mirror: a guard that fired always would 'protect' by disabling the feature."""
+    net = _net(aux=True)
+    _, info = aux_losses(net, torch.randn(8, 32), torch.randn(8, 17, 26),
+                         torch.zeros(8, 17, dtype=torch.bool), torch.zeros(8, 3),
+                         w_recon=0.1, w_reward=0.0)
+    assert "aux_recon_skipped" not in info
+    assert 0.0 < info["aux_recon"] < 100.0

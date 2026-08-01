@@ -36,6 +36,12 @@ import torch
 # 0.067s / 1s / 10s. The last is ~the half-life of gamma=0.9954 (150.3 decisions).
 DEFAULT_HORIZONS = (1, 15, 150)
 
+# Raw recon MSE above this is divergence, not data. Obs entity features are bounded at
+# |x| ~ 2.6 (pos/vel scaled by 1/2300; measured max over a 3000-step rollout, zero elements
+# above 10, zero non-finite), so an in-range prediction cannot exceed ~O(10). See the guard
+# in aux_losses for the two incidents that motivated it.
+RECON_CAP = 100.0
+
 
 def horizon_returns(
     rewards: np.ndarray,      # (T, N)
@@ -120,8 +126,27 @@ def aux_losses(
         # batch with more absent slots is not silently down-weighted.
         denom = keep.sum() * F
         recon = (((pred_e - ents) ** 2) * keep).sum() / denom.clamp(min=1.0)
-        loss = loss + w_recon * recon
-        info["aux_recon"] = float(recon.detach())
+        # GUARD: an auxiliary loss must never inject an unbounded gradient into a
+        # well-trained trunk. Observed TWICE on the first update after a (re)start -- raw
+        # recon of 1.7e24 on a fresh fork (which drove clip_frac 0.05 -> 0.356 and ep_rew
+        # 2297 -> 2041) and 1.9e22 on a resume from a TRAINED head. Zero-init fixed the
+        # fresh-fork case; this covers the rest.
+        #
+        # The TARGET is bounded, so a large value is always the prediction diverging, never
+        # bad data: obs entity features max out at |x| ~ 2.6 (pos/vel are scaled by 1/2300),
+        # with zero elements above 10 and zero non-finite over a 3000-step rollout. A
+        # trained head predicting in-range therefore cannot exceed a recon of ~O(10), so
+        # RECON_CAP=100 is far outside the normal regime and only fires on divergence.
+        #
+        # Dropped rather than clipped: a clipped huge value still points the trunk in a
+        # direction chosen by a diverging head. The skip is COUNTED so it cannot pass
+        # silently -- a run that trips this every iteration is broken, not protected.
+        if torch.isfinite(recon) and float(recon.detach()) <= RECON_CAP:
+            loss = loss + w_recon * recon
+            info["aux_recon"] = float(recon.detach())
+        else:
+            info["aux_recon"] = float(recon.detach())
+            info["aux_recon_skipped"] = 1.0
 
     if w_reward != 0.0:
         rl = torch.nn.functional.mse_loss(pred_r, reward_target)
