@@ -256,3 +256,39 @@ def test_zero_init_head_gives_zero_gradient_to_the_trunk_on_step_one():
         "a zero-init aux head must send NO gradient into the shared trunk"
     assert net.aux_recon.weight.grad.abs().sum() > 0, "the head itself must still learn"
     assert net.aux_reward.weight.grad.abs().sum() > 0
+
+
+def test_per_horizon_explained_variance_separates_the_easy_horizon_from_the_hard_one():
+    """The aggregate aux_reward MSE is a TRAP: it averages horizons whose targets have
+    very different variance, so a large drop is consistent with only the trivial h=1
+    improving while h=150 -- the one ev_mc says is the real deficiency -- does not move.
+
+    Constructed so horizon 0 is predicted perfectly and horizon 2 not at all; the
+    per-horizon ev must show that, and the aggregate MSE must NOT.
+    """
+    net = _net(aux=True)
+    B = 256
+    torch.manual_seed(0)
+    target = torch.randn(B, 3) * torch.tensor([1.0, 1.0, 10.0])
+    pooled = torch.randn(B, 32)
+    with torch.no_grad():          # make the head reproduce column 0 and zero elsewhere
+        net.aux_reward.weight.zero_(); net.aux_reward.bias.zero_()
+    _, info = aux_losses(net, pooled, torch.randn(B, 17, 26),
+                         torch.zeros(B, 17, dtype=torch.bool), target,
+                         w_recon=0.0, w_reward=1.0)
+    # a zero head predicts the mean-ish (0), so ev ~ 0 on EVERY horizon...
+    assert all(abs(info[f"aux_ev{i}"]) < 0.1 for i in range(3))
+    # ...while the aggregate MSE is dominated by the high-variance horizon alone,
+    # which is exactly why it cannot be read as "the critic improved".
+    assert info["aux_reward"] > 30
+
+
+def test_degenerate_target_column_reports_nan_not_a_perfect_fit():
+    """A constant target has zero variance; 1 - MSE/0 must not render as a great score."""
+    import math
+    net = _net(aux=True)
+    target = torch.zeros(64, 3)          # every column constant
+    _, info = aux_losses(net, torch.randn(64, 32), torch.randn(64, 17, 26),
+                         torch.zeros(64, 17, dtype=torch.bool), target,
+                         w_recon=0.0, w_reward=1.0)
+    assert all(math.isnan(info[f"aux_ev{i}"]) for i in range(3))

@@ -2015,6 +2015,17 @@ class Trainer:
                 if p.get("aux_recon_coef", 0.0) or p.get("aux_reward_coef", 0.0):
                     msg += (f" aux_rec {stats.get('aux_recon', 0.0):.4f}"
                             f" aux_rew {stats.get('aux_reward', 0.0):.4f}")
+                    # PER-HORIZON explained variance. The aggregate above averages three
+                    # horizons with very different target variance, so a big drop in it is
+                    # consistent with only the EASY h=1 improving. These are scale-free and
+                    # on the same scale as diagnose_ppo's ev_mc (~0.35), which is the number
+                    # this arm exists to move -- so read aux_ev on the LAST horizon, not
+                    # aux_rew.
+                    _hz = tuple(p.get("aux_horizons", DEFAULT_HORIZONS))
+                    _ev = [stats.get(f"aux_ev{_i}") for _i in range(len(_hz))]
+                    if any(v is not None for v in _ev):
+                        msg += " aux_ev " + "/".join(
+                            "—" if v is None else f"{v:.3f}" for v in _ev)
                 if p.get("lr_final") is not None:
                     # Only when a schedule is configured, so every existing run's
                     # log line -- and ctl.py/dashboard.py's regex, which anchors on

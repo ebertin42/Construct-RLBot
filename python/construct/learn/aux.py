@@ -127,5 +127,28 @@ def aux_losses(
         rl = torch.nn.functional.mse_loss(pred_r, reward_target)
         loss = loss + w_reward * rl
         info["aux_reward"] = float(rl.detach())
+        # PER-HORIZON EXPLAINED VARIANCE, because the aggregate above is a TRAP.
+        # It averages three horizons whose targets have wildly different variance: the
+        # h=1 target is nearly trivial (r + gamma*V', which the value head already fits)
+        # while h=150 is the hard one that ev_mc says is the actual deficiency. A drop
+        # from 34 to 3 in the mean is consistent with the easy horizon carrying all of it
+        # and the long one not moving -- unattributed aggregates have already misled this
+        # investigation twice.
+        #
+        # ev = 1 - MSE/Var is scale-free, comparable ACROSS horizons, and on the same
+        # scale as the diagnose_ppo ev_mc (~0.35) this whole arm exists to move.
+        with torch.no_grad():
+            se = ((pred_r - reward_target) ** 2).mean(dim=0)          # [H]
+            var = reward_target.var(dim=0, unbiased=False)            # [H]
+            ev = 1.0 - se / var.clamp(min=1e-8)
+            # A degenerate (constant) target makes ev meaningless, not 1.0 -- report nan
+            # so a flat column is visible as absent rather than as a perfect fit.
+            ev = torch.where(var > 1e-8, ev, torch.full_like(ev, float("nan")))
+            # SCALARS, one key per horizon -- ppo_update averages stats as floats, so a
+            # list here would break the aggregation. nan on a degenerate column
+            # propagates through that mean and prints as nan, which is the honest
+            # rendering of "not measurable" rather than a silent 0.0 or a fake 1.0.
+            for _i in range(ev.shape[0]):
+                info[f"aux_ev{_i}"] = float(ev[_i])
 
     return loss, info
