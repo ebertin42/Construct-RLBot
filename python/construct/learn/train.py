@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from construct._engine import Engine, action_table_v1, action_table_v1_air, schema_dict
+from construct.learn.aux import DEFAULT_HORIZONS, aux_losses, horizon_returns
 from construct.learn.config import TrainConfig
 from construct.learn.gae import compute_gae
 from construct.learn.kickstart import (
@@ -23,7 +24,7 @@ from construct.tables import DEFAULT_V1_TABLE
 
 
 def compose_extra_loss(net, batch, *, kickstart, lambda_k, lambda_v,
-                       prior_logits, lambda_p):
+                       prior_logits, lambda_p, w_recon=0.0, w_reward=0.0):
     """Build the per-minibatch extra-loss hook for ppo_update, composing the
     kickstart distillation term (KL(teacher‖student)+value MSE, annealed) and
     the BC-prior anchor (KL(student‖prior), constant lambda_p). Returns None
@@ -35,7 +36,18 @@ def compose_extra_loss(net, batch, *, kickstart, lambda_k, lambda_v,
     outputs; prior_logits: None or precomputed full-batch prior logits."""
     kick_on = kickstart is not None and (lambda_k > 0.0 or lambda_v > 0.0)
     prior_on = prior_logits is not None and lambda_p > 0.0
-    if not kick_on and not prior_on:
+    # Aux heads (see learn/aux.py). Gated on BOTH a nonzero weight and the head actually
+    # existing: a config that asks for aux on a net built with aux=False must fail loudly
+    # here rather than silently training without it -- that silent-null shape is exactly
+    # what made these heads dead scaffolding for weeks.
+    aux_on = (w_recon != 0.0 or w_reward != 0.0)
+    if aux_on and not getattr(net, "aux", False):
+        raise ValueError(
+            f"aux loss requested (w_recon={w_recon}, w_reward={w_reward}) but the net was "
+            "built with aux=False, so aux_reward/aux_recon do not exist. Set [net] aux=true "
+            "(and on a RESUME pass --aux, since the checkpoint's net block overwrites the toml)."
+        )
+    if not kick_on and not prior_on and not aux_on:
         return None
 
     def fn(idx):
@@ -67,6 +79,19 @@ def compose_extra_loss(net, batch, *, kickstart, lambda_k, lambda_v,
             kl_p = kl_student_prior(s_logits, prior_logits[idx])
             loss = loss + lambda_p * kl_p
             info["kl_pri"] = kl_p.item()
+        if aux_on:
+            # A SECOND trunk pass, not a reuse of the one above: `net(**obs)` returns
+            # (logits, value) and discards `pooled`, and the aux losses must shape the
+            # EXACT representation the value head reads. net.trunk() is what forward()
+            # itself calls, so the two cannot drift.
+            o = batch["obs"]
+            pooled = net.trunk(**{k: v[idx] for k, v in o.items()})
+            a_loss, a_info = aux_losses(
+                net, pooled, o["ents"][idx], o["mask"][idx],
+                batch["aux_returns"][idx], w_recon=w_recon, w_reward=w_reward,
+            )
+            loss = loss + a_loss
+            info.update(a_info)
         return loss, info
 
     return fn
@@ -398,6 +423,10 @@ class Trainer:
                 d_model=int(cfg.net["d_model"]), layers=int(cfg.net["layers"]),
                 heads=int(cfg.net["heads"]), ff=int(cfg.net["ff"]),
                 action_table=action_table_for(self.schema),
+                # Aux heads (learn/aux.py). Off unless the config asks: an unconfigured
+                # run must stay byte-identical to before. On a RESUME this is overwritten
+                # by the checkpoint's net block, so resume_train.py exposes --aux.
+                aux=bool(cfg.net.get("aux", False)),
             ).to(self.device)
         else:
             self.net = PolicyValueNet(
@@ -743,9 +772,67 @@ class Trainer:
                       f"adjust every {self._ac_every} iters", flush=True)
 
         if _state:
-            self.net.load_state_dict(_state["model"])
+            # ENABLING AUX ON A RESUME IS THE ONE CASE WHERE MISSING KEYS ARE LEGAL:
+            # a checkpoint trained with aux=False has no aux_reward/aux_recon tensors, so
+            # a strict load would refuse. Accept ONLY those four, freshly initialised, and
+            # still fail loudly on anything else missing or unexpected -- a silent
+            # strict=False everywhere would hide a genuine architecture mismatch, which is
+            # far worse than the problem it solves.
+            missing, unexpected = self.net.load_state_dict(_state["model"], strict=False)
+            allowed = {"aux_reward.weight", "aux_reward.bias",
+                       "aux_recon.weight", "aux_recon.bias"}
+            bad_missing = set(missing) - allowed
+            if bad_missing or unexpected:
+                raise RuntimeError(
+                    f"checkpoint/net mismatch — missing {sorted(bad_missing)}, "
+                    f"unexpected {sorted(unexpected)}"
+                )
+            if missing:
+                # ZERO-INIT THE FRESH AUX HEADS. Measured the hard way: with default
+                # PyTorch init and w_recon=0.1, the first update drove aux_recon to a raw
+                # loss of 1.7e24, clip_frac to 0.356 (normal ~0.05) and ep_rew from 2297 to
+                # 2041 -- a random head attached to a 2.8B-step trunk is a large gradient
+                # pointed at a well-trained representation.
+                #
+                # Zero weights make the head predict 0, so its loss starts at the target's
+                # own variance and, crucially, dL/d(pooled) = W^T(...) = 0 at step one: the
+                # TRUNK sees no aux gradient until the head has learned something worth
+                # propagating. It ramps itself; no schedule needed.
+                with torch.no_grad():
+                    for _n, _p in self.net.named_parameters():
+                        if _n in missing:
+                            _p.zero_()
+                print(f"[aux] fresh-initialised {sorted(missing)} to ZERO "
+                      f"(checkpoint predates the aux heads; zero-init keeps the first "
+                      f"update from shocking the trunk)", flush=True)
             if _state["optimizer"] is not None:  # None = deliberate reset (regime swap)
-                self.opt.load_state_dict(_state["optimizer"])
+                # Enabling aux adds 4 tensors, so Adam's saved param group is SHORTER than
+                # the optimizer's and load_state_dict refuses on size. `--reset-optimizer`
+                # would clear it, but that throws away the moments for all 488k existing
+                # params at 2.8B steps -- a real perturbation to dodge a bookkeeping issue.
+                # Instead extend the saved group with the new indices and leave their state
+                # absent; Adam initialises per-param state lazily on first step.
+                #
+                # SAFE ONLY BECAUSE THE NEW PARAMS SORT LAST: aux_reward/aux_recon are
+                # registered last in EntityPolicyNet.__init__, so parameters() yields them
+                # after every pre-existing tensor and indices 0..M-1 still mean what the
+                # checkpoint meant. Asserted, not assumed.
+                osd = _state["optimizer"]
+                n_now = sum(len(g["params"]) for g in self.opt.state_dict()["param_groups"])
+                n_old = sum(len(g["params"]) for g in osd["param_groups"])
+                if n_now != n_old:
+                    names = [n for n, _ in self.net.named_parameters()]
+                    added = n_now - n_old
+                    assert added > 0 and all(n.startswith("aux_") for n in names[n_old:]), (
+                        f"optimizer param count changed {n_old}->{n_now} but the extra "
+                        f"tensors are {names[n_old:]}, not aux_* — refusing to pad")
+                    osd = {**osd, "param_groups": [dict(g) for g in osd["param_groups"]]}
+                    osd["param_groups"][-1]["params"] = (
+                        list(osd["param_groups"][-1]["params"]) + list(range(n_old, n_now))
+                    )
+                    print(f"[aux] extended optimizer param group by {added} "
+                          f"({names[n_old:]}); existing moments preserved", flush=True)
+                self.opt.load_state_dict(osd)
             self.total_steps = _state["total_steps"]
             # Absent on every checkpoint written before 2026-07-26, in which case
             # this is a no-op and the rungs stay at their config seeds exactly as
@@ -1384,6 +1471,24 @@ class Trainer:
         # mean re-deriving the worker split `(num_arenas - assigned)/(threads - t)`
         # with `threads` auto-detected from the machine -- it would agree on this
         # box and disagree on another, mis-scaling every gradient with no error.
+        # Multi-horizon return targets for aux_reward. Computed only when the aux
+        # reward weight is on -- horizon_returns walks a window per step, so it is not
+        # free, and an unconfigured run must not pay for it.
+        if float(self.cfg.ppo.get("aux_reward_coef", 0.0)) != 0.0:
+            hz = tuple(self.cfg.ppo.get("aux_horizons", DEFAULT_HORIZONS))
+            hr = horizon_returns(
+                out["rewards"], values_ext, out["terminated"], out["truncated"],
+                self.cfg.ppo["gamma"], hz,
+            )
+            result["aux_returns"] = torch.as_tensor(
+                hr.reshape(T * N, len(hz)), device=dev
+            )
+        else:
+            # aux_losses still indexes this when only w_recon is on; a zero tensor keeps
+            # the shape contract without computing the windows.
+            result["aux_returns"] = torch.zeros(
+                (T * N, len(DEFAULT_HORIZONS)), device=dev
+            )
         if "learner_team_size" in out:
             lab = np.asarray(out["learner_team_size"]).astype(np.int64)
             assert lab.shape == (N,), f"learner_team_size {lab.shape} != ({N},)"
@@ -1866,6 +1971,8 @@ class Trainer:
                 self.net, batch,
                 kickstart=kickstart_outs, lambda_k=lambda_k, lambda_v=lambda_v,
                 prior_logits=prior_logits, lambda_p=lambda_p,
+                w_recon=float(p.get("aux_recon_coef", 0.0)),
+                w_reward=float(p.get("aux_reward_coef", 0.0)),
             )
 
             stats = ppo_update(
@@ -1899,6 +2006,15 @@ class Trainer:
                     msg += f" kick_kl {stats.get('kick_kl', 0.0):.4f} lambda_k {lambda_k:.3f}"
                 if self.kl_prior is not None:
                     msg += f" kl_pri {stats.get('kl_pri', 0.0):.4f} lambda_p {lambda_p:.3f}"
+                # Aux losses, RAW (unweighted) so the magnitudes are readable and the
+                # coefficients can be sized from the log. Printed only when configured, so
+                # every existing run's line is unchanged. This is the observability that
+                # was missing when these heads sat dead for weeks: a run claiming aux is on
+                # must SHOW a nonzero, moving number, not merely have been launched with
+                # the flag.
+                if p.get("aux_recon_coef", 0.0) or p.get("aux_reward_coef", 0.0):
+                    msg += (f" aux_rec {stats.get('aux_recon', 0.0):.4f}"
+                            f" aux_rew {stats.get('aux_reward', 0.0):.4f}")
                 if p.get("lr_final") is not None:
                     # Only when a schedule is configured, so every existing run's
                     # log line -- and ctl.py/dashboard.py's regex, which anchors on

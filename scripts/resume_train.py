@@ -66,6 +66,16 @@ p.add_argument("--adv-norm", choices=["global", "group"], default=None,
                     "resumed CHECKPOINT's ppo block wins over the toml, so on a "
                     "resume this flag is the ONLY way to change it -- and it is "
                     "also the kill switch if per-group standardisation misbehaves.")
+p.add_argument("--aux", action="store_true",
+               help="enable the aux heads (aux_reward + aux_recon, see learn/aux.py). "
+                    "REQUIRED ON A RESUME: line ~75 does `cfg.net = state[\'config\'][\'net\']`, "
+                    "so the CHECKPOINT's net block overwrites the toml and an `aux = true` "
+                    "there is silently discarded -- the run would train with dead heads and "
+                    "produce a guaranteed null. Same trap class as --entropy-coef/--adv-norm.")
+p.add_argument("--aux-recon-coef", type=float, default=None,
+               help="weight on the masked entity-reconstruction aux loss")
+p.add_argument("--aux-reward-coef", type=float, default=None,
+               help="weight on the multi-horizon return-prediction aux loss")
 p.add_argument("--max-iterations", type=int, default=None,
                help="stop after N iterations (for bounded A/B experiments); default: run forever")
 args = p.parse_args()
@@ -89,6 +99,13 @@ if args.team_sizes:
     cfg.env["team_size_weights"] = [float(x) for x in args.team_sizes.split(",")]
 if args.curriculum_config:
     cfg.curriculum_config_path = args.curriculum_config
+# Applied AFTER `cfg.net = state["config"]["net"]` above, which is the whole point.
+if args.aux:
+    cfg.net = {**cfg.net, "aux": True}
+if args.aux_recon_coef is not None:
+    cfg.ppo = {**cfg.ppo, "aux_recon_coef": args.aux_recon_coef}
+if args.aux_reward_coef is not None:
+    cfg.ppo = {**cfg.ppo, "aux_reward_coef": args.aux_reward_coef}
 if args.reset_optimizer:
     state["optimizer"] = None
 if args.league:

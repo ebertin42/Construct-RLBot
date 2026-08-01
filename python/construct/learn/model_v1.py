@@ -119,13 +119,23 @@ class EntityPolicyNet(nn.Module):
         print(f"EntityPolicyNet: {n_params:,} params (d_model={d_model} layers={layers} "
               f"heads={heads} ff={ff} aux={aux} action_table={action_table.shape[0]})")
 
-    def forward(
+    def trunk(
         self,
         ents: torch.Tensor,     # [B,17,26] f32
         mask: torch.Tensor,     # [B,17] bool True=ignore
         query: torch.Tensor,    # [B,64] f32
         prev: torch.Tensor,     # [B,5] int64
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:          # [B,d] pooled
+        """Everything up to `pooled` — the shared representation the policy head, the
+        value head and the aux heads all read.
+
+        Split out of `forward` so the aux losses can consume the EXACT tensor the value
+        head sees; shaping a separately-recomputed embedding would train a different
+        representation than the critic reads. `forward` calls this, so the two cannot
+        drift apart. No parameter is added or renamed, which is load-bearing: the Rust
+        engine looks weights up by name (policy_v1.rs) and weight-name parity with candle
+        is what lets the same checkpoint run in both.
+        """
         x = self.embed(ents)  # [B,17,d]
         for blk in self.blocks:
             x = blk(x, mask)
@@ -137,7 +147,16 @@ class EntityPolicyNet(nn.Module):
         prev_e = self.act_embed(prev_rows)           # [B,5,32]
         w = torch.softmax(self.prev_embed_w, dim=0)   # [5]
         prev_sum = (prev_e * w.view(1, PREV_ACTIONS, 1)).sum(dim=1)  # [B,32]
-        pooled = pooled + self.prev_proj(prev_sum)
+        return pooled + self.prev_proj(prev_sum)
+
+    def forward(
+        self,
+        ents: torch.Tensor,     # [B,17,26] f32
+        mask: torch.Tensor,     # [B,17] bool True=ignore
+        query: torch.Tensor,    # [B,64] f32
+        prev: torch.Tensor,     # [B,5] int64
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pooled = self.trunk(ents, mask, query, prev)
 
         player = self.policy_dot(pooled)              # [B,32]
         table_e = self.act_embed(self.action_table)    # [N,32]
