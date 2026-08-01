@@ -40,6 +40,8 @@ class KLPrior:
             d_model=int(dims["d_model"]), layers=int(dims["layers"]),
             heads=int(dims["heads"]), ff=int(dims["ff"]),
             action_table=ck["model"]["action_table"].numpy(),
+            # see deploy/model.py: aux-run checkpoints carry four extra tensors
+            aux=any(k.startswith("aux_") for k in ck["model"]),
         )
         self.net.load_state_dict(ck["model"])  # strict: dims mismatch raises
         self.device = torch.device(device)

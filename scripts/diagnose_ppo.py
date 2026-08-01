@@ -409,6 +409,10 @@ def build_net(state, device):
         d_model=int(net_cfg["d_model"]), layers=int(net_cfg["layers"]),
         heads=int(net_cfg["heads"]), ff=int(net_cfg["ff"]),
         action_table=state["model"]["action_table"].numpy(),
+        # aux inferred FROM THE CHECKPOINT, same pattern as deploy/model.py: a run with
+        # the aux heads carries four extra tensors and a net built without them fails a
+        # strict load on "unexpected keys".
+        aux=any(k.startswith("aux_") for k in state["model"]),
     ).to(device)
     net.load_state_dict(state["model"])
     net.eval()

@@ -292,3 +292,37 @@ def test_degenerate_target_column_reports_nan_not_a_perfect_fit():
                          torch.zeros(64, 17, dtype=torch.bool), target,
                          w_recon=0.0, w_reward=1.0)
     assert all(math.isnan(info[f"aux_ev{i}"]) for i in range(3))
+
+
+def test_every_torch_side_checkpoint_consumer_infers_aux_from_the_checkpoint():
+    """An aux-run checkpoint carries four extra tensors, so ANY consumer that builds
+    EntityPolicyNet and does a strict load must infer `aux` from the state_dict or die on
+    "unexpected keys". diagnose_ppo hit exactly that on run D's first comparison.
+
+    The engine path is unaffected -- policy_v1.rs looks weights up by name and ignores
+    aux_* -- so this covers only the torch side. Guarding it here because the failure
+    surfaces at bench time, which is the worst moment to discover it.
+    """
+    root = Path(__file__).resolve().parents[2]
+    for rel in ("scripts/diagnose_ppo.py", "scripts/watch.py", "scripts/eval_metrics.py",
+                "scripts/bench_collect.py", "scripts/behavior_distance.py",
+                "deploy/model.py", "python/construct/learn/kl_prior.py"):
+        src = (root / rel).read_text()
+        if "EntityPolicyNet(" not in src:
+            continue
+        assert "aux=" in src, f"{rel} builds EntityPolicyNet without ever passing aux"
+
+
+def test_a_net_built_from_an_aux_checkpoint_loads_strictly():
+    """End to end for the inference rule itself."""
+    donor = _net(aux=True)
+    sd = donor.state_dict()
+    rebuilt = EntityPolicyNet(d_model=32, layers=1, heads=2, ff=64,
+                              action_table=_table(),
+                              aux=any(k.startswith("aux_") for k in sd))
+    rebuilt.load_state_dict(sd)          # strict; raises if aux was inferred wrong
+    plain = EntityPolicyNet(d_model=32, layers=1, heads=2, ff=64, action_table=_table(),
+                            aux=any(k.startswith("aux_") for k in donor.state_dict()
+                                    if False))
+    with pytest.raises(RuntimeError, match="Unexpected key"):
+        plain.load_state_dict(sd)

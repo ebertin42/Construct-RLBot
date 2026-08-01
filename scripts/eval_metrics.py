@@ -48,6 +48,8 @@ if is_v1:
     net = EntityPolicyNet(
         d_model=int(net_cfg["d_model"]), layers=int(net_cfg["layers"]),
         heads=heads, ff=int(net_cfg["ff"]), action_table=table,
+        # see deploy/model.py: aux-run checkpoints carry four extra tensors
+        aux=any(k.startswith("aux_") for k in ck["model"]),
     )
     net.load_state_dict(ck["model"])
     net.eval()
