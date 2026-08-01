@@ -8,7 +8,7 @@ HOST="${1:-elliot@192.168.86.117}"
 RDIR="${2:-construct}"
 
 mkdir -p checkpoints checkpoints_entity checkpoints_scratch checkpoints_v9 \
-         checkpoints_v10 checkpoints_v11 league
+         checkpoints_v10 checkpoints_v11 checkpoints_v12 league
 while true; do
     rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints/" checkpoints/ 2>/dev/null
     rsync -az "$HOST:$RDIR/checkpoints/train_v0.log" checkpoints/train_remote.log 2>/dev/null
@@ -36,6 +36,14 @@ while true; do
     # the bench runs LOCALLY, so without this the comparison is impossible.
     rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_v11/" checkpoints_v11/ 2>/dev/null
     rsync -az "$HOST:$RDIR/checkpoints_v11/v11_s20260731.log" checkpoints_v11/train_remote.log 2>/dev/null
+    # v12 — RUN D, the AUX-HEADS arm (2026-08-01). Forked from run A's own
+    # ck_002780933120.pt (sha 73d51f86...), same reward tape, same curriculum, same
+    # entropy: it differs from A ONLY by the aux losses. Synced for the same reason v10
+    # and v11 were -- the bench runs LOCALLY, so without this the A-vs-D comparison is
+    # impossible. Note v10/v11 are RETIRED and no longer advance; they keep syncing only
+    # so their history stays pullable.
+    rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_v12/" checkpoints_v12/ 2>/dev/null
+    rsync -az "$HOST:$RDIR/checkpoints_v12/v12_s20260801.log" checkpoints_v12/train_remote.log 2>/dev/null
     # v8 from-scratch run — RETIRED 2026-07-26 at 1.589B (superseded by v9). Kept
     # syncing so its final checkpoints stay pullable; delete once archived.
     rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_scratch/" checkpoints_scratch/ 2>/dev/null

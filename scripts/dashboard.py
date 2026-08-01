@@ -77,14 +77,26 @@ CKPT_DIR = Path(_os.environ.get(
 RUNS = [
     {"id": "a", "label": "A · control", "log": MAIN_LOG, "ckpt": CKPT_DIR,
      "role": "v9 control lineage — reward_v9_aerial.toml, no planar flag."},
-    {"id": "b", "label": "B · planar-air", "log": REPO / "checkpoints_v10" / "train_remote.log",
+    {"id": "b", "label": "B · planar-air (retired)",
+     "log": REPO / "checkpoints_v10" / "train_remote.log",
      "ckpt": REPO / "checkpoints_v10",
      "role": "reward_v10_planar.toml (vel_to_ball_planar_air = true). Its own lineage "
-             "since the entropy arm — NOT a fork of A."},
-    {"id": "c", "label": "C · null control", "log": REPO / "checkpoints_v11" / "train_remote.log",
+             "since the entropy arm — NOT a fork of A. RETIRED 2026-08-01: the flag "
+             "benched null on all three channels over 36 matched pairs, and it is an "
+             "air lever, which the diagnosis had already ruled out."},
+    {"id": "c", "label": "C · null control (retired)",
+     "log": REPO / "checkpoints_v11" / "train_remote.log",
      "ckpt": REPO / "checkpoints_v11",
      "role": "forked from B's OWN start (v10 ck_002278225920) with A's control tape. "
-             "B vs C at matched steps isolates the flag; B vs A never could."},
+             "B vs C at matched steps isolates the flag; B vs A never could. "
+             "RETIRED 2026-08-01 with B — the flag benched null on all three channels."},
+    {"id": "d", "label": "D · aux heads", "log": REPO / "checkpoints_v12" / "train_remote.log",
+     "ckpt": REPO / "checkpoints_v12",
+     "role": "forked from A at ck_002780933120 (sha 73d51f86…). Same tape, same "
+             "curriculum, same entropy — differs from A ONLY by the aux losses "
+             "(masked entity reconstruction + 3-horizon return prediction). "
+             "Watch aux_rec / aux_rew on A's log-free iter line: both must be nonzero "
+             "and FALLING, or the heads are inert."},
 ]
 SSL_LOG = REPO / "logs" / "ssl_pull.log"
 SSL_DIR = REPO / "data" / "replays" / "ssl"
@@ -102,6 +114,12 @@ ITER_LINE = re.compile(
     r"pi_loss ([-\d.]+) v_loss ([-\d.]+) ent ([-\d.]+) clip ([-\d.]+)"
     r"(?: kick_kl ([-\d.]+) lambda_k ([-\d.]+))?"
     r"(?: kl_pri ([-\d.]+) lambda_p ([-\d.]+))?"
+    # FOURTH ERA (2026-08-01, run D): the aux heads append raw, unweighted
+    # aux_rec/aux_rew. Optional like the two above, so A's line -- which has no aux --
+    # still parses. These are the numbers that say whether the heads are LIVE: both must
+    # be nonzero and falling, or the run is training dead scaffolding, which is exactly
+    # the state the feature shipped in for weeks.
+    r"(?: aux_rec ([-\d.eE+]+) aux_rew ([-\d.eE+]+))?"
 )
 RESUME = re.compile(r"resumed at ([\d,]+) steps")
 CONTAINMENT = "physics blowup contained"
@@ -186,6 +204,8 @@ def parse_iter_line(line):
         row["kick_kl"], row["lambda_k"] = float(m.group(9)), float(m.group(10))
     if m.group(11) is not None:
         row["kl_pri"], row["lambda_p"] = float(m.group(11)), float(m.group(12))
+    if m.group(13) is not None:
+        row["aux_rec"], row["aux_rew"] = float(m.group(13)), float(m.group(14))
     return row
 
 
@@ -944,6 +964,30 @@ function grids(id, metrics) {
   return g;
 }
 
+// Aux-head liveness. The heads sat DEAD for weeks -- declared, never wired -- so
+// "the run was launched with --aux" is not evidence. Both raw losses must be nonzero
+// AND FALLING. Compares the last 20 aux iters against the 20 before them.
+function auxTile(rows) {
+  const a = rows.filter(r => r.aux_rec != null);
+  if (!a.length) return {v: "off", why: "no aux terms on this run's iter line"};
+  const last = a[a.length-1];
+  const mean = xs => xs.reduce((p,c)=>p+c,0) / Math.max(1, xs.length);
+  const recent = a.slice(-20).map(r=>r.aux_rec);
+  const prior  = a.slice(-40,-20).map(r=>r.aux_rec);
+  let trend = "";
+  if (prior.length >= 5) {
+    const d = mean(recent) - mean(prior);
+    trend = d < 0 ? " falling" : (d > 0 ? " RISING" : " flat");
+  }
+  const bad = !(last.aux_rec > 0) || !(last.aux_rew > 0) || last.aux_rec > 1e6;
+  return {
+    v: (bad ? "CHECK " : "live") + " rec " + last.aux_rec.toExponential(2) +
+       " · rew " + last.aux_rew.toFixed(2),
+    why: bad ? "a zero loss means inert heads; a huge one means the head is blowing up"
+             : "raw, unweighted" + trend + spark(recent),
+  };
+}
+
 function renderMain(md) {
   const meta = document.getElementById("main-meta");
   meta.textContent = md.log_age_s != null ? `log synced ${fmtAgo(md.log_age_s)}` : "log missing";
@@ -959,6 +1003,7 @@ function renderMain(md) {
     ["Entropy", last.ent.toFixed(3), "policy randomness"],
     ["KL to prior", klLast ? klLast.kl_pri.toFixed(3) + spark(klRows.slice(-60).map(r=>r.kl_pri)) : "—",
      klLast ? "λ_p " + klLast.lambda_p.toFixed(3) : "no kl-prior iters yet"],
+    ["Aux heads", auxTile(rows).v, auxTile(rows).why],
     ["Blowups contained", md.containment, "physics NaN events, engine-side"],
     ["Latest ck", md.ckpt.latest_steps ? fmtSteps(md.ckpt.latest_steps) : "—",
      md.ckpt.count ? `${md.ckpt.count} on disk · ${md.ckpt.total_gb} GB` : "none synced"],
@@ -970,7 +1015,9 @@ function renderMain(md) {
     if (rs.length > 1) chart(grid.children[i], rs, m, "steps", fmtSteps, md.restarts);
     else grid.children[i].innerHTML = `<h3>${m.title}</h3><div class="why">${m.why}</div>`;
   });
-  const cols = ["steps","sps","ep_rew","pi_loss","v_loss","ent","clip","kl_pri","lambda_p"];
+  const cols = rows.some(r => r.aux_rec != null)
+    ? ["steps","sps","ep_rew","pi_loss","v_loss","ent","clip","aux_rec","aux_rew"]
+    : ["steps","sps","ep_rew","pi_loss","v_loss","ent","clip","kl_pri","lambda_p"];
   document.getElementById("tbl").innerHTML =
     `<tr>${cols.map(c=>`<th>${c}</th>`).join("")}</tr>` +
     rows.slice(-15).reverse().map(r =>

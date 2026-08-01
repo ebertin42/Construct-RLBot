@@ -350,3 +350,39 @@ def test_parse_gate_history_keeps_an_explicit_team_mode():
         '{"ts": 100, "win_share": 0.60, "wins": 300, "draws": 100, "losses": 240, '
         '"n": 640, "passed": true, "mode": 2, "records": 640, "short_records": 71}\n')
     assert rows[0]["mode"] == 2 and rows[0]["short_records"] == 71
+
+
+def test_iter_line_parses_the_aux_era_run_d():
+    """Run D appends `aux_rec X aux_rew Y`. These are the numbers that say whether the
+    aux heads are actually LIVE -- both must be nonzero and falling -- so the dashboard
+    has to surface them, not merely tolerate the suffix."""
+    from scripts.dashboard import parse_iter_line
+    row = parse_iter_line(
+        "iter 5 steps 2,781,400,320 sps 3,573 ep_rew 2177.720 pi_loss 0.0043 "
+        "v_loss 1.0615 ent 2.648 clip 0.067 aux_rec 0.1032 aux_rew 21.2857 lr 1.00e-04"
+    )
+    assert row["aux_rec"] == 0.1032 and row["aux_rew"] == 21.2857
+    assert row["steps"] == 2781400320
+
+
+def test_iter_line_without_aux_still_parses_and_omits_the_keys():
+    """Run A has no aux, and its line must be unaffected -- an era regex that turned
+    optional groups mandatory would blank the control run's whole panel."""
+    from scripts.dashboard import parse_iter_line
+    row = parse_iter_line(
+        "iter 9 steps 2,780,933,120 sps 5,778 ep_rew 2301.5 pi_loss 0.0012 "
+        "v_loss 1.11 ent 2.60 clip 0.058 lr 1.00e-04"
+    )
+    assert "aux_rec" not in row and "aux_rew" not in row
+    assert row["clip"] == 0.058
+
+
+def test_aux_era_survives_scientific_notation():
+    """The raw recon loss hit 1.7e24 on a bad init. If the dashboard cannot parse that
+    it would silently drop exactly the rows that show a blow-up."""
+    from scripts.dashboard import parse_iter_line
+    row = parse_iter_line(
+        "iter 1 steps 1,000 sps 100 ep_rew 1.0 pi_loss 0.0 v_loss 1.0 ent 2.0 "
+        "clip 0.35 aux_rec 1686859847588369263493120.0000 aux_rew 26.1967"
+    )
+    assert row["aux_rec"] > 1e23
