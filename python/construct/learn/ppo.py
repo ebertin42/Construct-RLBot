@@ -98,6 +98,10 @@ def ppo_update(
     clip: float = 0.2,
     entropy_coef: float = 0.01,
     value_coef: float = 1.0,
+    # Weight on the clipped policy-gradient term. 1.0 is every run to date and takes an
+    # identity branch below, so the default path is unchanged. 0.0 makes the update purely
+    # supervised, which is what a distillation gate needs.
+    policy_coef: float = 1.0,
     epochs: int = 3,
     minibatch_size: int = 4096,
     max_grad_norm: float = 0.5,
@@ -163,7 +167,15 @@ def ppo_update(
             clipped = torch.clamp(ratio, 1 - clip, 1 + clip) * a
             policy_loss = -torch.min(unclipped, clipped).mean()
             value_loss = torch.nn.functional.mse_loss(values, batch["returns"][idx])
-            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy.mean()
+            # `policy_coef` exists so the policy-gradient term can be switched OFF for a pure
+            # supervised run (distillation from a foreign teacher, see foreign_distill.py):
+            # extra_loss_fn only ADDS, so without this the PPO gradient fights the teacher for
+            # the whole run and the result is a mixture, not the experiment. value_coef and
+            # entropy_coef were already zeroable from config; this was the one term that was
+            # not. Identity-branch rather than an unconditional `1.0 *` so the default path is
+            # the exact same sequence of ops it has always been.
+            pg = policy_loss if policy_coef == 1.0 else policy_coef * policy_loss
+            loss = pg + value_coef * value_loss - entropy_coef * entropy.mean()
             extra_info: dict[str, float] = {}
             if extra_loss_fn is not None:
                 extra_loss, extra_info = extra_loss_fn(idx)

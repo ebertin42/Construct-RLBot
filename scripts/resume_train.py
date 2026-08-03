@@ -47,6 +47,12 @@ p.add_argument("--foreign-weights", default=None,
 p.add_argument("--foreign-distill-coef", type=float, default=1.0,
                help="weight on the distillation cross-entropy (default 1.0). Only used with "
                     "--foreign-teacher.")
+p.add_argument("--policy-coef", type=float, default=None,
+               help="weight on PPO's clipped policy-gradient term (default 1.0). Pass 0 for a "
+                    "PURELY SUPERVISED run: the distillation loss only ADDS, so at the default "
+                    "the policy gradient competes with the teacher for the whole run and the "
+                    "result is a mixture. Set --entropy-coef 0 and [ppo] value_coef 0 too for "
+                    "a clean supervised pass.")
 p.add_argument("--kl-prior", default=None,
                help="v1 BC checkpoint to use as a frozen KL prior anchor")
 p.add_argument("--kl-prior-lambda", type=float, default=None,
@@ -113,6 +119,8 @@ if args.curriculum_config:
 # Applied AFTER `cfg.net = state["config"]["net"]` above, which is the whole point.
 if args.aux:
     cfg.net = {**cfg.net, "aux": True}
+if args.policy_coef is not None:
+    cfg.ppo = {**cfg.ppo, "policy_coef": args.policy_coef}
 if args.aux_recon_coef is not None:
     cfg.ppo = {**cfg.ppo, "aux_recon_coef": args.aux_recon_coef}
 if args.aux_reward_coef is not None:

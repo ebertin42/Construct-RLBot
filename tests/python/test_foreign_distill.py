@@ -136,3 +136,56 @@ def test_loss_is_minimised_by_matching_the_teacher():
     assert first == pytest.approx(np.log(96), abs=0.1), "zero logits => uniform over classes"
     assert final.item() < first * 0.1
     assert int(collapse_logits(logits.detach(), cls, 96)[0].argmax()) == int(cls[7])
+
+
+def _tiny_batch(n=64, a=8, seed=0):
+    """A minimal v0-shaped PPO batch: obs/actions/logprobs/advantages/returns."""
+    g = torch.Generator().manual_seed(seed)
+    return {
+        "obs": torch.randn(n, 12, generator=g),
+        "actions": torch.randint(0, a, (n,), generator=g),
+        "logprobs": torch.full((n,), -float(np.log(a))),
+        "advantages": torch.randn(n, generator=g),
+        "returns": torch.randn(n, generator=g),
+    }
+
+
+def _tiny_net(a=8):
+    from construct.learn.model import PolicyValueNet
+    torch.manual_seed(0)
+    return PolicyValueNet(obs_size=12, action_count=a, hidden=(16,))
+
+
+def test_policy_coef_zero_removes_the_policy_gradient():
+    """The distillation loss only ADDS to PPO's. Without policy_coef=0 the policy gradient
+    competes with the teacher for the whole run, so a 'pure distillation' gate would in fact
+    measure a mixture. Assert the term is genuinely gone, not just small."""
+    from construct.learn.ppo import ppo_update
+    batch = _tiny_batch()
+    net = _tiny_net()
+    opt = torch.optim.SGD(net.parameters(), lr=0.0)  # lr 0: stats only, weights frozen
+    stats = ppo_update(net, opt, batch, epochs=1, minibatch_size=64,
+                       entropy_coef=0.0, value_coef=0.0, policy_coef=0.0)
+    # policy_loss is still REPORTED (it is computed for the stat) but must not have moved the
+    # weights: with every coefficient zero there is no loss at all.
+    before = [p.detach().clone() for p in net.parameters()]
+    opt2 = torch.optim.SGD(net.parameters(), lr=1.0)
+    ppo_update(net, opt2, batch, epochs=1, minibatch_size=64,
+               entropy_coef=0.0, value_coef=0.0, policy_coef=0.0)
+    for b, p in zip(before, net.parameters()):
+        assert torch.equal(b, p), "policy_coef=0 with no other term must not change weights"
+    assert "policy_loss" in stats
+
+
+def test_policy_coef_one_is_unchanged_from_the_default():
+    """Byte-identity guard: 1.0 takes the identity branch, so passing it explicitly must give
+    exactly the same weights as not passing it at all."""
+    from construct.learn.ppo import ppo_update
+    outs = []
+    for kwargs in ({}, {"policy_coef": 1.0}):
+        net = _tiny_net()
+        opt = torch.optim.SGD(net.parameters(), lr=0.1)
+        ppo_update(net, opt, _tiny_batch(), epochs=2, minibatch_size=32, **kwargs)
+        outs.append([p.detach().clone() for p in net.parameters()])
+    for a, b in zip(*outs):
+        assert torch.equal(a, b), "policy_coef=1.0 must be byte-identical to the default"

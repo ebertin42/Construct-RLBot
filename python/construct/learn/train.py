@@ -2031,7 +2031,8 @@ class Trainer:
 
             stats = ppo_update(
                 self.net, self.opt, batch, clip=p["clip"], entropy_coef=p["entropy_coef"],
-                value_coef=p["value_coef"], epochs=p["epochs"], minibatch_size=p["minibatch_size"],
+                value_coef=p["value_coef"], policy_coef=float(p.get("policy_coef", 1.0)),
+                epochs=p["epochs"], minibatch_size=p["minibatch_size"],
                 extra_loss_fn=extra_loss_fn,
                 # Default "global" == the historical single-scalar
                 # standardisation, byte-identical. v9 declares "group".
