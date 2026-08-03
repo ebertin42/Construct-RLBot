@@ -190,9 +190,74 @@ pub fn to_controls(row: &[f32; 8]) -> CarControls {
     }
 }
 
+/// Index of the FIRST row of `table` exactly equal to `controls`, or `None`.
+///
+/// FOR TEACHER LABELLING: a ported bot returns controls-8, but a distillation
+/// target has to be an index into OUR table. This is exact rather than
+/// nearest-neighbour on purpose — an approximate match would silently relabel a
+/// teacher action as a different one, and a label that is quietly wrong is worse
+/// than a label that is absent. Callers must handle `None` (element and immortal
+/// emit continuous controls that need not appear in any table).
+///
+/// FIRST match, not any match, and that choice is load-bearing. The v1-air table
+/// contains SIX groups of byte-identical rows — {56,94,100}, {57,95,101},
+/// {92,98}, {93,99}, {96,102}, {97,103} — because the appended clean-air block
+/// re-expresses combinations the original 90 rows already had. Logits are
+/// computed from the 8-float row (`act_embed(action_table)`), so members of a
+/// group are provably indistinguishable to the policy. Returning the lowest index
+/// canonicalises every group to one representative, which is the same
+/// equivalence-class collapse a KL against these labels must apply.
+pub fn index_of_controls(table: &[[f32; 8]], controls: &[f32; 8]) -> Option<i64> {
+    table
+        .iter()
+        .position(|row| row == controls)
+        .map(|i| i as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn index_of_controls_is_exact_and_canonical() {
+        let t = make_lookup_table_v1_air();
+        // every row is findable, and duplicates canonicalise to the lowest index
+        for (i, row) in t.iter().enumerate() {
+            let got = index_of_controls(&t, row).expect("every row must be findable");
+            let first = t.iter().position(|r| r == row).unwrap() as i64;
+            assert_eq!(got, first, "row {i} must map to its group's lowest index");
+            assert!(got <= i as i64);
+        }
+        // the known duplicate groups collapse
+        assert_eq!(index_of_controls(&t, &t[94]), Some(56));
+        assert_eq!(index_of_controls(&t, &t[100]), Some(56));
+        assert_eq!(index_of_controls(&t, &t[95]), Some(57));
+        assert_eq!(index_of_controls(&t, &t[101]), Some(57));
+    }
+
+    #[test]
+    fn index_of_controls_refuses_a_near_miss() {
+        // An approximate match would silently mislabel a teacher action. A row
+        // that differs in one component by a hair must return None, not a
+        // neighbour.
+        let t = make_lookup_table_v1_air();
+        let mut near = t[10];
+        near[0] += 1e-3;
+        assert_eq!(index_of_controls(&t, &near), None);
+    }
+
+    #[test]
+    fn nexto_rows_are_a_prefix_of_the_v1_air_table() {
+        // Why teacher labelling from nexto is exact: its 90-row table is rows
+        // 0..90 of ours byte-for-byte, so every nexto choice HAS an index here.
+        let ours = make_lookup_table_v1_air();
+        let nexto = make_lookup_table_v1();
+        assert!(ours.len() >= nexto.len());
+        for (i, row) in nexto.iter().enumerate() {
+            assert_eq!(&ours[i], row, "row {i} diverges; nexto labels would be wrong");
+            assert!(index_of_controls(&ours, row).is_some());
+        }
+    }
 
     #[test]
     fn table_has_90_rows() {

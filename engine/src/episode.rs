@@ -880,6 +880,25 @@ impl EpisodeArena {
         // V1: shift the executed action into each agent's prev-action ring
         // (most-recent-first) BEFORE any possible reset below — a reset then
         // rightly zeroes it. No-op (and no state read) in v0 mode.
+        //
+        // KNOWN DEFECT, DELIBERATELY LEFT AS-IS FOR NOW (2026-08-03): for a
+        // FOREIGN-DRIVEN car this records OUR sampled `action_idx[a]`, but that car
+        // executes the bot's own controls via `foreign_overrides` below, so the ring
+        // describes an action that never happened.
+        //
+        // It is currently HARMLESS and must not be "fixed" carelessly:
+        //   * foreign cars are excluded from learner rows (engine.rs records obs
+        //     `for LEARNER rows only`), so these entries never leave the engine;
+        //   * the bot keeps its OWN prev-action state in ForeignPolicy::prev and
+        //     never reads this ring.
+        // A sentinel is NOT available: nothing clamps a negative index and
+        // `action_table[-1]` silently yields the LAST row (jump+boost+pitch) in
+        // torch, and there is no null row to borrow (row 0 is a real action).
+        //
+        // The correct fix arrives with teacher labelling, which is the first thing
+        // that records obs for a foreign-driven car: map the executed controls-8
+        // back to a table index (exact for nexto, whose 90 rows are byte-identical
+        // to our 0..89) and store THAT. See task #78.
         if let Some(v1) = self.v1.as_mut() {
             for (a, &act) in action_idx.iter().enumerate() {
                 let ring = &mut v1.prev[a];

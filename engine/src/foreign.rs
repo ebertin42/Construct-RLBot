@@ -272,6 +272,39 @@ impl ForeignPolicy {
         self.hold.clear();
     }
 
+    /// The RAW controls this bot last chose for `key`, before the jump/yaw
+    /// override is applied.
+    ///
+    /// `decide` returns the OVERRIDDEN controls (yaw zeroed while jumping for
+    /// kinds that need it) but stores the RAW choice here, because the bot feeds
+    /// its raw action back into its own observation. A teacher LABEL must be the
+    /// raw choice too — that is the action the bot actually selected, and the
+    /// override is an actuation detail applied afterwards. The override is also
+    /// lossy (it destroys yaw), so it cannot be inverted from the return value;
+    /// this accessor is the only way to recover the label.
+    pub fn prev_of(&self, key: u64) -> [f32; 8] {
+        *self.prev.get(&key).unwrap_or(&[0.0; 8])
+    }
+
+    /// Overwrite one car's stored previous action.
+    ///
+    /// EXISTS FOR TEACHER LABELLING, and the distinction it enables is the whole
+    /// point. `decide` ends by storing its OWN chosen controls as the next
+    /// previous action, which is right when the bot is driving: its obs then
+    /// reflects what it actually did.
+    ///
+    /// When the bot is used as a TEACHER over states produced by a DIFFERENT
+    /// policy, that is wrong. The car physically executed the student's controls,
+    /// so the teacher's observation must carry the student's last action, not the
+    /// teacher's counterfactual one. Letting `decide` feed itself would answer
+    /// "what would this bot do if it had been driving all along" — a question
+    /// about a trajectory that never occurred.
+    ///
+    /// Call this after each step with the controls the car ACTUALLY executed.
+    pub fn set_prev(&mut self, key: u64, controls: [f32; 8]) {
+        self.prev.insert(key, controls);
+    }
+
     /// Clear ONE car's previous action. Used at an episode boundary: a slot may
     /// drive several arenas, so a blanket `reset()` would wrongly clear cars whose
     /// episodes are still running.
