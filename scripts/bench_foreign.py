@@ -96,6 +96,23 @@ def main(argv=None):
           f"schema={schema} ({table_name(ck) or 'v0'})")
     print(f"  {rec['wins']}W/{rec['draws']}D/{rec['losses']}L  n={n}  "
           f"win_share={share:.4f} +/- {se:.4f}")
+    # GOALS, because win_share IS CENSORED AT THE FLOOR and has already hit the bound.
+    # At period 1 this bot reads 0W/0D/320L against all four opponents, so win_share is
+    # exactly 0.0000 and carries no information about HOW badly we lose -- 1-0 and 9-0 are
+    # the same number. `split_matches` has always returned (goals_for, goals_against) per
+    # match and this script threw them away. goals-against is also the tighter channel by a
+    # wide margin (CV 0.033-0.060 vs win_share's 0.217-0.307), so near a floor it is the
+    # only signal with usable power. See memory: goals-against-is-the-gate,
+    # absolute-strength-zero-at-period-1.
+    gf = [m[0] for m in matches]
+    ga = [m[1] for m in matches]
+    mf, mg = sum(gf) / n, sum(ga) / n
+    sef = (sum((x - mf) ** 2 for x in gf) / (n - 1) / n) ** 0.5 if n > 1 else 0.0
+    seg = (sum((x - mg) ** 2 for x in ga) / (n - 1) / n) ** 0.5 if n > 1 else 0.0
+    print(f"  goals_for={mf:.4f} +/- {sef:.4f}  goals_against={mg:.4f} +/- {seg:.4f}  "
+          f"diff={mf - mg:+.4f}")
+    print(f"  shutouts_against={sum(1 for x in gf if x == 0)}/{n}  "
+          f"clean_sheets={sum(1 for x in ga if x == 0)}/{n}")
     if share > 0.90:
         print("  -> PUNCHING BAG: the bot is far weaker; training against it "
               "teaches little.")
