@@ -47,6 +47,10 @@ p.add_argument("--foreign-weights", default=None,
 p.add_argument("--foreign-distill-coef", type=float, default=1.0,
                help="weight on the distillation cross-entropy (default 1.0). Only used with "
                     "--foreign-teacher.")
+p.add_argument("--value-coef", type=float, default=None,
+               help="override PPO value_coef. Needed for a purely supervised run: the "
+                    "resumed CHECKPOINT's ppo block overwrites the toml, so editing the toml "
+                    "alone is silently discarded (same trap as --entropy-coef).")
 p.add_argument("--policy-coef", type=float, default=None,
                help="weight on PPO's clipped policy-gradient term (default 1.0). Pass 0 for a "
                     "PURELY SUPERVISED run: the distillation loss only ADDS, so at the default "
@@ -135,7 +139,8 @@ if args.adv_norm is not None:
     cfg.ppo = {**cfg.ppo, "adv_norm": args.adv_norm}
 for _flag, _key in (("lr", "lr"), ("lr_final", "lr_final"),
                     ("lr_hold_steps", "lr_hold_steps"),
-                    ("lr_anneal_steps", "lr_anneal_steps")):
+                    ("lr_anneal_steps", "lr_anneal_steps"),
+                    ("value_coef", "value_coef")):
     _v = getattr(args, _flag)
     if _v is not None:
         cfg.ppo = {**cfg.ppo, _key: _v}

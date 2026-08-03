@@ -2067,6 +2067,17 @@ class Trainer:
                 # was missing when these heads sat dead for weeks: a run claiming aux is on
                 # must SHOW a nonzero, moving number, not merely have been launched with
                 # the flag.
+                # Foreign distillation, RAW cross-entropy against the marginal measured on
+                # the SAME frames. The CE alone is uninterpretable -- a nats figure means
+                # nothing without the state-independent baseline it has to beat -- so both
+                # print together and the gap between them IS the result. label_frac is the
+                # tripwire: it must sit at 1.000, and a drift downward means the teacher's
+                # controls stopped matching the action table, which would silently shrink
+                # the training set instead of erroring.
+                if p.get("foreign_distill_coef", 0.0):
+                    msg += (f" fd_ce {stats.get('fd_ce', 0.0):.4f}"
+                            f" fd_marg {stats.get('fd_marginal', 0.0):.4f}"
+                            f" fd_lab {stats.get('fd_label_frac', 0.0):.3f}")
                 if p.get("aux_recon_coef", 0.0) or p.get("aux_reward_coef", 0.0):
                     msg += (f" aux_rec {stats.get('aux_recon', 0.0):.4f}"
                             f" aux_rew {stats.get('aux_reward', 0.0):.4f}")
