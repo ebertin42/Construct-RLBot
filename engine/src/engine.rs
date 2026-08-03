@@ -50,6 +50,11 @@ enum Cmd {
     /// Foreign (ported-bot) opponent slots. Separate slot space from
     /// `SetOpponents`; a Collect assignment addresses slot `f` as `-(f) - 2`.
     SetForeignOpponents(Arc<Vec<NetWeights>>),
+    /// A TEACHER queried on LEARNER cars for on-policy distillation labels.
+    /// Separate from the opponent slots on purpose: a teacher does not drive any
+    /// car, it only answers "what would you do here" about states the STUDENT
+    /// produced. `None` clears it.
+    SetTeacher(Option<Arc<NetWeights>>),
     // `assignment` is the FULL (global, length num_arenas) opponent assignment;
     // each worker slices its own `[global_base..global_base+count)` range out of
     // it (see the Cmd::Collect arm). Legacy calls (Python `arena_opponents=None`)
@@ -110,6 +115,14 @@ pub struct CollectOut {
     /// reconstruction would silently disagree on some machines and mis-scale
     /// every gradient without producing an error anywhere.
     pub learner_team_size: Vec<i8>,
+    /// `[T, N_learner]` teacher action indices, EMPTY unless a teacher is set.
+    ///
+    /// For on-policy distillation: what a ported bot would do in the state the
+    /// STUDENT is actually standing in. `-1` means the teacher's controls matched
+    /// no row of our table exactly (element and immortal emit continuous
+    /// controls); consumers must FILTER those rows, never index with them —
+    /// `action_table[-1]` silently yields the last row in torch.
+    pub teacher_actions: Vec<i64>,
     /// Rows put through OUR policy's batched forward per round: learner rows
     /// plus the "mirror" cars of a partial foreign team (E4), whose experience
     /// is discarded. Equals `learner_agents` whenever no arena runs a partial
@@ -142,6 +155,7 @@ impl CollectOut {
             last_values: vec![0.0; agents],
             learner_agents: agents,
             learner_team_size: vec![],
+            teacher_actions: vec![],
             forward_rows: agents,
         }
     }
@@ -165,6 +179,8 @@ impl CollectOut {
             last_values: vec![0.0; agents],
             learner_agents: agents,
             learner_team_size: vec![0; agents],
+            // Sized only when a teacher is configured; the caller fills it in.
+            teacher_actions: vec![],
             forward_rows: agents,
         }
     }
@@ -369,6 +385,11 @@ fn collect_v1_worker(
     pol: &EntityPolicy,
     opponents: &[EntityPolicy],
     foreign: &mut [crate::foreign::ForeignPolicy],
+    // Optional TEACHER, queried on LEARNER cars for on-policy distillation
+    // labels. Per-worker (each worker builds its own, like `foreign`), so the
+    // fixed-(seed, num_arenas, num_threads) determinism contract is unchanged.
+    // `None` on every ordinary collect, which is then byte-identical to before.
+    mut teacher: Option<&mut crate::foreign::ForeignPolicy>,
     // Index of this worker's first arena in the GLOBAL arena list; used to build
     // per-arena keys for foreign state (car ids restart at 1 in every arena).
     global_base: usize,
@@ -517,6 +538,12 @@ fn collect_v1_worker(
     let mut out = CollectOut::zeros_v1(steps, n_learner, emit_v0_obs);
     out.learner_team_size = learner_team_size;
     out.forward_rows = n_fwd;
+    // Teacher labels are per LEARNER row, same shape as `actions`. Left EMPTY
+    // when no teacher is set, so an ordinary collect allocates nothing and the
+    // Python dict omits the key entirely. -1 fill = "no exact table match".
+    if teacher.is_some() {
+        out.teacher_actions = vec![-1; steps * n_learner];
+    }
 
     // Full-agent-width per-round obs scratch (current + terminal-final).
     let mut ents_buf = vec![0f32; agents * ek];
@@ -662,6 +689,44 @@ fn collect_v1_worker(
                 }
                 ar.set_foreign_overrides(ov);
             }
+
+            // TEACHER LABELS: for every LEARNER car in this arena, ask the teacher
+            // what IT would do in the state the student is standing in. Queried
+            // BEFORE step_v1 so the label describes the state the student's obs was
+            // just recorded from.
+            //
+            // Keys collide with the opponent's by construction (same arena, same
+            // car ids) but live in a DIFFERENT ForeignPolicy, so the two prev/hold
+            // maps never mix.
+            if let Some(tp) = teacher.as_deref_mut() {
+                // EVERY learner car in this arena, not just blue. In self-play both
+                // sides are learner rows, and a blue-only loop leaves every orange
+                // row at the -1 fill — which reads as "no exact table match" and
+                // would be silently FILTERED rather than raising, discarding half
+                // the labels. `learner_col` is the authority on which agents are
+                // learner rows; iterate all agents and let it decide.
+                for i in 0..n {
+                    let a = aoff + i;
+                    let Some(col) = learner_col[a] else { continue };
+                    let (_cid, key, _out) =
+                        ar.foreign_controls(i, tp, global_base + li);
+                    // The RAW choice, not the returned controls: `decide` applies a
+                    // lossy jump/yaw override on the way out, and the label must be
+                    // the action the bot selected.
+                    let raw = tp.prev_of(key);
+                    out.teacher_actions[t * n_learner + col] =
+                        crate::actions::index_of_controls(ar.action_table(), &raw).unwrap_or(-1);
+                    // Then overwrite the teacher's prev with what the car ACTUALLY
+                    // executes. `decide` just fed it its own choice, which is right
+                    // when the bot drives and wrong when it teaches: this car runs
+                    // the STUDENT's controls, so the teacher's next observation must
+                    // carry those or it answers a question about a trajectory that
+                    // never happened.
+                    let executed = ar.action_table()[acts[a] as usize];
+                    tp.set_prev(key, executed);
+                }
+            }
+
             ar.step_v1(
                 &acts[aoff..aoff + n],
                 &mut rew_buf[..n],
@@ -922,6 +987,10 @@ impl MultiEngine {
                 // addressed by `k <= -2` in a Collect assignment. Empty until
                 // set_foreign_opponents is called.
                 let mut opponents_foreign: Vec<crate::foreign::ForeignPolicy> = Vec::new();
+                // Per-worker like `opponents_foreign`: each worker owns its own
+                // instance built from the same weights, so the fixed-(seed,
+                // num_arenas, num_threads) determinism contract is untouched.
+                let mut teacher_foreign: Option<crate::foreign::ForeignPolicy> = None;
                 while let Ok(cmd) = crx.recv() {
                     match cmd {
                         Cmd::Shutdown => break,
@@ -1105,6 +1174,31 @@ impl MultiEngine {
                                 }
                             }
                         }
+                        Cmd::SetTeacher(w) => {
+                            match w {
+                                None => {
+                                    teacher_foreign = None;
+                                    let _ = otx.send(WorkerOut::ack());
+                                }
+                                Some(w) => match &*w {
+                                    NetWeights::Foreign { raw, kind, .. } => {
+                                        match crate::foreign::ForeignPolicy::new(raw, *kind) {
+                                            Ok(p) => {
+                                                // PERIOD 1 ALWAYS. A teacher must think on
+                                                // every decision; a zero-order hold would
+                                                // label a state with a stale action and the
+                                                // student would learn to imitate lag.
+                                                teacher_foreign = Some(p);
+                                                let _ = otx.send(WorkerOut::ack());
+                                            }
+                                            Err(e) => { let _ = otx.send(WorkerOut::err(e)); }
+                                        }
+                                    }
+                                    _ => { let _ = otx.send(WorkerOut::err(
+                                        "set_teacher needs a foreign dict".into())); }
+                                },
+                            }
+                        }
                         Cmd::Collect { steps, assignment } => {
                             // V1 (entity) rollout lives in its own function so
                             // the v0 loop below stays literally untouched
@@ -1119,7 +1213,8 @@ impl MultiEngine {
                                 let msg = match collect_v1_worker(
                                     steps, my_assignment, &mut arenas, &arena_sizes,
                                     &a_to_arena, max_arena_agents, &mut rngs, pol,
-                                    &opponents_v1, &mut opponents_foreign, global_base,
+                                    &opponents_v1, &mut opponents_foreign,
+                                    teacher_foreign.as_mut(), global_base,
                                     emit_v0_obs,
                                 ) {
                                     Ok(out) => WorkerOut::collect(out),
@@ -1636,6 +1731,37 @@ impl MultiEngine {
         Ok(())
     }
 
+    /// Set (or clear, with `None`) the TEACHER queried on learner cars.
+    ///
+    /// A teacher drives no car. It answers "what would you do here" about states
+    /// the STUDENT produced, which is what makes the labels on-policy — the
+    /// property that offline behaviour cloning lacks and that cost this project a
+    /// 639-0 net once.
+    pub fn set_teacher(&mut self, weights: Option<NetWeights>) -> Result<(), String> {
+        if let Some(w) = &weights {
+            if !matches!(w, NetWeights::Foreign { .. }) {
+                return Err("set_teacher requires a foreign state dict".into());
+            }
+        }
+        let arc = weights.map(Arc::new);
+        for w in &self.workers {
+            w.tx.send(Cmd::SetTeacher(arc.clone())).map_err(|e| e.to_string())?;
+        }
+        let mut first_err: Option<String> = None;
+        for w in &self.workers {
+            let out = w.rx.recv().map_err(|e| e.to_string())?;
+            if let Some(e) = out.error {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     /// Fans `Cmd::Collect { steps, assignment }` to every worker (drain-all: send to
     /// all, then recv from all — same pattern as `set_weights`) and interleaves the
     /// per-worker `CollectOut`s (already learner-row-only, see the worker's
@@ -1731,6 +1857,16 @@ impl MultiEngine {
                     dst[d_start..d_start + n * k].copy_from_slice(&src[t * n * k..(t + 1) * n * k]);
                 }
                 let mut merged = CollectOut::zeros_v1(steps, learner_count, self.emit_v0_obs);
+                // Sized only if the workers produced labels. Checking the first
+                // worker is sound because SetTeacher is broadcast to all of them,
+                // so either every worker has a teacher or none does.
+                if worker_outs
+                    .first()
+                    .and_then(|o| o.collect.as_ref())
+                    .is_some_and(|c| !c.teacher_actions.is_empty())
+                {
+                    merged.teacher_actions = vec![-1; steps * learner_count];
+                }
                 let mut off = 0usize;
                 let mut fwd_rows = 0usize;
                 for out in worker_outs.into_iter() {
@@ -1751,6 +1887,10 @@ impl MultiEngine {
                         ilv(&mut merged.terminated, &co.terminated, t, learner_count, off, n, 1);
                         ilv(&mut merged.truncated, &co.truncated, t, learner_count, off, n, 1);
                         ilv(&mut merged.final_values, &co.final_values, t, learner_count, off, n, 1);
+                        if !merged.teacher_actions.is_empty() {
+                            ilv(&mut merged.teacher_actions, &co.teacher_actions,
+                                t, learner_count, off, n, 1);
+                        }
                     }
                     merged.last_values[off..off + n].copy_from_slice(&co.last_values);
                     // Same interleave as last_values: workers own contiguous

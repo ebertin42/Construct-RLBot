@@ -844,6 +844,14 @@ impl EpisodeArena {
         self.foreign_overrides = o;
     }
 
+    /// This arena's action table. Exposed so a caller can map a foreign bot's
+    /// controls-8 back to an index in the table this arena actually indexes —
+    /// which table that is depends on obs_mode and the schema's action_table, so
+    /// reconstructing it at the call site could silently disagree.
+    pub fn action_table(&self) -> &[[f32; 8]] {
+        &self.table
+    }
+
     /// Ask a foreign (ported) policy for `agent_idx`'s controls. Maps the agent
     /// to its car in the live `GameState` BY CAR ID -- `get_game_state()` does
     /// not return cars in agent order -- then runs the bot's own obs/net/table.

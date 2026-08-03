@@ -390,6 +390,52 @@ impl Engine {
         self.inner.set_foreign_opponents(parsed).map_err(PyValueError::new_err)
     }
 
+    /// Set (or clear, with `weights=None`) the TEACHER queried on LEARNER cars.
+    ///
+    /// Adds `teacher_actions` `(T, N_learner)` to `collect`'s dict: for every
+    /// state the STUDENT visited, the action index this bot would have chosen
+    /// there. That is what makes distillation ON-POLICY — an offline dataset
+    /// labels only states the teacher itself reached, and the compounding-error
+    /// gap that opens between the two is what produced a 0W/1D/639L net here once.
+    ///
+    /// `-1` means the bot's controls matched no row of our table exactly (element
+    /// and immortal emit continuous controls). FILTER those rows; never index
+    /// with them — `action_table[-1]` silently yields the LAST row in torch.
+    ///
+    /// The teacher always thinks at PERIOD 1. A handicapped teacher would label a
+    /// state with a stale action and the student would learn to imitate lag.
+    #[pyo3(signature = (weights=None, kind=None))]
+    fn set_teacher(
+        &mut self,
+        weights: Option<HashMap<String, PyReadonlyArrayDyn<'_, f32>>>,
+        kind: Option<String>,
+    ) -> PyResult<()> {
+        let parsed = match (weights, kind) {
+            (None, _) => None,
+            (Some(_), None) => {
+                return Err(PyValueError::new_err("set_teacher needs a kind alongside weights"))
+            }
+            (Some(w), Some(kind)) => {
+                let arrays: HashMap<String, (Vec<f32>, Vec<usize>)> = w
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let shape = v.shape().to_vec();
+                        (k, (v.as_array().iter().copied().collect(), shape))
+                    })
+                    .collect();
+                let fk = crate::foreign::ForeignKind::parse(&kind)
+                    .ok_or_else(|| PyValueError::new_err(format!("unknown foreign kind {kind:?}")))?;
+                Some(engine::NetWeights::Foreign {
+                    raw: arrays,
+                    kind: fk,
+                    period: 1,
+                    cars: u32::MAX,
+                })
+            }
+        };
+        self.inner.set_teacher(parsed).map_err(PyValueError::new_err)
+    }
+
     /// Per-term reward telemetry summed over every arena since the last call,
     /// RESET ON READ (E9). Returns `{term_name: float}` with `TERM_NAMES`'
     /// keys: indices 0-8 are reward contributions, 9-19 are event counts
@@ -544,6 +590,15 @@ impl Engine {
         // partial foreign team's mirror cars (E4). Equal to `learner_agents`
         // unless partial teams are in play.
         dict.set_item("forward_rows", out.forward_rows)?;
+        // (T, N_learner) teacher action indices; key ABSENT unless set_teacher was
+        // called, so no existing caller sees a shape change. -1 = no exact match.
+        if !out.teacher_actions.is_empty() {
+            let ta: Bound<'py, PyArray2<i64>> =
+                numpy::ndarray::Array2::from_shape_vec((t, n), out.teacher_actions)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?
+                    .into_pyarray(py);
+            dict.set_item("teacher_actions", ta)?;
+        }
         Ok(dict)
     }
 
