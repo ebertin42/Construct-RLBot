@@ -36,6 +36,17 @@ p.add_argument("--kickstart-teacher", default=None,
 p.add_argument("--kickstart-steps", type=int, default=None,
                help="steps over which the kickstart KL weight anneals to 0 "
                     "(default 500_000_000; only used with --kickstart-teacher)")
+p.add_argument("--foreign-teacher", default=None,
+               help="distil from a foreign bot ON the learner's own car: 'nexto' / "
+                    "'immortal' / etc. The engine queries it every step for the action IT "
+                    "would take here and the student's head is trained on that label. "
+                    "Unrelated to [foreign], which puts those bots in the ORANGE cars.")
+p.add_argument("--foreign-weights", default=None,
+               help="path to the teacher .npz (default ~/.cache/construct/<kind>_weights.npz). "
+                    "These weights are unlicensed for redistribution and live outside the repo.")
+p.add_argument("--foreign-distill-coef", type=float, default=1.0,
+               help="weight on the distillation cross-entropy (default 1.0). Only used with "
+                    "--foreign-teacher.")
 p.add_argument("--kl-prior", default=None,
                help="v1 BC checkpoint to use as a frozen KL prior anchor")
 p.add_argument("--kl-prior-lambda", type=float, default=None,
@@ -124,6 +135,14 @@ if args.kickstart_teacher:
     cfg.kickstart = {**cfg.kickstart, "teacher": args.kickstart_teacher}
     if args.kickstart_steps is not None:
         cfg.kickstart["steps"] = args.kickstart_steps
+if args.foreign_teacher:
+    cfg.foreign_distill = {**cfg.foreign_distill, "kind": args.foreign_teacher}
+    if args.foreign_weights:
+        cfg.foreign_distill["weights"] = args.foreign_weights
+    # The coefficient lives in [ppo] so it rides the same checkpoint-overwrites-toml path as
+    # every other loss weight -- which is exactly why it needs a flag: resume_train restores
+    # cfg.ppo from the checkpoint, so a toml edit alone would be silently discarded.
+    cfg.ppo = {**cfg.ppo, "foreign_distill_coef": args.foreign_distill_coef}
 if args.kl_prior:
     cfg.kl_prior = {**cfg.kl_prior, "ck": args.kl_prior}
 if args.kl_prior_lambda is not None:

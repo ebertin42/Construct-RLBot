@@ -43,6 +43,14 @@ class TrainConfig:
     # the front and league opponent arenas from the back, so both can run at once
     # in every regime.
     foreign: dict = field(default_factory=dict)
+    # On-policy distillation FROM a foreign bot (learn/foreign_distill.py). Distinct from
+    # `foreign` above, which puts those bots in the ORANGE cars as opponents: this queries
+    # one on the LEARNER's own car every step and asks "what would you do here", then trains
+    # the student's action head on the answer. Keys: kind ("nexto"/"immortal"/..., required
+    # to activate), weights (path to the .npz, default ~/.cache/construct/<kind>_weights.npz).
+    # The strength lives in ppo.foreign_distill_coef so it can be annealed like every other
+    # loss weight. Weights are UNLICENSED for redistribution and live outside the repo.
+    foreign_distill: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str) -> "TrainConfig":

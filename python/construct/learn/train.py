@@ -8,6 +8,7 @@ import torch
 
 from construct._engine import Engine, action_table_v1, action_table_v1_air, schema_dict
 from construct.learn.aux import DEFAULT_HORIZONS, aux_losses, horizon_returns
+from construct.learn.foreign_distill import equivalence_classes, foreign_distill_loss
 from construct.learn.config import TrainConfig
 from construct.learn.gae import compute_gae
 from construct.learn.kickstart import (
@@ -24,7 +25,8 @@ from construct.tables import DEFAULT_V1_TABLE
 
 
 def compose_extra_loss(net, batch, *, kickstart, lambda_k, lambda_v,
-                       prior_logits, lambda_p, w_recon=0.0, w_reward=0.0):
+                       prior_logits, lambda_p, w_recon=0.0, w_reward=0.0,
+                       lambda_f=0.0, fd_cls=None, fd_k=0):
     """Build the per-minibatch extra-loss hook for ppo_update, composing the
     kickstart distillation term (KL(teacher‖student)+value MSE, annealed) and
     the BC-prior anchor (KL(student‖prior), constant lambda_p). Returns None
@@ -47,7 +49,20 @@ def compose_extra_loss(net, batch, *, kickstart, lambda_k, lambda_v,
             "built with aux=False, so aux_reward/aux_recon do not exist. Set [net] aux=true "
             "(and on a RESUME pass --aux, since the checkpoint's net block overwrites the toml)."
         )
-    if not kick_on and not prior_on and not aux_on:
+    # Foreign-teacher distillation (learn/foreign_distill.py). Requires BOTH a nonzero weight
+    # and labels actually present in the batch. A config asking for it on a run with no
+    # teacher installed must fail loudly here rather than train silently without it -- the
+    # exact silent-null shape that left the aux heads dead scaffolding for weeks.
+    fd_on = lambda_f != 0.0
+    if fd_on and "teacher_actions" not in batch:
+        raise ValueError(
+            f"foreign distillation requested (lambda_f={lambda_f}) but the batch carries no "
+            "teacher_actions. The engine only emits them after Engine.set_teacher(weights, "
+            "kind); pass --foreign-teacher so the trainer installs one."
+        )
+    if fd_on and (fd_cls is None or fd_k <= 0):
+        raise ValueError("foreign distillation needs fd_cls/fd_k from equivalence_classes()")
+    if not kick_on and not prior_on and not aux_on and not fd_on:
         return None
 
     def fn(idx):
@@ -79,6 +94,12 @@ def compose_extra_loss(net, batch, *, kickstart, lambda_k, lambda_v,
             kl_p = kl_student_prior(s_logits, prior_logits[idx])
             loss = loss + lambda_p * kl_p
             info["kl_pri"] = kl_p.item()
+        if fd_on:
+            fd, fd_info = foreign_distill_loss(
+                s_logits, batch["teacher_actions"][idx], fd_cls, fd_k
+            )
+            loss = loss + lambda_f * fd
+            info.update(fd_info)
         if aux_on:
             # A SECOND trunk pass, not a reuse of the one above: `net(**obs)` returns
             # (logits, value) and discards `pooled`, and the aux losses must shape the
@@ -473,6 +494,29 @@ class Trainer:
                   f"lambda_p={self.kl_prior['lambda']}"
                   + (f" annealing -> {self.kl_prior['lambda_floor']} over {_an} iters"
                      if _an > 0 else ""), flush=True)
+
+        # Foreign-teacher distillation. The row -> equivalence-class map is a pure function
+        # of the action table, so it is built once here rather than per minibatch. Held even
+        # when the coefficient is 0 (cheap, ~104 ints) so compose_extra_loss can raise a
+        # clear error instead of a None-deref if a config turns the term on mid-run.
+        self._fd_cls, self._fd_k = None, 0
+        if self.is_v1:
+            self._fd_cls = equivalence_classes(action_table_for(self.schema)).to(self.device)
+            self._fd_k = int(self._fd_cls.max()) + 1
+        self._foreign_teacher = None
+        if cfg.foreign_distill.get("kind"):
+            kind = cfg.foreign_distill["kind"]
+            wp = os.path.expanduser(cfg.foreign_distill.get(
+                "weights", f"~/.cache/construct/{kind}_weights.npz"))
+            if not self.is_v1:
+                raise ValueError("foreign distillation is v1-schema only "
+                                 "(the label is an index into the v1 action table)")
+            w = {k: v.astype(np.float32) for k, v in np.load(wp).items()}
+            self.engine.set_teacher(w, kind)
+            self._foreign_teacher = kind
+            print(f"foreign_distill: teacher={kind} at period 1, "
+                  f"coef={cfg.ppo.get('foreign_distill_coef', 0.0)}, "
+                  f"{self._fd_k} action classes", flush=True)
 
         # Opponent-pool ("league") integration. Disabled by default (cfg.league == {}
         # or {"enabled": False}) -> self._assignment stays None -> engine.collect's
@@ -1489,6 +1533,14 @@ class Trainer:
             result["aux_returns"] = torch.zeros(
                 (T * N, len(DEFAULT_HORIZONS)), device=dev
             )
+        # Foreign-teacher labels (Engine::set_teacher). Present only when a teacher is
+        # installed, so the key is absent on every ordinary run and the distillation term
+        # stays off. Values are action-table ROW indices, or -1 where the teacher's controls
+        # matched no row -- foreign_distill masks those; they must never index the table.
+        if "teacher_actions" in out:
+            result["teacher_actions"] = torch.as_tensor(
+                np.asarray(out["teacher_actions"]).reshape(T * N).astype(np.int64), device=dev
+            )
         if "learner_team_size" in out:
             lab = np.asarray(out["learner_team_size"]).astype(np.int64)
             assert lab.shape == (N,), f"learner_team_size {lab.shape} != ({N},)"
@@ -1973,6 +2025,8 @@ class Trainer:
                 prior_logits=prior_logits, lambda_p=lambda_p,
                 w_recon=float(p.get("aux_recon_coef", 0.0)),
                 w_reward=float(p.get("aux_reward_coef", 0.0)),
+                lambda_f=float(p.get("foreign_distill_coef", 0.0)),
+                fd_cls=self._fd_cls, fd_k=self._fd_k,
             )
 
             stats = ppo_update(
