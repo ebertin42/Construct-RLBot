@@ -32,7 +32,12 @@ fi
 # checkpoints_v9 FIRST: v9 is the live run since 2026-07-26 (the v8 lineage in
 # checkpoints_scratch was retired at 1.589B). Selection is by mtime, so listing
 # v9 first only matters on a tie, but it documents which lineage is live.
-WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_v9 checkpoints_scratch checkpoints_entity checkpoints_hc}"
+# checkpoints_ppo_distilled FIRST since 2026-08-04: it is the live winning arm. Selection is
+# by mtime, so order only breaks ties -- but run A (checkpoints_v9) was RETIRED that day and
+# is now frozen, so leaving it at the head of this list would have pointed the viewer at a
+# lineage that stopped moving. That failure is silent: the stream keeps playing, it just
+# shows a dead policy.
+WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_ppo_distilled checkpoints_distill checkpoints_v9 checkpoints_scratch checkpoints_entity checkpoints_hc}"
 # Curriculum the viewer renders under -- MUST match the live arm's curriculum so
 # "what you watch matches what it learns". Default is the match-win regime
 # (full 300s matches + score); set CONSTRUCT_WATCH_CURRICULUM='' to render
@@ -47,7 +52,7 @@ WATCH_CURRICULUM="${CONSTRUCT_WATCH_CURRICULUM-configs/curriculum_v3_match.toml}
 # plain self-play.
 FOREIGN_ROSTER=(element immortal necto nexto self)
 FOREIGN_CACHE="${CONSTRUCT_FOREIGN_CACHE:-$HOME/.cache/construct}"
-SCRATCH_LOG="${CONSTRUCT_SCRATCH_LOG:-checkpoints_v9/train_remote.log}"
+SCRATCH_LOG="${CONSTRUCT_SCRATCH_LOG:-checkpoints_ppo_distilled/train_remote.log}"
 WATCH_FOREIGN="${CONSTRUCT_WATCH_FOREIGN:-1}"
 current_period() {  # $1 = bot kind. Periods are PER BOT since 2026-07-25, so the
                     # viewer must read that bot's own rung out of the newest
@@ -94,14 +99,21 @@ while true; do
     # 1v1 on slots 0,2,4,6,8 | 2v2 on 1,5,7 | 3v3 on 3,9.
     # CONSTRUCT_WATCH_MODE forces a single format -- the from-scratch/foreign-opponent
     # runs are ALL 1v1 (foreign bots are 1v1-only), so set it to 1v1 there.
-    if [ -n "${CONSTRUCT_WATCH_MODE:-}" ]; then
+    # DEFAULT IS 1v1 SINCE 2026-08-04, not the [0.5,0.3,0.2] rotation. Both live arms are
+    # launched with --team-sizes 1,0,0, so 2v2/3v3 slots would render formats the policy
+    # never trains on -- which looks like a bot that has forgotten how to rotate, when in
+    # fact it has simply never seen a teammate. Set CONSTRUCT_WATCH_MODE=mix to restore the
+    # old cycle for a mixed-team-size lineage.
+    if [ -n "${CONSTRUCT_WATCH_MODE:-}" ] && [ "${CONSTRUCT_WATCH_MODE}" != "mix" ]; then
         mode="$CONSTRUCT_WATCH_MODE"
-    else
+    elif [ "${CONSTRUCT_WATCH_MODE:-}" = "mix" ]; then
         case $((slot % 10)) in
             1|5|7) mode="2v2" ;;
             3|9)   mode="3v3" ;;
             *)     mode="1v1" ;;
         esac
+    else
+        mode="1v1"
     fi
     if [ -n "$entity" ]; then
         # 1v1 + foreign enabled: rotate the opponent roster at the live period.

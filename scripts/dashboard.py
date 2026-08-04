@@ -75,28 +75,36 @@ CKPT_DIR = Path(_os.environ.get(
 # MAIN_LOG / CKPT_DIR above still drive the FIRST entry, so the env overrides keep
 # working for inspecting a retired lineage.
 RUNS = [
-    {"id": "a", "label": "A · control", "log": MAIN_LOG, "ckpt": CKPT_DIR,
-     "role": "v9 control lineage — reward_v9_aerial.toml, no planar flag."},
-    {"id": "b", "label": "B · planar-air (retired)",
-     "log": REPO / "checkpoints_v10" / "train_remote.log",
-     "ckpt": REPO / "checkpoints_v10",
-     "role": "reward_v10_planar.toml (vel_to_ball_planar_air = true). Its own lineage "
-             "since the entropy arm — NOT a fork of A. RETIRED 2026-08-01: the flag "
-             "benched null on all three channels over 36 matched pairs, and it is an "
-             "air lever, which the diagnosis had already ruled out."},
-    {"id": "c", "label": "C · null control (retired)",
-     "log": REPO / "checkpoints_v11" / "train_remote.log",
-     "ckpt": REPO / "checkpoints_v11",
-     "role": "forked from B's OWN start (v10 ck_002278225920) with A's control tape. "
-             "B vs C at matched steps isolates the flag; B vs A never could. "
-             "RETIRED 2026-08-01 with B — the flag benched null on all three channels."},
-    {"id": "d", "label": "D · aux heads", "log": REPO / "checkpoints_v12" / "train_remote.log",
+    {"id": "ppo", "label": "PPO-from-distilled \u00b7 LIVE",
+     "log": REPO / "checkpoints_ppo_distilled" / "train_remote.log",
+     "ckpt": REPO / "checkpoints_ppo_distilled",
+     "role": "THE ARM THAT WINS. PPO on top of the nexto-distilled policy, with a 0.1 "
+             "distillation anchor so the policy gradient cannot unlearn the repertoire. "
+             "30W/12D/278L vs element at p1 \u2014 the project's first wins at full strength, "
+             "against a history of 0W/0D/320L across 1,280 matches. n=8: goals_against "
+             "9.868 vs run A's 12.989 (t=-12.1). Watch fd_ce/fd_pct: if fd_ce climbs hard "
+             "and flips/min falls toward 0, PPO is eroding the repertoire and the anchor "
+             "is too weak."},
+    {"id": "distill", "label": "distill \u00b7 LIVE",
+     "log": REPO / "checkpoints_distill" / "train_remote.log",
+     "ckpt": REPO / "checkpoints_distill",
+     "role": "Pure distillation from nexto (policy_coef=0, so the CE is the ONLY gradient). "
+             "RESUMED 2026-08-04 from ck_003300874240 after being stopped 28M steps early: "
+             "fd_ce had plateaued at 43% but goals_against was still falling -0.061/Mstep "
+             "(r=-0.907). This arm tests whether that keeps paying. fd_pct is the clone "
+             "completeness; it is NOT the stopping signal \u2014 goals_against is, and that "
+             "costs a bench to read."},
+    {"id": "a", "label": "A \u00b7 control (retired)", "log": MAIN_LOG, "ckpt": CKPT_DIR,
+     "role": "v9 control lineage, reward_v9_aerial.toml. RETIRED 2026-08-04 at "
+             "ck_003674219520 (1919 checkpoints retained). Beaten on every channel by both "
+             "distillation arms; it was holding ~6 cores the live experiments could use. "
+             "This is the BASELINE every distillation number is quoted against."},
+    {"id": "d", "label": "D \u00b7 aux heads (retired)",
+     "log": REPO / "checkpoints_v12" / "train_remote.log",
      "ckpt": REPO / "checkpoints_v12",
-     "role": "forked from A at ck_002780933120 (sha 73d51f86…). Same tape, same "
-             "curriculum, same entropy — differs from A ONLY by the aux losses "
-             "(masked entity reconstruction + 3-horizon return prediction). "
-             "Watch aux_rec / aux_rew on A's log-free iter line: both must be nonzero "
-             "and FALLING, or the heads are inert."},
+     "role": "Forked from A at ck_002780933120; differed only by the aux losses. RETIRED "
+             "2026-08-03 at 342M divergence: mechanism flat (aux_ev 0.497-0.526 across "
+             "260M steps), effect worth ~32M steps, settling it would have cost ~387M."},
 ]
 SSL_LOG = REPO / "logs" / "ssl_pull.log"
 SSL_DIR = REPO / "data" / "replays" / "ssl"
@@ -120,6 +128,12 @@ ITER_LINE = re.compile(
     # be nonzero and falling, or the run is training dead scaffolding, which is exactly
     # the state the feature shipped in for weeks.
     r"(?: aux_rec ([-\d.eE+]+) aux_rew ([-\d.eE+]+))?"
+    # FIFTH ERA (2026-08-04, the distillation arms): fd_ce / fd_marg / fd_lab. NOTE these
+    # are printed BEFORE the aux block in train.py, but the optional groups above are
+    # order-fixed and `.search()` does not anchor to end-of-line -- so without this the line
+    # still MATCHED and the three fields were silently dropped. A silent omission, which is
+    # the same failure the aux era exists to prevent, one layer down.
+    r"(?:.*? fd_ce ([-\d.eE+]+) fd_marg ([-\d.eE+]+) fd_lab ([-\d.eE+]+))?"
 )
 RESUME = re.compile(r"resumed at ([\d,]+) steps")
 CONTAINMENT = "physics blowup contained"
@@ -206,6 +220,15 @@ def parse_iter_line(line):
         row["kl_pri"], row["lambda_p"] = float(m.group(11)), float(m.group(12))
     if m.group(13) is not None:
         row["aux_rec"], row["aux_rew"] = float(m.group(13)), float(m.group(14))
+    if m.group(15) is not None:
+        # fd_ce alone is uninterpretable -- a nats figure means nothing without the
+        # state-independent baseline it has to beat -- so the gap is derived here rather
+        # than left for whoever reads the tile. fd_lab must sit at 1.000; a drift downward
+        # means the teacher's controls stopped matching the action table, which would
+        # silently shrink the training set instead of erroring.
+        row["fd_ce"], row["fd_marg"] = float(m.group(15)), float(m.group(16))
+        row["fd_lab"] = float(m.group(17))
+        row["fd_pct"] = (1.0 - row["fd_ce"] / row["fd_marg"]) * 100.0 if row["fd_marg"] else 0.0
     return row
 
 
@@ -988,6 +1011,31 @@ function auxTile(rows) {
   };
 }
 
+function distillTile(rows) {
+  const a = rows.filter(r => r.fd_ce != null);
+  if (!a.length) return {v: "off", why: "no distillation term on this run's iter line"};
+  const last = a[a.length-1];
+  const mean = xs => xs.reduce((p,c)=>p+c,0) / Math.max(1, xs.length);
+  const recent = a.slice(-20).map(r=>r.fd_pct);
+  const prior  = a.slice(-60,-20).map(r=>r.fd_pct);
+  let trend = "";
+  if (prior.length >= 10) {
+    const d = mean(recent) - mean(prior);
+    trend = d > 0.2 ? " climbing" : (d < -0.2 ? " FALLING" : " flat");
+  }
+  // fd_lab is the tripwire: it must sit at 1.000. Below that the teacher's controls have
+  // stopped matching the action table and those frames are dropped -- which shrinks the
+  // training set silently rather than erroring.
+  const labBad = last.fd_lab < 0.999;
+  return {
+    v: (labBad ? "CHECK " : "") + last.fd_pct.toFixed(1) + "% below marginal",
+    why: labBad
+      ? "fd_lab " + last.fd_lab.toFixed(3) + " — labels are being DROPPED, training set is shrinking"
+      : "ce " + last.fd_ce.toFixed(3) + " vs marg " + last.fd_marg.toFixed(3) +
+        trend + " — clone completeness, NOT the stopping signal" + spark(recent),
+  };
+}
+
 function renderMain(md) {
   const meta = document.getElementById("main-meta");
   meta.textContent = md.log_age_s != null ? `log synced ${fmtAgo(md.log_age_s)}` : "log missing";
@@ -1004,6 +1052,7 @@ function renderMain(md) {
     ["KL to prior", klLast ? klLast.kl_pri.toFixed(3) + spark(klRows.slice(-60).map(r=>r.kl_pri)) : "—",
      klLast ? "λ_p " + klLast.lambda_p.toFixed(3) : "no kl-prior iters yet"],
     ["Aux heads", auxTile(rows).v, auxTile(rows).why],
+    ["Distillation", distillTile(rows).v, distillTile(rows).why],
     ["Blowups contained", md.containment, "physics NaN events, engine-side"],
     ["Latest ck", md.ckpt.latest_steps ? fmtSteps(md.ckpt.latest_steps) : "—",
      md.ckpt.count ? `${md.ckpt.count} on disk · ${md.ckpt.total_gb} GB` : "none synced"],

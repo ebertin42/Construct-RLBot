@@ -26,8 +26,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CK=checkpoints_v9/ck_003242526720.pt
-LOG=logs/distill_gate1.log
+# Defaults to the original fork point. Pass a later distill checkpoint to RESUME the same
+# lineage -- which is the normal case now: the first run was stopped at 28M steps while
+# goals_against was still falling -0.061/Mstep, because fd_ce had plateaued and I used that as
+# the stopping signal instead of the metric the project is judged on.
+CK=${1:-checkpoints_v9/ck_003242526720.pt}
+LOG=${2:-logs/distill_gate1.log}
 mkdir -p logs
 
 if pgrep -f "checkpoint-dir checkpoints_distill" >/dev/null; then

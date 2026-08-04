@@ -8,8 +8,24 @@ HOST="${1:-elliot@192.168.86.117}"
 RDIR="${2:-construct}"
 
 mkdir -p checkpoints checkpoints_entity checkpoints_scratch checkpoints_v9 \
-         checkpoints_v10 checkpoints_v11 checkpoints_v12 league
+         checkpoints_v10 checkpoints_v11 checkpoints_v12 league \
+         checkpoints_distill checkpoints_ppo_distilled
 while true; do
+    # THE TWO LIVE ARMS since 2026-08-04, pulled FIRST because everything downstream
+    # (dashboard, watch_loop) picks the newest checkpoint by mtime across these dirs and
+    # run A -- which was that newest thing for a week -- is now retired and frozen.
+    #
+    #   checkpoints_distill      pure distillation from nexto (policy_coef=0). RESUMED from
+    #                            ck_003300874240 after being stopped 28M steps early: fd_ce
+    #                            had plateaued but goals_against was still falling
+    #                            -0.061/Mstep. Tests whether that keeps paying.
+    #   checkpoints_ppo_distilled  PPO on top of the distilled policy, with a 0.1
+    #                            distillation anchor. THE ARM THAT WINS: 30W/12D/278L vs
+    #                            element at p1, from a project history of 0W/0D/320L.
+    rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_ppo_distilled/" checkpoints_ppo_distilled/ 2>/dev/null
+    rsync -az "$HOST:$RDIR/logs/ppo_distilled.log" checkpoints_ppo_distilled/train_remote.log 2>/dev/null
+    rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_distill/" checkpoints_distill/ 2>/dev/null
+    rsync -az "$HOST:$RDIR/logs/distill_resume.log" checkpoints_distill/train_remote.log 2>/dev/null
     rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints/" checkpoints/ 2>/dev/null
     rsync -az "$HOST:$RDIR/checkpoints/train_v0.log" checkpoints/train_remote.log 2>/dev/null
     # entity-transformer lineage (kickstart run) — separate dir, own log
