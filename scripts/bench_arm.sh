@@ -19,10 +19,16 @@ LABEL=${3:-$(basename "$DIR")}
 OUT=${4:-logs/bench_$(basename "$DIR").tsv}
 ARENAS=${5:-32}
 STEPS=${6:-45000}
+# Optional step bounds. Benching only the region added since the last measurement avoids
+# re-paying for cells already in hand; pool the old rows with the new ones afterwards for a
+# full-span trend, which has a longer lever arm than either half alone.
+LO=${7:-0}
+HI=${8:-99999999999}
 
 mapfile -t CKS < <(ls "$DIR"/*.pt 2>/dev/null \
-  | awk -F'ck_0*' '{print $2+0"\t"$0}' | sort -n \
+  | awk -F'ck_0*' -v lo="$LO" -v hi="$HI" '{s=$2+0; if (s>=lo && s<=hi) print s"\t"$0}' | sort -n \
   | awk -v n="$N" '{a[NR]=$2} END{ if(NR<n) n=NR; for(i=0;i<n;i++) print a[1+int(i*(NR-1)/(n>1?n-1:1))] }')
+[ "${#CKS[@]}" -gt 0 ] || { echo "no checkpoints in [$LO,$HI] under $DIR" >&2; exit 1; }
 
 echo "$LABEL: ${#CKS[@]} checkpoints from $DIR"
 printf 'arm\tcheckpoint\tsteps\tgoals_for\tgoals_against\tdiff\twin_share\n' > "$OUT"
