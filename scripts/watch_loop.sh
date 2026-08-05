@@ -37,7 +37,7 @@ fi
 # is now frozen, so leaving it at the head of this list would have pointed the viewer at a
 # lineage that stopped moving. That failure is silent: the stream keeps playing, it just
 # shows a dead policy.
-WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_ppo_distilled checkpoints_distill checkpoints_v9 checkpoints_scratch checkpoints_entity checkpoints_hc}"
+WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_distill checkpoints_ppo_distilled checkpoints_v9 checkpoints_scratch checkpoints_entity checkpoints_hc}"
 # Curriculum the viewer renders under -- MUST match the live arm's curriculum so
 # "what you watch matches what it learns". Default is the match-win regime
 # (full 300s matches + score); set CONSTRUCT_WATCH_CURRICULUM='' to render
@@ -52,7 +52,10 @@ WATCH_CURRICULUM="${CONSTRUCT_WATCH_CURRICULUM-configs/curriculum_v3_match.toml}
 # plain self-play.
 FOREIGN_ROSTER=(element immortal necto nexto self)
 FOREIGN_CACHE="${CONSTRUCT_FOREIGN_CACHE:-$HOME/.cache/construct}"
-SCRATCH_LOG="${CONSTRUCT_SCRATCH_LOG:-checkpoints_ppo_distilled/train_remote.log}"
+# checkpoints_distill since 2026-08-05: the PPO arm was retired that day (measurably worse
+# than pure distillation at matched steps), so its log is frozen and reading the curriculum
+# period out of it would silently pin the viewer to a stale rung.
+SCRATCH_LOG="${CONSTRUCT_SCRATCH_LOG:-checkpoints_distill/train_remote.log}"
 WATCH_FOREIGN="${CONSTRUCT_WATCH_FOREIGN:-1}"
 current_period() {  # $1 = bot kind. Periods are PER BOT since 2026-07-25, so the
                     # viewer must read that bot's own rung out of the newest
