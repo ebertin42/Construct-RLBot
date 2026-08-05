@@ -39,7 +39,9 @@ for ck in "${CKS[@]}"; do
         --arenas "$ARENAS" --steps "$STEPS" --seed 11 --period 1 2>/dev/null)
     gf=$(sed -nE 's/.*goals_for=([0-9.-]+).*/\1/p' <<<"$line" | head -1)
     ga=$(sed -nE 's/.*goals_against=([0-9.-]+).*/\1/p' <<<"$line" | head -1)
-    df=$(sed -nE 's/.*diff=([0-9.-]+).*/\1/p' <<<"$line" | head -1)
+    # NOTE the leading [+-]?: bench_foreign prints diff=+0.2062 once we OUTSCORE the bot, and
+    # a [0-9.-] class silently drops it -- a parse bug that can only ever fire on success.
+    df=$(sed -nE 's/.*diff=([+-]?[0-9.]+).*/\1/p' <<<"$line" | head -1)
     ws=$(sed -nE 's/.*win_share=([0-9.-]+).*/\1/p' <<<"$line" | head -1)
     st=$(basename "$ck" | sed -E 's/ck_0*([0-9]+)\.pt/\1/')
     # Loud on parse failure: a silently dropped row shrinks n without shrinking the
