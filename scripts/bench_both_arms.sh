@@ -1,22 +1,44 @@
 #!/usr/bin/env bash
-# Bench the region each live arm has ADDED since its last measurement.
+# Bench whatever each live arm has ADDED since it was last benched, and accumulate the rows
+# into a per-arm history file.
 #
-# SEQUENTIAL, one arm then the other, one cell at a time: concurrent cells contend for the
-# box and bias the result, and the whole point of these numbers is that they are comparable
-# to the ones already recorded.
+# THE BOUND IS DERIVED, NOT HARDCODED. An earlier version carried the last bench's step
+# numbers as literals in this file, which goes stale the moment it runs -- the next
+# invocation would silently re-bench the same region and quietly double-count it in the
+# trend. Here LO comes from the max step already present in the history, so running this
+# repeatedly is idempotent and each cell is paid for exactly once.
 #
-# Bounds are the last checkpoint each arm was benched at, so nothing is paid for twice:
-#   ppo_distilled  last benched to 3,322,470,400  (n=8 mean goals_against 9.868)
-#   distill        last benched to 3,300,874,240  (n=8 mean goals_against 11.101)
+# SEQUENTIAL, one cell at a time: concurrent cells contend for the box, and the entire value
+# of these numbers is that they are comparable to the ones already recorded.
 #
-# WHY THIS RUNS AT ALL, given fd_pct is visible on the dashboard: fd_pct is the clone
-# completeness and it is NOT the stopping signal. The distillation run was cut 28M steps
-# early because fd_ce plateaued at 43% while goals_against was still falling -0.061/Mstep.
-# goals_against costs a bench to read; that is the price of the only number that decides.
+# WHY BENCH AT ALL when fd_pct is on the dashboard: fd_pct is clone completeness and it is
+# NOT the stopping signal. The distillation run was cut 28M steps early because fd_ce
+# plateaued at 43% while goals_against was still falling -0.061/Mstep -- and that "plateau"
+# later turned out to be stale optimizer state, not convergence. goals_against costs a bench
+# to read; that is the price of the only number that decides.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 N=${1:-8}
-bash scripts/bench_arm.sh checkpoints_ppo_distilled "$N" ppo_new  logs/bench_ppo_new.tsv     32 45000 3322470401
-bash scripts/bench_arm.sh checkpoints_distill       "$N" dist_new logs/bench_distill_new.tsv 32 45000 3300874241
+mkdir -p logs
+
+bench_one() {  # dir label
+    local dir=$1 label=$2
+    local hist=logs/bench_hist_${label}.tsv
+    local lo=0
+    if [ -s "$hist" ]; then
+        lo=$(awk -F'\t' 'NR>1 && $3 ~ /^[0-9]+$/ {if ($3+0 > m) m=$3+0} END{print m+1}' "$hist")
+    fi
+    echo "=== $label: benching steps > ${lo} ==="
+    local tmp=logs/.bench_${label}_new.tsv
+    if ! bash scripts/bench_arm.sh "$dir" "$N" "$label" "$tmp" 32 45000 "$lo"; then
+        echo "  $label: nothing new to bench (or bench failed); leaving history untouched" >&2
+        return 0
+    fi
+    if [ -s "$hist" ]; then tail -n +2 "$tmp" >> "$hist"; else cp "$tmp" "$hist"; fi
+    echo "  $label history now $(( $(wc -l < "$hist") - 1 )) rows -> $hist"
+}
+
+bench_one checkpoints_ppo_distilled ppo
+bench_one checkpoints_distill       distill
 echo "BOTH DONE"
