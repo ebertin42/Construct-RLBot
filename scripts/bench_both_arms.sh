@@ -20,18 +20,22 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 N=${1:-8}
+KIND=${KIND:-necto}
 mkdir -p logs
+echo "gauge: $KIND"
 
 bench_one() {  # dir label
     local dir=$1 label=$2
-    local hist=logs/bench_hist_${label}.tsv
+    # History is PER OPPONENT: mixing element and necto cells into one trend would splice two
+    # different rulers and manufacture a step change at the switchover.
+    local hist=logs/bench_hist_${label}_${KIND}.tsv
     local lo=0
     if [ -s "$hist" ]; then
         lo=$(awk -F'\t' 'NR>1 && $3 ~ /^[0-9]+$/ {if ($3+0 > m) m=$3+0} END{print m+1}' "$hist")
     fi
     echo "=== $label: benching steps > ${lo} ==="
     local tmp=logs/.bench_${label}_new.tsv
-    if ! bash scripts/bench_arm.sh "$dir" "$N" "$label" "$tmp" 32 45000 "$lo"; then
+    if ! bash scripts/bench_arm.sh "$dir" "$N" "$label" "$tmp" 32 45000 "$lo" 99999999999 "$KIND"; then
         echo "  $label: nothing new to bench (or bench failed); leaving history untouched" >&2
         return 0
     fi

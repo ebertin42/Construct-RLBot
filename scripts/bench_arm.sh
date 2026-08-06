@@ -24,18 +24,23 @@ STEPS=${6:-45000}
 # full-span trend, which has a longer lever arm than either half alone.
 LO=${7:-0}
 HI=${8:-99999999999}
+# Opponent. Was hardcoded to element, which reached win_share 0.945 by 366M steps past the
+# fork and has ~0.05 of range left -- a saturating gauge decelerates no matter what the
+# policy does, and reading that as a plateau is a mistake this project has already made
+# twice. necto sits at 0.663 and is the current maximum-resolution opponent.
+KIND=${9:-necto}
 
 mapfile -t CKS < <(ls "$DIR"/*.pt 2>/dev/null \
   | awk -F'ck_0*' -v lo="$LO" -v hi="$HI" '{s=$2+0; if (s>=lo && s<=hi) print s"\t"$0}' | sort -n \
   | awk -v n="$N" '{a[NR]=$2} END{ if(NR<n) n=NR; for(i=0;i<n;i++) print a[1+int(i*(NR-1)/(n>1?n-1:1))] }')
 [ "${#CKS[@]}" -gt 0 ] || { echo "no checkpoints in [$LO,$HI] under $DIR" >&2; exit 1; }
 
-echo "$LABEL: ${#CKS[@]} checkpoints from $DIR"
+echo "$LABEL vs $KIND: ${#CKS[@]} checkpoints from $DIR"
 printf 'arm\tcheckpoint\tsteps\tgoals_for\tgoals_against\tdiff\twin_share\n' > "$OUT"
 
 for ck in "${CKS[@]}"; do
     line=$(.venv/bin/python scripts/bench_foreign.py "$ck" \
-        --kind element --weights "$HOME/.cache/construct/element_weights.npz" \
+        --kind "$KIND" --weights "$HOME/.cache/construct/${KIND}_weights.npz" \
         --arenas "$ARENAS" --steps "$STEPS" --seed 11 --period 1 2>/dev/null)
     gf=$(sed -nE 's/.*goals_for=([0-9.-]+).*/\1/p' <<<"$line" | head -1)
     ga=$(sed -nE 's/.*goals_against=([0-9.-]+).*/\1/p' <<<"$line" | head -1)

@@ -1,0 +1,286 @@
+# Reward v13: GOAL ONLY. Every dense shaping term is zero.
+#
+# WHY THIS EXISTS. The dense tape was measured on 2026-08-05 against the outcome it is meant
+# to proxy: across 16 benched checkpoints spanning goals_against 10.1 -> 6.6, ep_rew moved
+# only 474.9 -> 504.8. It correlates in the right direction (r = -0.54 with goals_against)
+# but explains 29% of outcome variance and has a 6% dynamic range over a 36% outcome change.
+# A policy gradient on that cannot distinguish a 6.6-conceding policy from a 10.3-conceding
+# one -- which is why the PPO-from-distilled arm ended up MEASURABLY WORSE than pure
+# distillation at matched steps (t = +3.63, MDE 0.856) and was retired.
+#
+# Goal differential has perfect resolution: it IS the objective. It was untrainable before
+# only because it is sparse and exploration could never find good play -- p_jump_edge sat at
+# ~4e-4 and the dodge composite at ~1e-7 per decision. Distillation removed exactly that
+# obstacle: the policy now flips ~11x/min and beats element 297-16. This config exists to
+# test whether the sparse objective becomes trainable once the exploration problem is solved.
+#
+# KEEP a small foreign_distill_coef when training on this: with no dense signal and no anchor
+# the policy gradient is free to wander off the repertoire in the low-signal early phase.
+#
+# Derived from reward_v9_aerial.toml; ONLY the term weights differ, so any behavioural
+# difference is attributable to the objective and not to a changed curriculum or gamma.
+
+# v9 from-scratch reward: reward_v8_team + AIR PLAY. (2026-07-26)
+#
+# NOT a scoring tape. The gate, the benches, the league tape and the
+# auto-curriculum eval all keep pointing at configs/reward_v0.toml, whose
+# GOAL_THRESHOLD 9.4 depends on no non-goal row ever exceeding 0.55 in a single
+# step. `aerial_touch` below can pay 1.5 in one step, so THIS FILE MUST NEVER BE
+# USED AS A SCORING TAPE and `aerial_touch` must never be added to reward_v0.toml.
+#
+# Every measurement below is from engine/examples/aerial_reward_probe.rs
+# (2026-07-26, `cargo run --release --example aerial_reward_probe`).
+
+goal = 10.0            # +goal scoring team, -goal conceding team. Reference scale.
+
+# --- the flat-touch hazard, and its fix ------------------------------------
+# MEASURED: RocketSim writes ballHitInfo.tickCountWhenHit inside Bullet's
+# per-contact-point callback with NO cooldown (RocketSim/src/Sim/Ball/Ball.cpp:256)
+# -- while the extra-impulse path six lines below (:262) has an explicit 1-tick
+# cooldown. That contrast is the author telling you the hit tick is not rate
+# limited. With the ball held in overlap so a manifold exists every tick, the
+# `touched` predicate in reward.rs fires 12.0-14.4 times per SECOND, so a flat
+# touch = 0.5 pays 6.00-7.19/s = 1800-2160 per 300s match = 180-216 GOALS' worth
+# to a bot that just holds the ball. That hazard is live in reward_v8_team.toml
+# today; v9 is the run that would find it, because carries and air dribbles hold
+# contact and we are about to pay the bot to go airborne.
+# HONEST CAVEAT: forced overlap is an UPPER bound. A scripted free-play carry
+# produced only ~0.1/s. The mechanism is confirmed; the achievable rate is not.
+touch = 0.0
+touch_cooldown_ticks = 30   # 0.25s. Caps flat touch at 2.0/s (was 7.19/s
+                            # measured). Real touches are seconds apart, so
+                            # normal play is untouched. Default 0 = historical
+                            # behavior, which is what keeps reward_v0 bit-identical.
+                            # Applies to `touch` AND `aerial_touch` (2026-07-26
+                            # review -- see the aerial block for why that term
+                            # lost its exemption). NOT to `touch_accel`, which is
+                            # already impulse-bounded and whose proportionality
+                            # to delivered impulse a gate would break.
+
+vel_to_ball = 0.0     # max(0, dot(vel, unit(ball-car)))/2300, in [0,1]. Already
+                       # FULLY 3D (reward.rs:130-133 includes z), so flying AT a
+                       # high ball is already paid. What was missing is the arrival.
+
+# --- the flip/power teacher. Do NOT add a `has_flipped` term ---------------
+# A flip-usage term is farmable: flips are free and recharge every ~1.5s, so it
+# pays ~0.7Hz forever going nowhere, AND it degrades driving because a flip locks
+# your inputs. touch_accel is the un-farmable form of the same intent -- it pays
+# the PHYSICS OUTCOME of a flip (delivered impulse), not the input. MEASURED on a
+# 2000uu/s strike: peak per-step |d ball_vel| = 2805 -> impact 1.22 -> clamps to
+# 1.0 -> pays the full weight. Under the forced-contact carry regime above it pays
+# 0.178-0.356/s at w=1.0, i.e. 20x LESS than flat touch in exactly the regime that
+# farms flat touch.
+touch_accel = 0.0
+
+# --- THE headline term ------------------------------------------------------
+# Paid ONLY for a touch made with no surface contact, on a ball too high for a
+# double jump, and only for the impulse THIS car delivered down the field toward
+# the opponent's end:
+#     h    = clamp((ball_z - aerial_z_lo)/(aerial_z_hi - aerial_z_lo), 0, 1)
+#     dv   = ball.vel(cur) - ball.vel(prev)
+#     fwd  = clamp(sign(opp_goal_y) * dv.y / 2300, -1, 1)
+#     mine = clamp(cos(dv, ball_pos - car_pos), 0, 1)
+#     r   += aerial_touch * h * fwd * mine
+#            iff touched && !is_on_ground && the touch cooldown allows it
+#
+# Each factor closes a MEASURED exploit:
+#  * !is_on_ground kills wall-riding. Car.cpp:118 defines isOnGround as
+#    numWheelsInContact >= 3, surface-agnostic: a car driving the SIDE WALL at
+#    z = 1065 reads is_on_ground = TRUE (measured; pinned by the Rust test
+#    `wall_riding_is_not_airborne`). Without this gate, a "height-scaled touch"
+#    is a wall-play farm with zero air skill. Do not use
+#    world_contact.has_contact instead -- it reads false up there (body, not wheels).
+#  * h kills hop-taps. MEASURED apexes from a standing start with 100 boost:
+#    hop 231.9, double jump 393.6, hop+boost 612.6, full aerial 1238.1. A car
+#    contacts a ball ~130uu above its own centre, so a hop reaches ball z ~= 360
+#    (h = 0) and a double jump reaches z ~= 525 (h = 0.125). Low aerial (800)
+#    -> 0.40; high aerial (1200) -> 0.80. A RAMP, not a step, so the exact
+#    threshold is not load-bearing.
+#  * fwd kills juggling: a vertical juggle has dv.y ~ 0 and pays ~0.
+#
+# THE 2026-07-26 REVIEW CHANGED THREE OF THESE. Two were farms, both measured;
+# the third is the rate bound the first one's fix leaves needed.
+#
+#  (1) fwd used to be clamp(dot(dv_xy, unit(goal - ball_xy))/2300, 0, 1) -- the
+#      BALL-RELATIVE goal direction, with the return leg clamped to free. Two
+#      closed cycles paid on both legs and put the ball back where it started:
+#      2.391 aerial_touch per lap (4.789 across all terms) = 2.1 laps per goal.
+#        - a y-axis juggle paid 1.198 out and 0.000 back instead of -1.198;
+#        - a LATERAL corner cycle, which the [0,1] clamp alone does NOT fix: at
+#          ball (x=+3000, y=4500) the goal vector is 98% sideways, and it FLIPS
+#          once the ball crosses to x=-3000, so batting it back and forth paid
+#          1.198 then 1.193 with no progress and no goal possible (z=1200 is
+#          well above the 642 crossbar). It was also invisible to the
+#          touches/min/car tripwire: a 6000uu leg at 2400uu/s is 24/min/car,
+#          inside the "healthy 20-40" band.
+#      The axis is now the FIELD-FORWARD one (+y for blue, -y for orange), a
+#      constant per team, clamped SYMMETRICALLY. A constant axis is what makes
+#      the term a difference the unpaid flight phase cannot quietly restore:
+#      lateral travel does not change the ball's y-velocity, so a lateral cycle
+#      pays 0 on both legs, and any closed ball-velocity cycle the CAR makes
+#      nets ~0 because the return leg is charged what the forward leg paid.
+#      Pinned by `aerial_touch_telescopes_to_zero_over_a_closed_ball_velocity_
+#      cycle`, run at ball x != 0 so the lateral case is covered.
+#      PRICE: a cross-field pass from the corner now pays ~0. That was already
+#      the stated intent below -- it just was not true.
+#  (2) dv is the ball's TOTAL velocity change over the step, from every source,
+#      and the only per-car gate was `touched && !is_on_ground`. MEASURED: a
+#      motionless airborne car parked beside the ball collected 0.896, byte-
+#      identical to the striker's 0.896 -- including when the impulse came from
+#      an OPPONENT. In a run whose whole point is equal 1s/2s/3s share, 2/3 of
+#      experience is in arenas where a teammate supplies the impulse, so one
+#      strike paid N grazing teammates N x 0.896: 11 free grazes to a goal
+#      against a budget of 4-10 for the ENTIRE term per match, while teaching
+#      the double-commit habit team_spirit exists to suppress. `mine` is the
+#      cosine between the impulse and this car's direction to the ball: a real
+#      strike pushes the ball AWAY from the striker (~1, unchanged), a graze or
+#      a hover under the ball is perpendicular (~0). It does not separate two
+#      cars stacked on the same side within one 8-tick window -- that is a real
+#      50-50, not a free graze.
+#  (3) and the term now TAKES touch_cooldown_ticks. Its exemption rested on
+#      "payout is proportional to delivered impulse, which physics caps"; that
+#      holds for a monotone one-way strike and not for a ball the BACK WALL
+#      hands straight back, which is the one ratchet the forward axis leaves
+#      open. The cooldown is what bounds that at one payment per 0.25s.
+#
+# DELIBERATELY UNPAID: a purely vertical ceiling shot and a sideways setup pass
+# pay zero. That is the price of killing the juggle farm. Do not "fix" it.
+#
+# MAGNITUDE: read 1.5 as "an excellent aerial strike is worth 3 flat touches,
+# 15% of a goal". Clean strike at ball_z 1000 with dv 1800 straight at the net
+# -> 0.88. Air-dribble nudge at ball_z 800 with dv 150 -> 0.05. h, |fwd| and
+# mine are all in [0,1] so the weight is the bound in BOTH directions.
+#
+# WHAT IT ACTUALLY PAYS TODAY, and why the old "expect 4-10 per match" line is
+# gone. Measured on REAL rollouts (champion ck_001171502080 vs full-strength
+# nexto, match_mode; 1v1 = 8 arenas x 3000 steps = 5.3 match-equivalents):
+#   1v1 arena-wide r_aerial_touch  +2.23 and +2.31 on two runs of the same
+#       setup, against +4.21 before the review fixes -- roughly halved.
+#   3v3 (4 arenas x 1500 steps, 1 nexto among 3 orange)  -0.00 and +2.55 on two
+#       runs. That spread IS the finding: 61-70 airborne touches is far too few
+#       to estimate this, and the sum is dominated by a handful of real strikes.
+#       Do not read a 3v3 aerial total off anything this short.
+#   OUR CHAMPION'S OWN SHARE at 1v1 is EXACTLY 0.0000, over 24,000 learner steps
+#       and its ~150 own airborne touches (measured by diffing the identical
+#       rollout under aerial_touch 1.5 vs 0.0, same process layout, actions
+#       byte-identical). Every airborne touch it makes is under the z_lo = 400
+#       ramp, where h is exactly 0. ALL of the payout is nexto's.
+# The last line is the term behaving correctly, not failing: it pays the bot
+# that actually aerials and pays a ground bot nothing, which is the entire
+# point. The per-match total is small because clean high strikes are RARE today,
+# and making them less rare is the job. Read the per-EVENT number (0.88 for a
+# clean strike) as the design magnitude, and `air_tch_frac` as whether the
+# behaviour is appearing at all -- r_aerial_touch is a signed NET, not a volume
+# (see train.py::_reward_terms_line).
+# IF air_tch_frac is healthy at 150M steps and r_aerial_touch is still ~0, the
+# knob is the weight or the z_lo/z_hi ramp, not the geometry.
+aerial_touch = 0.0
+aerial_z_lo = 400.0
+aerial_z_hi = 1400.0
+# The air_gate_frac COUNTER's floor, pinned independently of the payout ramp
+# above. Currently identical to aerial_z_lo, so this changes nothing today --
+# it is set so that any FUTURE move of aerial_z_lo cannot silently move the
+# instrument that would score it. aerial_z_lo drives the payout, air_setup's PHI
+# and the counter at once; the 1,786-iteration air_gate_frac baseline (312M-491M
+# steps, mean 2.76e-4) is the only thing a later ramp change can be judged
+# against, and it survives only if the ruler is nailed down. Same discipline as
+# never rebuilding the gate .so mid-measurement.
+aerial_meas_z_lo = 400.0
+
+# --- STAGED OFF. Do not enable at launch. ----------------------------------
+# Potential-based aerial-setup shaping (Ng/Harada/Russell):
+#     PHI = 0 if on ground, else h(ball_z) * clamp(1 - dist3d/2500, 0, 1)
+#     r  += air_setup * (gamma*PHI(cur) - PHI(prev))
+# It teaches the TAKEOFF DECISION ("the ball is going up, jump NOW"), which
+# aerial_touch cannot: the random resets already start 50% of cars airborne, so
+# they teach "you are already up there, hit it" and never the commitment.
+# It cannot be farmed by any cyclic behavior BY CONSTRUCTION -- the sum
+# telescopes, so flying in circles nets exactly 0 and a jump-and-land refunds the
+# takeoff payment exactly (pinned by `air_potential_telescopes_to_zero_over_a_
+# jump_cycle`). Loitering at high PHI COSTS w(gamma-1)PHI = -0.0046w per step.
+# TWO BOUNDED LEAKS: (1) a goal/terminal while airborne never delivers the
+# refund, up to +w per goal (3% of a goal at w=0.3); (2) random resets can start
+# an episode at PHI>0 (ball spawns to z=1700), absorbed by GAE's bootstrap.
+# The reset boundary itself is SAFE: episode.rs sets prev_state to the fresh
+# kickoff AFTER rewards are computed, so no (pre-reset, post-reset) pair is ever
+# fed to the shaping. A later refactor could break that silently.
+# ENABLE ONLY IF the airborne-touch fraction stalls below ~5% at 150M steps, as a
+# SINGLE-variable change, with air_setup = 0.3 and win_prob_gamma = 0.9954
+# (the shared potential gamma; it MUST equal [ppo] gamma or the run silently
+# optimises a different objective -- checked at trainer startup, and the engine
+# refuses air_setup with a zero gamma outright).
+# ENABLED 2026-07-26 at 222M steps, on the trigger above. MEASURED over the 300
+# iterations before the change (~30M steps): air_tch_frac mean 0.0237, max 0.0770
+# -- under the 5% threshold and FLAT since ~40M steps, so the 104-row air table
+# was necessary but not sufficient. It made a full-height takeoff 237x more
+# reachable (1-in-97,336 decisions -> 1-in-410), which is what lets exploration
+# FIND the manoeuvre; it does not create a gradient that pulls the policy toward
+# it, and aerial_touch alone is chicken-and-egg (it only pays once you can already
+# reach a high ball). air_setup is the potential-based term that supplies that
+# gradient, and being potential-based (Ng/Harada/Russell) it cannot change the
+# optimal policy -- loitering at altitude costs w(gamma-1)PHI per step, so there
+# is no hover farm.
+#
+# SINGLE-VARIABLE: nothing else changed in this file or the train config. If the
+# airborne-touch fraction does not move within ~50M steps, air_setup is the thing
+# to revert, with no confound to unpick (contrast the 2026-07-20 two-variable
+# confound).
+air_setup = 0.0
+#
+# 2026-07-27, 510M steps: air_setup did NOT move the aerial numbers in the 288M
+# steps since it was enabled, and the reason is structural rather than a weight
+# being too small.
+#
+# MEASURED (learner-only, 32,550 touches / 1,155 airborne across 1v1+2v2+3v3 on
+# ck_000510489600, ~/construct-measure/touch_heights.json). Ball height at an
+# AIRBORNE learner touch -- the population that had never been measured, and the
+# only one `aerial_touch` can ever pay:
+#
+#     0-150   76.8%  |  150-300  21.5%  |  300-500  1.3%
+#   500-800    0.3%  |  800-1200  0.1%  |   1200+   0.0%
+#
+#   P(ball_z > 400 | airborne touch) = 0.011
+#
+# The probe's air_gate_frac reads 0.00025 against the live run's all-time
+# 2.76e-4, so this describes the actual regime and not a lab artifact.
+#
+# PHI shares `height_ramp` with the payout, so PHI is identically 0 whenever
+# ball_z <= aerial_z_lo REGARDLESS of what the car is doing -- i.e. the one term
+# whose stated job is teaching the TAKEOFF DECISION has exactly zero gradient in
+# 99.6% of the states where takeoff is decided. It could only ever pay for
+# already being airborne near an already-high ball, which is the same
+# chicken-and-egg it was introduced to break.
+#
+# So: give PHI its own ramp, reaching down to where the ball actually is. The
+# PAYOUT ramp is deliberately left at 400 -- 76.8% of these touches are on a ball
+# at resting height (93.15) hit by a car that merely happens to be off the
+# ground, and paying for those is a hop-tap farm, not aerial play. Lowering
+# aerial_z_lo to the 250 that was proposed would have reached 8.9% of airborne
+# touches and every one of them a hop-tap. THIS IS THE SINGLE VARIABLE.
+#
+# WATCH FOR: a low PHI ramp pays for being airborne near a LOW ball, so it could
+# reinforce the tumbling contact the histogram above shows already dominates
+# rather than real takeoffs. The `air_touch_z_*` buckets are in the log for
+# exactly this: if mass shifts UP out of 0-150, it is working; if air_any_frac
+# rises while the buckets keep their shape, it is paying for tumbling and this
+# is the thing to revert.
+air_setup_z_lo = 100.0
+air_setup_z_hi = 1400.0
+# REQUIRED co-requisite, not a free knob: air_setup's potential is discounted by
+# win_prob_gamma, which MUST equal [ppo] gamma (0.9954 in
+# configs/train_v9_fromscratch.toml) or the shaping telescopes against a different
+# discount and the run silently optimises something else. reward.rs:207 hard-errors
+# on air_setup != 0 with gamma <= 0, and train.py re-checks the equality at startup.
+win_prob_gamma = 0.9954
+
+# --- team credit sharing (unchanged from reward_v8_team.toml) --------------
+# r_i' = (1-tau)*r_i + tau*mean(own team). In a 1v1 arena each team is one car,
+# so this collapses to r_i (float32: identical to within 3.7e-09, measured
+# 2026-07-25 -- last-bit rounding of 0.7r + 0.3r, not a behavioural change).
+# Without it, three bots in a 3v3 arena are paid purely for their own touches and
+# we would be actively teaching a ball-chasing habit we would then have to untrain.
+# NOTE the L9 trap this creates for anything that reads THIS tape: at tau = 0.3
+# a lone scorer's spike is 0.7*10 + 0.3*(10/m) = 8.0 at m=2, BELOW
+# GOAL_THRESHOLD 9.4. That is why the gate/benches/eval all use reward_v0.
+team_spirit = 0.3
+opp_spirit = 0.0
