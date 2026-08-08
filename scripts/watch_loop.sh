@@ -37,7 +37,7 @@ fi
 # is now frozen, so leaving it at the head of this list would have pointed the viewer at a
 # lineage that stopped moving. That failure is silent: the stream keeps playing, it just
 # shows a dead policy.
-WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_distill checkpoints_ppo_distilled checkpoints_v9 checkpoints_scratch checkpoints_entity checkpoints_hc}"
+WATCH_DIRS="${CONSTRUCT_WATCH_DIRS:-checkpoints_distill checkpoints_mt checkpoints_ppo_distilled checkpoints_v9 checkpoints_scratch checkpoints_entity checkpoints_hc}"
 # Curriculum the viewer renders under -- MUST match the live arm's curriculum so
 # "what you watch matches what it learns". Default is the match-win regime
 # (full 300s matches + score); set CONSTRUCT_WATCH_CURRICULUM='' to render

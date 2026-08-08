@@ -50,6 +50,23 @@ class TrainConfig:
     # to activate), weights (path to the .npz, default ~/.cache/construct/<kind>_weights.npz).
     # The strength lives in ppo.foreign_distill_coef so it can be annealed like every other
     # loss weight. Weights are UNLICENSED for redistribution and live outside the repo.
+    #
+    # MULTI-TEACHER: `mixture = [{kind, weight, weights?}, ...]` distils from several bots
+    # at once. The engine holds exactly ONE teacher (Engine::set_teacher takes a single
+    # state dict), so the mixture is realised by SAMPLING a teacher per iteration in
+    # proportion to `weight` -- an unbiased estimator of the weighted-average CE, at
+    # iteration granularity. `kind` alone still means one teacher, set once, on the
+    # pre-mixture code path.
+    #
+    # WHICH BOTS CAN ACTUALLY TEACH: the label is an index into OUR action table, so a
+    # teacher whose controls fall off that table emits -1 and the frame is dropped.
+    # Measured on ck_004068864000, 4 arenas, 2 iterations (fd_lab):
+    #     nexto 1.000   immortal 0.87   necto 0.24   element 0.20
+    # nexto shares our table by construction; immortal's 126-row table overlaps it far
+    # more than its separate provenance suggests. necto (multi-discrete decode) and
+    # element (continuous controls) are NOT usable: a 20% label rate is not a random
+    # subsample, it is exactly the frames our table cannot express, so training on it
+    # teaches a biased subset while looking healthy.
     foreign_distill: dict = field(default_factory=dict)
 
     @classmethod

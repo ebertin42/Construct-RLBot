@@ -189,3 +189,91 @@ def test_policy_coef_one_is_unchanged_from_the_default():
         outs.append([p.detach().clone() for p in net.parameters()])
     for a, b in zip(*outs):
         assert torch.equal(a, b), "policy_coef=1.0 must be byte-identical to the default"
+
+
+# --- multi-teacher mixture sampler ------------------------------------------------------
+#
+# The engine holds exactly ONE teacher, so a weighted mixture is realised in time: one
+# teacher sampled per iteration. Three properties have to hold or the arm measures something
+# other than the mixture it claims. `_pick_teacher` touches only a handful of attributes, so
+# it is exercised through a stand-in rather than a real Trainer (which would want an engine,
+# a checkpoint and a GPU to say anything about six lines of arithmetic).
+
+
+class _FakeEngine:
+    def __init__(self):
+        self.calls = []
+
+    def set_teacher(self, weights, kind):
+        self.calls.append(kind)
+
+
+class _Stub:
+    """Minimal surface of Trainer that _pick_teacher reads."""
+
+    def __init__(self, mix, seed=41, steps=0):
+        from types import SimpleNamespace
+        self.cfg = SimpleNamespace(env={"seed": seed})
+        self.total_steps = steps
+        self.engine = _FakeEngine()
+        self._teacher_mix = mix
+        self._foreign_teacher = mix[0][0] if mix else None
+
+
+def _pick(stub):
+    from construct.learn.train import Trainer
+    Trainer._pick_teacher(stub)
+
+
+def _draw(mix, n, seed=41, step=1_000_000):
+    """n independent draws, one per distinct total_steps, as run() would make them."""
+    out = []
+    for i in range(n):
+        s = _Stub(mix, seed=seed, steps=i * step)
+        s._foreign_teacher = None  # force a set_teacher on every pick so we can read it
+        _pick(s)
+        out.append(s._foreign_teacher)
+    return out
+
+
+def test_mixture_respects_the_weights():
+    """A 0.75/0.25 split has to actually be 0.75/0.25. If the sampler were uniform the arm
+    would be a half-and-half mixture wearing a nexto-dominant label, and the whole reason
+    nexto is dominant is that its argmax is the one we want preserved."""
+    mix = [("nexto", {}, 0.75), ("immortal", {}, 0.25)]
+    draws = _draw(mix, 4000)
+    frac = draws.count("nexto") / len(draws)
+    # se at n=4000 is ~0.0068; 5 se is a wide enough band to never flake and still catch a
+    # uniform sampler (which would land at 0.50, 37 se away).
+    assert 0.75 - 0.034 < frac < 0.75 + 0.034, f"nexto share {frac:.3f} != 0.75"
+    assert set(draws) == {"nexto", "immortal"}
+
+
+def test_pick_is_keyed_on_total_steps_not_on_iteration():
+    """`it` restarts at 0 on every resume. An it-keyed sequence would replay the same teacher
+    order after each restart, correlating teacher choice with restarts -- the same trap the lr
+    anneal already had to be moved off. Same total_steps must give the same teacher; different
+    total_steps must not all give one."""
+    mix = [("nexto", {}, 0.5), ("immortal", {}, 0.5)]
+    a = _Stub(mix, steps=7_000_000); a._foreign_teacher = None; _pick(a)
+    b = _Stub(mix, steps=7_000_000); b._foreign_teacher = None; _pick(b)
+    assert a._foreign_teacher == b._foreign_teacher
+    assert len(set(_draw(mix, 50))) == 2
+
+
+def test_pick_skips_the_engine_call_when_the_teacher_is_unchanged():
+    """set_teacher REBUILDS the ForeignPolicy and drops its per-car prev-action map, which
+    the teacher's own observation carries. Re-installing the teacher it already has would pay
+    that reset for nothing."""
+    s = _Stub([("nexto", {}, 1.0)])
+    for _ in range(5):
+        _pick(s)
+    assert s.engine.calls == [], "an unchanged teacher must not be re-installed"
+
+
+def test_empty_mixture_is_a_no_op():
+    """Single-teacher runs go through the pre-mixture path untouched: _pick_teacher must not
+    so much as look at the engine, or every existing distillation arm changes behaviour."""
+    s = _Stub([])
+    _pick(s)
+    assert s.engine.calls == [] and s._foreign_teacher is None

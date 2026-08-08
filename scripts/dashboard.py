@@ -75,17 +75,29 @@ CKPT_DIR = Path(_os.environ.get(
 # MAIN_LOG / CKPT_DIR above still drive the FIRST entry, so the env overrides keep
 # working for inspecting a retired lineage.
 RUNS = [
-    {"id": "ppo", "label": "PPO-from-distilled \u00b7 LIVE",
+    {"id": "mt", "label": "multi-teacher \u00b7 LIVE",
+     "log": REPO / "checkpoints_mt" / "train_remote.log",
+     "ckpt": REPO / "checkpoints_mt",
+     "role": "Distillation from a MIXTURE: nexto 0.75 / immortal 0.25, one teacher sampled "
+             "per iteration. Forked from distill at 4,070,379,520 on 2026-08-09; every "
+             "other setting is identical, so the mixture is the only variable. Read fd_ce "
+             "PER TEACHER \u2014 the fd_t field names who labelled that iteration, and the two "
+             "series are on completely different scales (nexto ~1.7 against a 3.7 marginal, "
+             "immortal ~4.6 against 2.6). fd_lab is ALSO per teacher: 1.000 for nexto, "
+             "~0.80-0.88 for immortal, whose 126-row action table only partly overlaps "
+             "ours. A rising fd_ce is EXPECTED here (a hard-label mixture raises the "
+             "irreducible floor) and is not a fault. The verdict is goals_against vs "
+             "distill over a matched window; the falsifier is in launch_multiteacher.sh."},
+    {"id": "ppo", "label": "PPO-from-distilled \u00b7 retired",
      "log": REPO / "checkpoints_ppo_distilled" / "train_remote.log",
      "ckpt": REPO / "checkpoints_ppo_distilled",
-     "role": "THE ARM THAT WINS. PPO on top of the nexto-distilled policy, with a 0.1 "
-             "distillation anchor so the policy gradient cannot unlearn the repertoire. "
-             "30W/12D/278L vs element at p1 \u2014 the project's first wins at full strength, "
-             "against a history of 0W/0D/320L across 1,280 matches. n=8: goals_against "
-             "9.868 vs run A's 12.989 (t=-12.1). Watch fd_ce/fd_pct: if fd_ce climbs hard "
-             "and flips/min falls toward 0, PPO is eroding the repertoire and the anchor "
-             "is too weak."},
-    {"id": "distill", "label": "distill \u00b7 LIVE",
+     "role": "PPO on top of the nexto-distilled policy with a 0.1 distillation anchor. It "
+             "won the project's first wins at p1 (30W/12D/278L vs element, against a "
+             "history of 0W/0D/320L) but RETIRED 2026-08-05: against pure distillation over "
+             "a matched window it is measurably WORSE, t=+3.63 on goals_against. The "
+             "goal-only variant then failed the same way at t=+4.90, which is what closed "
+             "the reward-resolution explanation."},
+    {"id": "distill", "label": "distill \u00b7 LIVE (control)",
      "log": REPO / "checkpoints_distill" / "train_remote.log",
      "ckpt": REPO / "checkpoints_distill",
      "role": "Pure distillation from nexto (policy_coef=0, so the CE is the ONLY gradient). "

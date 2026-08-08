@@ -43,15 +43,17 @@ bench_one() {  # dir label
     echo "  $label history now $(( $(wc -l < "$hist") - 1 )) rows -> $hist"
 }
 
-# Which arms to bench. Defaults to the live one only: the PPO arm was retired 2026-08-05 and
-# still has unbenched checkpoints, but spending cells on a dead lineage buys nothing. Pass
+# Which arms to bench. Defaults to the two LIVE ones: distill (the control) and mt (the
+# multi-teacher arm forked from it 2026-08-09). The ppo and goalonly arms are retired and
+# still have unbenched checkpoints, but spending cells on a dead lineage buys nothing. Pass
 # arm names to override, e.g. `bench_both_arms.sh 8 distill ppo`.
 shift || true
 ARMS=("$@")
-[ ${#ARMS[@]} -gt 0 ] || ARMS=(distill)
+[ ${#ARMS[@]} -gt 0 ] || ARMS=(distill mt)
 for a in "${ARMS[@]}"; do
     case "$a" in
         distill)  bench_one checkpoints_distill       distill ;;
+        mt)       bench_one checkpoints_mt            mt ;;
         goalonly) bench_one checkpoints_goalonly      goalonly ;;
         ppo)      bench_one checkpoints_ppo_distilled ppo ;;
         *)       echo "unknown arm: $a" >&2; exit 1 ;;

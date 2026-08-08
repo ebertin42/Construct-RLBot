@@ -504,7 +504,42 @@ class Trainer:
             self._fd_cls = equivalence_classes(action_table_for(self.schema)).to(self.device)
             self._fd_k = int(self._fd_cls.max()) + 1
         self._foreign_teacher = None
-        if cfg.foreign_distill.get("kind"):
+        # Multi-teacher: [{kind, weight, weights?}, ...]. Held as (kind, npz-dict, weight)
+        # and sampled per iteration in run(); empty for every single-teacher run, which
+        # keeps the branch below byte-identical to the pre-mixture path.
+        self._teacher_mix: list[tuple[str, dict, float]] = []
+        mixture = cfg.foreign_distill.get("mixture") or []
+
+        def _load_teacher(kind: str, path: str | None) -> dict:
+            wp = os.path.expanduser(path or f"~/.cache/construct/{kind}_weights.npz")
+            return {k: v.astype(np.float32) for k, v in np.load(wp).items()}
+
+        if mixture:
+            if not self.is_v1:
+                raise ValueError("foreign distillation is v1-schema only "
+                                 "(the label is an index into the v1 action table)")
+            if cfg.foreign_distill.get("kind"):
+                # Silently preferring one over the other is how a run ends up distilling
+                # from a teacher nobody chose. Refuse instead.
+                raise ValueError("foreign_distill: set EITHER kind (one teacher) OR "
+                                 "mixture (several), not both")
+            for ent in mixture:
+                k, wgt = ent["kind"], float(ent.get("weight", 1.0))
+                if wgt <= 0.0:
+                    raise ValueError(f"foreign_distill mixture weight for {k} must be > 0")
+                self._teacher_mix.append((k, _load_teacher(k, ent.get("weights")), wgt))
+            tot = sum(w for _, _, w in self._teacher_mix)
+            self._teacher_mix = [(k, w, wgt / tot) for k, w, wgt in self._teacher_mix]
+            # The FIRST teacher is installed here so an iteration-0 collect is never
+            # unlabelled; run() re-samples before every collect including the first.
+            self.engine.set_teacher(self._teacher_mix[0][1], self._teacher_mix[0][0])
+            self._foreign_teacher = self._teacher_mix[0][0]
+            share = ", ".join(f"{k} {wgt:.2f}" for k, _, wgt in self._teacher_mix)
+            print(f"foreign_distill: MIXTURE of {len(self._teacher_mix)} teachers at "
+                  f"period 1 ({share}), sampled per iteration, "
+                  f"coef={cfg.ppo.get('foreign_distill_coef', 0.0)}, "
+                  f"{self._fd_k} action classes", flush=True)
+        elif cfg.foreign_distill.get("kind"):
             kind = cfg.foreign_distill["kind"]
             wp = os.path.expanduser(cfg.foreign_distill.get(
                 "weights", f"~/.cache/construct/{kind}_weights.npz"))
@@ -1971,6 +2006,39 @@ class Trainer:
             out.append(f"shaping/goal {shaping / ge:.2f}")
         return " " + " ".join(out)
 
+    def _pick_teacher(self) -> None:
+        """Sample this iteration's teacher from the mixture and install it.
+
+        The engine holds exactly one teacher, so a weighted mixture has to be realised in
+        time rather than in space. Sampling per iteration is an unbiased estimator of the
+        weighted-average cross-entropy: with rollout_steps on the order of 10^4 and a run
+        measured in thousands of iterations, the extra variance from batching a whole
+        iteration onto one teacher averages out long before any bench reads it.
+
+        SEEDED ON total_steps, not on `it`, for the same reason the lr anneal is: `it`
+        restarts at 0 on every resume, so an `it`-keyed sequence would replay the same
+        teacher order after each restart and correlate teacher choice with restarts.
+
+        The set_teacher call REBUILDS the ForeignPolicy, which drops its per-car prev-action
+        map -- the teacher's own observation carries its previous action, so the first
+        decision after a switch is taken with prev=0. One frame per car per switch against
+        rollout_steps of them; the alternative (holding several teachers alive in the
+        engine) is a Rust change and a wheel ship for a rounding error.
+        """
+        if not self._teacher_mix:
+            return
+        r = random.Random(self.cfg.env.get("seed", 0) * 1000003 + self.total_steps)
+        x, chosen = r.random(), self._teacher_mix[-1]
+        acc = 0.0
+        for ent in self._teacher_mix:
+            acc += ent[2]
+            if x < acc:
+                chosen = ent
+                break
+        if chosen[0] != self._foreign_teacher:
+            self.engine.set_teacher(chosen[1], chosen[0])
+            self._foreign_teacher = chosen[0]
+
     def run(self, max_iterations: int | None = None):
         it = 0
         p = self.cfg.ppo
@@ -1984,6 +2052,7 @@ class Trainer:
             lr = self._apply_lr(lr_at(self.total_steps, p))
             if self._league and it % self._league["refresh"] == 0:
                 self._refresh_opponents(it)
+            self._pick_teacher()  # no-op unless [foreign_distill].mixture is set
             batch = self.collect(p["rollout_steps"])
 
             # --- extra-loss hook: kickstart distillation (T7) + BC-prior anchor (K3) ---
@@ -2071,13 +2140,19 @@ class Trainer:
                 # the SAME frames. The CE alone is uninterpretable -- a nats figure means
                 # nothing without the state-independent baseline it has to beat -- so both
                 # print together and the gap between them IS the result. label_frac is the
-                # tripwire: it must sit at 1.000, and a drift downward means the teacher's
-                # controls stopped matching the action table, which would silently shrink
-                # the training set instead of erroring.
+                # tripwire, and its healthy value is PER TEACHER, not 1.000 everywhere:
+                # nexto shares our action table by construction (1.000) but immortal has
+                # its own 126-row table and lands on ours ~0.87 of the time. A drift down
+                # from THAT TEACHER'S baseline means the controls stopped matching the
+                # table, silently shrinking the training set instead of erroring. fd_t
+                # names the teacher that labelled this iteration; without it a mixture
+                # run's fd_ce is two interleaved series being read as one.
                 if p.get("foreign_distill_coef", 0.0):
                     msg += (f" fd_ce {stats.get('fd_ce', 0.0):.4f}"
                             f" fd_marg {stats.get('fd_marginal', 0.0):.4f}"
                             f" fd_lab {stats.get('fd_label_frac', 0.0):.3f}")
+                    if self._teacher_mix:
+                        msg += f" fd_t {self._foreign_teacher}"
                 if p.get("aux_recon_coef", 0.0) or p.get("aux_reward_coef", 0.0):
                     msg += (f" aux_rec {stats.get('aux_recon', 0.0):.4f}"
                             f" aux_rew {stats.get('aux_reward', 0.0):.4f}")

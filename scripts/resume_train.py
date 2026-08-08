@@ -41,6 +41,14 @@ p.add_argument("--foreign-teacher", default=None,
                     "'immortal' / etc. The engine queries it every step for the action IT "
                     "would take here and the student's head is trained on that label. "
                     "Unrelated to [foreign], which puts those bots in the ORANGE cars.")
+p.add_argument("--foreign-teachers", default=None,
+               help="MULTI-TEACHER distillation: 'nexto:3,immortal:1' -- comma-separated "
+                    "kind:weight pairs, weights normalised. One teacher is sampled per "
+                    "iteration in proportion to its weight (the engine holds exactly one). "
+                    "Mutually exclusive with --foreign-teacher. Only nexto (label rate "
+                    "1.00) and immortal (0.87) are usable; necto (0.24) and element (0.20) "
+                    "emit controls that mostly fall off our action table, and the dropped "
+                    "frames are the expressive ones, not a random subsample.")
 p.add_argument("--foreign-weights", default=None,
                help="path to the teacher .npz (default ~/.cache/construct/<kind>_weights.npz). "
                     "These weights are unlicensed for redistribution and live outside the repo.")
@@ -148,8 +156,22 @@ if args.kickstart_teacher:
     cfg.kickstart = {**cfg.kickstart, "teacher": args.kickstart_teacher}
     if args.kickstart_steps is not None:
         cfg.kickstart["steps"] = args.kickstart_steps
+if args.foreign_teacher and args.foreign_teachers:
+    p.error("--foreign-teacher and --foreign-teachers are mutually exclusive")
+if args.foreign_teachers:
+    mix = []
+    for part in args.foreign_teachers.split(","):
+        kind, _, w = part.strip().partition(":")
+        mix.append({"kind": kind, "weight": float(w) if w else 1.0})
+    # A single-entry mixture is deliberately NOT rewritten to the `kind` path: the two
+    # differ (the mixture re-installs the teacher every iteration, resetting its prev map),
+    # and quietly swapping one for the other would make a control arm not a control.
+    cfg.foreign_distill = {**cfg.foreign_distill, "mixture": mix}
+    cfg.foreign_distill.pop("kind", None)  # a resumed checkpoint may carry one
+    cfg.ppo = {**cfg.ppo, "foreign_distill_coef": args.foreign_distill_coef}
 if args.foreign_teacher:
     cfg.foreign_distill = {**cfg.foreign_distill, "kind": args.foreign_teacher}
+    cfg.foreign_distill.pop("mixture", None)
     if args.foreign_weights:
         cfg.foreign_distill["weights"] = args.foreign_weights
     # The coefficient lives in [ppo] so it rides the same checkpoint-overwrites-toml path as
