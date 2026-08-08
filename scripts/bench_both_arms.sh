@@ -51,8 +51,9 @@ ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(distill)
 for a in "${ARMS[@]}"; do
     case "$a" in
-        distill) bench_one checkpoints_distill       distill ;;
-        ppo)     bench_one checkpoints_ppo_distilled ppo ;;
+        distill)  bench_one checkpoints_distill       distill ;;
+        goalonly) bench_one checkpoints_goalonly      goalonly ;;
+        ppo)      bench_one checkpoints_ppo_distilled ppo ;;
         *)       echo "unknown arm: $a" >&2; exit 1 ;;
     esac
 done
