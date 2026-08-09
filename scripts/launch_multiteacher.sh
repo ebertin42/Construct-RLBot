@@ -53,8 +53,38 @@
 # ONE VARIABLE. Identical to the live distill command in every other respect -- same config,
 # same lr 3e-4 flat, policy/value/entropy all 0 (pure supervised), same 48 arenas, same
 # seed 21, same 1v1 mix -- so the only difference between the arms is the teacher mixture.
+#
+# ============================ RESULT, 2026-08-09: FAILED ============================
+# Launched from ck_004070379520 and killed the same day at 79M steps. It did NOT test the
+# hypothesis above -- it found a bug in HOW the mixture was delivered.
+#
+#   entropy 1.590 -> 2.565 within FIVE iterations, touches/min 43 -> 20, and it never
+#   recovered over 79M steps (nexto fd_ce flat at 2.03 -> 2.09 vs the control's 1.63).
+#   Benched vs necto at p1: 0W/0D/16L where the control read 16W/0D/0L.
+#
+# Two 30-iteration probes from the same base isolated the cause:
+#   B  mixture, NO --reset-optimizer   ent 1.55 -> 2.57 by iter 5,  0W/0D/16L, ga 10.06
+#   C  pure nexto, WITH --reset-optimizer  ent flat 1.61-1.67,     13W/2D/1L,  ga  3.88
+# So the optimizer reset is exonerated and the per-iteration teacher rotation is the cause:
+# one whole iteration of immortal is epochs x minibatches of FULL-STRENGTH steps toward a
+# target 4.9 nats away, not a small step in the mixture direction. See Trainer._pick_teacher.
+#
+# A faithful test needs both teachers' labels in ONE batch -- engine holds K teachers and
+# collect emits (T, N_learner, K). That is a Rust change and a wheel ship. Do not relaunch
+# this script expecting a verdict on multi-teacher; it can only reproduce the failure.
+# ====================================================================================
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+# Refuse by default. The script is kept because reproducing the failure is occasionally
+# useful and because the falsifier above is the record of what was predicted; it is not kept
+# because it is safe to run.
+if [ "${I_KNOW_THIS_ESTIMATOR_IS_BROKEN:-0}" != "1" ]; then
+    echo "REFUSING: this arm was measured to destroy the policy on 2026-08-09 (see the" >&2
+    echo "header). Re-run only with I_KNOW_THIS_ESTIMATOR_IS_BROKEN=1, and only to" >&2
+    echo "reproduce the failure -- not to get a verdict on multi-teacher." >&2
+    exit 1
+fi
 
 BASE=${1:?usage: launch_multiteacher.sh <distill-checkpoint> [mix]}
 MIX=${2:-nexto:3,immortal:1}

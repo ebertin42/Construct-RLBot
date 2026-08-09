@@ -35,13 +35,38 @@ mapfile -t CKS < <(ls "$DIR"/*.pt 2>/dev/null \
   | awk -v n="$N" '{a[NR]=$2} END{ if(NR<n) n=NR; for(i=0;i<n;i++) print a[1+int(i*(NR-1)/(n>1?n-1:1))] }')
 [ "${#CKS[@]}" -gt 0 ] || { echo "no checkpoints in [$LO,$HI] under $DIR" >&2; exit 1; }
 
+# How many times to retry a cell that comes back CONTAMINATED. The failure is a contained
+# physics blowup shredding one arena's matches, it is nondeterministic under ASLR, and a
+# re-run usually lands clean -- so a retry is far cheaper than either dropping the cell
+# (which shrinks n without shrinking anyone's confidence in the result) or keeping it
+# (which is what silently corrupted the 2026-08-08 distill numbers).
+RETRIES=${BENCH_RETRIES:-2}
+
 echo "$LABEL vs $KIND: ${#CKS[@]} checkpoints from $DIR"
-printf 'arm\tcheckpoint\tsteps\tgoals_for\tgoals_against\tdiff\twin_share\n' > "$OUT"
+printf 'arm\tcheckpoint\tsteps\tgoals_for\tgoals_against\tdiff\twin_share\tshort_frac\n' > "$OUT"
 
 for ck in "${CKS[@]}"; do
-    line=$(.venv/bin/python scripts/bench_foreign.py "$ck" \
-        --kind "$KIND" --weights "$HOME/.cache/construct/${KIND}_weights.npz" \
-        --arenas "$ARENAS" --steps "$STEPS" --seed 11 --period 1 2>/dev/null)
+    # NOTE 2>&1, not 2>/dev/null: the engine prints its blowup containments to stderr, and
+    # throwing them away is half the reason this went unnoticed for so long. bench_foreign
+    # prints its own census to stdout, so the parse below does not depend on stderr, but a
+    # human reading the log should see the storm that produced a bad cell.
+    for attempt in $(seq 0 "$RETRIES"); do
+        line=$(.venv/bin/python scripts/bench_foreign.py "$ck" \
+            --kind "$KIND" --weights "$HOME/.cache/construct/${KIND}_weights.npz" \
+            --arenas "$ARENAS" --steps "$STEPS" --seed 11 --period 1 2>&1)
+        sf=$(sed -nE 's/.*short_frac=([0-9.]+).*/\1/p' <<<"$line" | head -1)
+        grep -q CONTAMINATED <<<"$line" || break
+        echo "  $(basename "$ck") CONTAMINATED (short_frac=$sf), retry $((attempt+1))/$RETRIES" >&2
+    done
+    if grep -q CONTAMINATED <<<"$line"; then
+        # Written to the table with its flag rather than dropped, so a downstream reader
+        # sees the hole instead of inferring a clean n.
+        st=$(basename "$ck" | sed -E 's/ck_0*([0-9]+)\.pt/\1/')
+        printf '%s\t%s\t%s\tNA\tNA\tNA\tNA\t%s\n' \
+            "$LABEL" "$(basename "$ck")" "$st" "${sf:-NA}" >> "$OUT"
+        echo "  $(basename "$ck") STILL CONTAMINATED after $RETRIES retries -- row is NA" >&2
+        continue
+    fi
     gf=$(sed -nE 's/.*goals_for=([0-9.-]+).*/\1/p' <<<"$line" | head -1)
     ga=$(sed -nE 's/.*goals_against=([0-9.-]+).*/\1/p' <<<"$line" | head -1)
     # NOTE the leading [+-]?: bench_foreign prints diff=+0.2062 once we OUTSCORE the bot, and
@@ -52,7 +77,7 @@ for ck in "${CKS[@]}"; do
     # Loud on parse failure: a silently dropped row shrinks n without shrinking the
     # confidence anyone reads off the result.
     [ -n "$ga" ] || { echo "PARSE_FAILED $ck" >&2; gf=NA; ga=NA; df=NA; ws=NA; }
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$LABEL" "$(basename "$ck")" "$st" "$gf" "$ga" "$df" "$ws" >> "$OUT"
-    echo "  $(basename "$ck") ga=$ga gf=$gf"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$LABEL" "$(basename "$ck")" "$st" "$gf" "$ga" "$df" "$ws" "${sf:-NA}" >> "$OUT"
+    echo "  $(basename "$ck") ga=$ga gf=$gf short_frac=${sf:-NA}"
 done
 echo "DONE -> $OUT"

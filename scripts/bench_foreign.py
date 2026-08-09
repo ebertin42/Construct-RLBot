@@ -37,6 +37,11 @@ import sys
 
 import numpy as np
 
+# A healthy match is 300 s of a 15 Hz agent clock. Kept in sync with
+# scripts/matchwin_gate.py, which has censused blowups against it since the containment
+# landed; split_matches' own docstring quotes the same 4500.
+FULL_MATCH_STEPS = 4500
+
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
@@ -84,12 +89,33 @@ def main(argv=None):
     # every arena driven by foreign slot 0 (encoded -2)
     out = eng.collect(args.steps, arena_opponents=[-2] * args.arenas)
 
-    matches = split_matches(out["rewards"], out["terminated"])
+    # BLOWUP CENSUS. `matchwin_gate.py` has done this since the containment landed and this
+    # script never did -- which is how a silently corrupted cell reached a published number
+    # on 2026-08-09. A contained physics blowup (engine/src/episode.rs) terminates every car
+    # in the arena and rebuilds it, so split_matches closes a record tens of steps into a
+    # match instead of at FULL_MATCH_STEPS. One arena stuck in that loop shreds its 300 s
+    # matches into ~6 s fragments, and since goals are reported PER MATCH the inflated
+    # denominator drives goals_for and goals_against toward zero together while win_share
+    # collapses to ~0.5 (fragments are mostly goalless, hence draws).
+    #
+    # Observed: ck_004070758400 vs necto read goals 0.1794/0.0882 win_share 0.5083 in one run
+    # and 8.1451/3.9321 win_share 0.8935 in the next, SAME checkpoint, same seed -- the
+    # engine is not bit-reproducible under ASLR, so this lands on some cells and not others.
+    # It is therefore invisible to any single re-run and can only be caught by the census.
+    #
+    # A short record is NOT a 0-0 draw and is NOT dropped here: the blowup branch preserves
+    # the score accumulated so far, so a blowup at 2-1 emits (2,1), a decided result. Counted
+    # and reported, never silently filtered -- filtering would also move every historical
+    # number this project has published.
+    matches, durations = split_matches(out["rewards"], out["terminated"],
+                                       with_durations=True)
     rec = match_record(matches)
     n = rec["wins"] + rec["draws"] + rec["losses"]
     if n == 0:
         print("no completed matches -- increase --steps")
         return 1
+    short = sum(1 for d in durations if d < FULL_MATCH_STEPS)
+    short_frac = short / len(durations)
     share = (rec["wins"] + 0.5 * rec["draws"]) / n
     se = (share * (1 - share) / n) ** 0.5
     print(f"{args.checkpoint} (blue) vs {args.kind} (orange), period={args.period}, "
@@ -113,6 +139,16 @@ def main(argv=None):
           f"diff={mf - mg:+.4f}")
     print(f"  shutouts_against={sum(1 for x in gf if x == 0)}/{n}  "
           f"clean_sheets={sum(1 for x in ga if x == 0)}/{n}")
+    # Machine-readable and on its own line so every harness can grep one key. The threshold
+    # is deliberately tight: at 5% short records the per-match denominator is already
+    # inflated enough to move goals_against by more than the 0.09 MDE these benches run at.
+    print(f"  short_frac={short_frac:.4f}  short={short}/{len(durations)}"
+          f"{'  CONTAMINATED' if short_frac > 0.05 else ''}")
+    if short_frac > 0.05:
+        print(f"  -> DO NOT USE THIS CELL. {short}/{len(durations)} records closed before "
+              f"{FULL_MATCH_STEPS} steps (contained physics blowups), so goals-per-match "
+              f"are divided by an inflated match count. Re-run it; the failure is "
+              f"nondeterministic.")
     if share > 0.90:
         print("  -> PUNCHING BAG: the bot is far weaker; training against it "
               "teaches little.")

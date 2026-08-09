@@ -11,22 +11,20 @@ mkdir -p checkpoints checkpoints_entity checkpoints_scratch checkpoints_v9 \
          checkpoints_v10 checkpoints_v11 checkpoints_v12 league \
          checkpoints_distill checkpoints_ppo_distilled checkpoints_mt
 while true; do
-    # THE TWO LIVE ARMS since 2026-08-09, pulled FIRST because everything downstream
-    # (dashboard, watch_loop) picks the newest checkpoint by mtime across these dirs and
-    # run A -- which was that newest thing for a week -- is now retired and frozen.
+    # ONE LIVE ARM since 2026-08-09: checkpoints_distill, pure distillation from nexto
+    # (policy_coef=0). Still the strongest thing this project has. Pulled FIRST because
+    # everything downstream (dashboard, watch_loop) picks the newest checkpoint by mtime
+    # across these dirs.
     #
-    #   checkpoints_distill      pure distillation from nexto (policy_coef=0). THE CONTROL,
-    #                            and still the strongest thing this project has: necto
-    #                            win_share 0.708 conceding 2.65 at 4.0B.
-    #   checkpoints_mt           MULTI-TEACHER distillation, nexto 0.75 / immortal 0.25,
-    #                            forked from distill at 4,070,379,520 on 2026-08-09. Same
-    #                            everything else, so the teacher mixture is the only
-    #                            variable. Falsifier is in scripts/launch_multiteacher.sh.
+    # RETIRED, still on disk:
+    #   checkpoints_ppo_distilled  2026-08-05, PPO on the distilled policy -- worse
+    #   checkpoints_goalonly       2026-08-09, goal-only PPO           -- worse
+    #   checkpoints_mt             2026-08-09, nexto/immortal mixture  -- BROKEN, see below
     #
-    # RETIRED, still on disk, no longer pulled: checkpoints_ppo_distilled (2026-08-05) and
-    # checkpoints_goalonly (2026-08-09) -- BOTH PPO-on-top-of-distillation variants measured
-    # WORSE than pure distillation (t=+3.63 and t=+4.90 on goals_against).
-    rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_mt/" checkpoints_mt/ 2>/dev/null
+    # mt is still pulled because its log is the evidence for the estimator bug (entropy
+    # 1.59 -> 2.57 in five iterations, 0W/0D/16L vs necto). Its CHECKPOINTS are unusable and
+    # must never be promoted or forked from; watch_loop picks by mtime, so it stays after
+    # distill in WATCH_DIRS deliberately.
     rsync -az "$HOST:$RDIR/logs/mt.log" checkpoints_mt/train_remote.log 2>/dev/null
     rsync -az --include='ck_*.pt' --exclude='*' "$HOST:$RDIR/checkpoints_distill/" checkpoints_distill/ 2>/dev/null
     rsync -az "$HOST:$RDIR/logs/distill_resume.log" checkpoints_distill/train_remote.log 2>/dev/null

@@ -75,19 +75,18 @@ CKPT_DIR = Path(_os.environ.get(
 # MAIN_LOG / CKPT_DIR above still drive the FIRST entry, so the env overrides keep
 # working for inspecting a retired lineage.
 RUNS = [
-    {"id": "mt", "label": "multi-teacher \u00b7 LIVE",
+    {"id": "mt", "label": "multi-teacher \u00b7 retired (broken)",
      "log": REPO / "checkpoints_mt" / "train_remote.log",
      "ckpt": REPO / "checkpoints_mt",
-     "role": "Distillation from a MIXTURE: nexto 0.75 / immortal 0.25, one teacher sampled "
-             "per iteration. Forked from distill at 4,070,379,520 on 2026-08-09; every "
-             "other setting is identical, so the mixture is the only variable. Read fd_ce "
-             "PER TEACHER \u2014 the fd_t field names who labelled that iteration, and the two "
-             "series are on completely different scales (nexto ~1.7 against a 3.7 marginal, "
-             "immortal ~4.6 against 2.6). fd_lab is ALSO per teacher: 1.000 for nexto, "
-             "~0.80-0.88 for immortal, whose 126-row action table only partly overlaps "
-             "ours. A rising fd_ce is EXPECTED here (a hard-label mixture raises the "
-             "irreducible floor) and is not a fault. The verdict is goals_against vs "
-             "distill over a matched window; the falsifier is in launch_multiteacher.sh."},
+     "role": "Distillation from a nexto 0.75 / immortal 0.25 mixture, one teacher sampled "
+             "per iteration. Launched and killed 2026-08-09. It did NOT test multi-teacher "
+             "\u2014 it found a bug in how the mixture was delivered: entropy 1.59 \u2192 2.57 within "
+             "five iterations and 0W/0D/16L vs necto where the control read 16W/0D/0L. Two "
+             "probes isolated it (optimizer reset exonerated, per-iteration rotation is the "
+             "cause: one whole immortal iteration is epochs \u00d7 minibatches of full-strength "
+             "steps toward a target 4.9 nats away). A faithful mixture needs both teachers' "
+             "labels in one batch, i.e. an engine change. Kept visible so the curves stay "
+             "readable, not because the lineage is usable."},
     {"id": "ppo", "label": "PPO-from-distilled \u00b7 retired",
      "log": REPO / "checkpoints_ppo_distilled" / "train_remote.log",
      "ckpt": REPO / "checkpoints_ppo_distilled",

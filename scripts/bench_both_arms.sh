@@ -39,17 +39,28 @@ bench_one() {  # dir label
         echo "  $label: nothing new to bench (or bench failed); leaving history untouched" >&2
         return 0
     fi
+    # SCHEMA GUARD. bench_arm.sh gained a short_frac column on 2026-08-09; appending 8-column
+    # rows under a 7-column header gives every historical row an empty $8 that awk reads as 0
+    # -- i.e. "no contamination", the most dangerous possible default, and precisely the
+    # column-index class of bug that once produced a confident t=+19.76. Rotate instead of
+    # mixing, loudly, and let the old file keep its own header.
+    if [ -s "$hist" ] && [ "$(head -1 "$hist")" != "$(head -1 "$tmp")" ]; then
+        mv "$hist" "$hist.pre_short_frac"
+        echo "  $label: history schema changed -> rotated to $hist.pre_short_frac" >&2
+        echo "  the rotated rows predate the blowup census and MAY BE CONTAMINATED" >&2
+    fi
     if [ -s "$hist" ]; then tail -n +2 "$tmp" >> "$hist"; else cp "$tmp" "$hist"; fi
     echo "  $label history now $(( $(wc -l < "$hist") - 1 )) rows -> $hist"
 }
 
-# Which arms to bench. Defaults to the two LIVE ones: distill (the control) and mt (the
-# multi-teacher arm forked from it 2026-08-09). The ppo and goalonly arms are retired and
-# still have unbenched checkpoints, but spending cells on a dead lineage buys nothing. Pass
-# arm names to override, e.g. `bench_both_arms.sh 8 distill ppo`.
+# Which arms to bench. Defaults to the ONE live arm, distill. mt joined this list on
+# 2026-08-09 and left it the same day: the mixture estimator destroyed the policy (0W/0D/16L
+# vs necto) and the arm was killed. ppo and goalonly are likewise retired. All three still
+# have unbenched checkpoints; spending cells on a dead lineage buys nothing. Pass arm names
+# to override, e.g. `bench_both_arms.sh 8 distill mt`.
 shift || true
 ARMS=("$@")
-[ ${#ARMS[@]} -gt 0 ] || ARMS=(distill mt)
+[ ${#ARMS[@]} -gt 0 ] || ARMS=(distill)
 for a in "${ARMS[@]}"; do
     case "$a" in
         distill)  bench_one checkpoints_distill       distill ;;

@@ -2009,11 +2009,30 @@ class Trainer:
     def _pick_teacher(self) -> None:
         """Sample this iteration's teacher from the mixture and install it.
 
-        The engine holds exactly one teacher, so a weighted mixture has to be realised in
-        time rather than in space. Sampling per iteration is an unbiased estimator of the
-        weighted-average cross-entropy: with rollout_steps on the order of 10^4 and a run
-        measured in thousands of iterations, the extra variance from batching a whole
-        iteration onto one teacher averages out long before any bench reads it.
+        **MEASURED 2026-08-09: THIS ESTIMATOR DOES NOT WORK. DO NOT USE THE MIXTURE PATH FOR
+        A REAL RUN WITHOUT READING THIS.** A nexto 0.75 / immortal 0.25 mixture destroyed a
+        healthy policy in FOUR iterations -- entropy 1.55 -> 2.44 immediately after the first
+        immortal iteration, and a 30-iteration probe went from 14W/1D/1L to 0W/0D/16L against
+        necto (goals_against 4.25 -> 10.06). A matched probe that changed ONLY the optimizer
+        reset stayed healthy (13W/2D/1L), so the optimizer is exonerated and the estimator
+        below is the cause.
+
+        WHY. The paragraph that used to be here argued that sampling one teacher per
+        iteration is an unbiased estimator of the weighted-average cross-entropy and that the
+        extra variance averages out. The first half is true of the EXPECTED GRADIENT and the
+        second half is false, for a reason that is obvious in hindsight: `ppo_update` takes
+        epochs x minibatches gradient steps per iteration, all at full loss strength. So one
+        immortal iteration is not a small step in the mixture direction, it is many full-size
+        steps toward a target the policy sits ~4.9 nats away from. What gets optimised is not
+        0.75*CE_nexto + 0.25*CE_immortal; it is the two objectives alternately, at full
+        strength, and the policy ends up between them at high entropy and plays terribly.
+        Unbiasedness of a gradient estimator only buys you anything when the steps are small
+        enough for the linearisation to hold.
+
+        A FAITHFUL MIXTURE NEEDS BOTH TEACHERS' LABELS IN THE SAME BATCH, which means the
+        engine holding K teachers and `collect` emitting `(T, N_learner, K)` -- a Rust change
+        and a wheel ship, not a config change. Until that exists, this path is a diagnostic
+        toy.
 
         SEEDED ON total_steps, not on `it`, for the same reason the lr anneal is: `it`
         restarts at 0 on every resume, so an `it`-keyed sequence would replay the same
