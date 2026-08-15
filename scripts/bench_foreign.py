@@ -144,6 +144,38 @@ def main(argv=None):
     # inflated enough to move goals_against by more than the 0.09 MDE these benches run at.
     print(f"  short_frac={short_frac:.4f}  short={short}/{len(durations)}"
           f"{'  CONTAMINATED' if short_frac > 0.05 else ''}")
+    # FULL-MATCH-ONLY GOALS. The figures above divide by EVERY record, so a handful of arenas
+    # stuck in a blowup loop can supply hundreds of ~6 s fragments and drag goals-per-match
+    # toward zero -- necto against a nexto-clone read short_frac 0.82 and goals 1.76/0.66 on
+    # 2026-08-15 for exactly that reason. A full match is a complete 300 s observation, so
+    # restricting to `duration >= FULL_MATCH_STEPS` is the estimator that answers "how does a
+    # match between these two go".
+    #
+    # It is printed ALONGSIDE, never instead of, the all-records figures: those are what every
+    # historical number was computed on, and silently switching the definition would make new
+    # rows incomparable with the series they are appended to -- the same trap that made a
+    # column-index change produce a confident t=+19.76 once. Cross-era comparisons use the
+    # all-records column; new analysis should prefer _full.
+    #
+    # Dropping short records is not free of assumptions: a blowup at 2-1 emits (2,1), so the
+    # discarded partials carry real goals. What survives is an unbiased sample of FULL-match
+    # play, which is the quantity of interest; what it cannot tell you is whether blowups
+    # correlate with score, so a high short_frac still means "re-run this cell", not
+    # "just read the _full column".
+    full = [(g, a) for (g, a), d in zip(matches, durations) if d >= FULL_MATCH_STEPS]
+    if full:
+        nfull = len(full)
+        mff = sum(g for g, _ in full) / nfull
+        mgf = sum(a for _, a in full) / nfull
+        seff = (sum((g - mff) ** 2 for g, _ in full) / (nfull - 1) / nfull) ** 0.5 \
+            if nfull > 1 else 0.0
+        segf = (sum((a - mgf) ** 2 for _, a in full) / (nfull - 1) / nfull) ** 0.5 \
+            if nfull > 1 else 0.0
+        print(f"  goals_for_full={mff:.4f} +/- {seff:.4f}  "
+              f"goals_against_full={mgf:.4f} +/- {segf:.4f}  n_full={nfull}")
+    else:
+        print("  goals_for_full=NA  goals_against_full=NA  n_full=0"
+              "   [every record was short -- no full match completed]")
     if short_frac > 0.05:
         print(f"  -> DO NOT USE THIS CELL. {short}/{len(durations)} records closed before "
               f"{FULL_MATCH_STEPS} steps (contained physics blowups), so goals-per-match "
