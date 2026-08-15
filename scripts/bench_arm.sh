@@ -42,8 +42,19 @@ mapfile -t CKS < <(ls "$DIR"/*.pt 2>/dev/null \
 # (which is what silently corrupted the 2026-08-08 distill numbers).
 RETRIES=${BENCH_RETRIES:-2}
 
+# ...but NOT every contaminated cell is nondeterministic. Against necto our nexto-clone hits
+# the mirrored-KICKOFF pinch essentially every match (short_frac 0.82 and 0.96 on two separate
+# runs), so retrying just pays three times for the same failure. A cell is SALVAGEABLE when
+# enough FULL matches survived to measure on: 270 full matches out of an expected ~324 is a
+# perfectly good sample even though 96% of the RECORDS were fragments. Retry only when the
+# full-match sample is too thin to use.
+MIN_FULL=${BENCH_MIN_FULL:-100}
+
 echo "$LABEL vs $KIND: ${#CKS[@]} checkpoints from $DIR"
-printf 'arm\tcheckpoint\tsteps\tgoals_for\tgoals_against\tdiff\twin_share\tshort_frac\n' > "$OUT"
+# The _full columns are always emitted, never substituted into goals_for/goals_against: two
+# estimators in one column is how a series stops meaning one thing. Read goals_against when
+# short_frac is low, goals_against_full when it is not, and never mix them within a trend.
+printf 'arm\tcheckpoint\tsteps\tgoals_for\tgoals_against\tdiff\twin_share\tshort_frac\tgoals_for_full\tgoals_against_full\tn_full\n' > "$OUT"
 
 for ck in "${CKS[@]}"; do
     # NOTE 2>&1, not 2>/dev/null: the engine prints its blowup containments to stderr, and
@@ -55,16 +66,24 @@ for ck in "${CKS[@]}"; do
             --kind "$KIND" --weights "$HOME/.cache/construct/${KIND}_weights.npz" \
             --arenas "$ARENAS" --steps "$STEPS" --seed 11 --period 1 2>&1)
         sf=$(sed -nE 's/.*short_frac=([0-9.]+).*/\1/p' <<<"$line" | head -1)
+        nfull=$(sed -nE 's/.*n_full=([0-9]+).*/\1/p' <<<"$line" | head -1)
         grep -q CONTAMINATED <<<"$line" || break
-        echo "  $(basename "$ck") CONTAMINATED (short_frac=$sf), retry $((attempt+1))/$RETRIES" >&2
+        # Salvageable despite the flag: enough full matches survived to measure on.
+        [ "${nfull:-0}" -ge "$MIN_FULL" ] && {
+            echo "  $(basename "$ck") contaminated (short_frac=$sf) but n_full=$nfull -- salvaged" >&2
+            break
+        }
+        echo "  $(basename "$ck") CONTAMINATED (short_frac=$sf, n_full=${nfull:-0}), retry $((attempt+1))/$RETRIES" >&2
     done
-    if grep -q CONTAMINATED <<<"$line"; then
+    gff=$(sed -nE 's/.*goals_for_full=([0-9.]+|NA).*/\1/p'     <<<"$line" | head -1)
+    gaf=$(sed -nE 's/.*goals_against_full=([0-9.]+|NA).*/\1/p' <<<"$line" | head -1)
+    if grep -q CONTAMINATED <<<"$line" && [ "${nfull:-0}" -lt "$MIN_FULL" ]; then
         # Written to the table with its flag rather than dropped, so a downstream reader
         # sees the hole instead of inferring a clean n.
         st=$(basename "$ck" | sed -E 's/ck_0*([0-9]+)\.pt/\1/')
-        printf '%s\t%s\t%s\tNA\tNA\tNA\tNA\t%s\n' \
-            "$LABEL" "$(basename "$ck")" "$st" "${sf:-NA}" >> "$OUT"
-        echo "  $(basename "$ck") STILL CONTAMINATED after $RETRIES retries -- row is NA" >&2
+        printf '%s\t%s\t%s\tNA\tNA\tNA\tNA\t%s\t%s\t%s\t%s\n' \
+            "$LABEL" "$(basename "$ck")" "$st" "${sf:-NA}" "${gff:-NA}" "${gaf:-NA}" "${nfull:-0}" >> "$OUT"
+        echo "  $(basename "$ck") STILL CONTAMINATED after $RETRIES retries, only ${nfull:-0} full matches -- row is NA" >&2
         continue
     fi
     gf=$(sed -nE 's/.*goals_for=([0-9.-]+).*/\1/p' <<<"$line" | head -1)
@@ -77,7 +96,8 @@ for ck in "${CKS[@]}"; do
     # Loud on parse failure: a silently dropped row shrinks n without shrinking the
     # confidence anyone reads off the result.
     [ -n "$ga" ] || { echo "PARSE_FAILED $ck" >&2; gf=NA; ga=NA; df=NA; ws=NA; }
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$LABEL" "$(basename "$ck")" "$st" "$gf" "$ga" "$df" "$ws" "${sf:-NA}" >> "$OUT"
-    echo "  $(basename "$ck") ga=$ga gf=$gf short_frac=${sf:-NA}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$LABEL" "$(basename "$ck")" "$st" \
+        "$gf" "$ga" "$df" "$ws" "${sf:-NA}" "${gff:-NA}" "${gaf:-NA}" "${nfull:-NA}" >> "$OUT"
+    echo "  $(basename "$ck") ga=$ga gf=$gf short_frac=${sf:-NA} ga_full=${gaf:-NA} n_full=${nfull:-NA}"
 done
 echo "DONE -> $OUT"
